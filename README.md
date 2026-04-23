@@ -1,6 +1,8 @@
 # Limceron
 
 **The language where agents cannot exist without guardrails.**
+> Agents need an operating system, not a library.
+
 
 ## The Problem
 
@@ -12,9 +14,57 @@ You deploy an AI agent on Friday. By Monday:
 - It ran `rm -rf /data` because the LLM hallucinated a shell command
 - Its accuracy drifted from 90% to 60% and nobody noticed
 
+- **Nothing crashed.**
+- **Nothing alerted you.**
+- **It just got worse.**
+
 Every framework gives you tools to build agents. None give you tools to **trust** them.
 
 The root cause: agents need an operating system, not a library. They need a kernel that controls what they can access, how much they can spend, how much uncertainty they can tolerate, and what happens when they drift. They need Limceron.
+
+---
+
+## Why This Happens
+
+Every existing framework treats agents like **code you write**.
+
+They are not.
+
+Agents are:
+
+* non-deterministic
+* probabilistic
+* capable of unsafe behavior by default
+
+You don’t need a framework.
+
+You need:
+
+* constraints
+* enforcement
+* observability
+* automatic failure
+
+You need an **operating system for agents**.
+
+---
+
+## What Limceron Is
+
+Limceron is a programming language where:
+
+* **Capabilities are enforced at compile-time**
+* **Budgets are part of the syntax**
+* **Uncertainty is measured and bounded**
+* **Agents stop themselves when they become unreliable**
+
+Not middleware.
+Not decorators.
+Not runtime patches.
+
+👉 If it’s not declared, it doesn’t compile.
+
+---
 
 ## Three Pillars
 
@@ -31,27 +81,43 @@ Every other framework bolts these on as middleware. In Limceron, the compiler re
 A complete agent in 12 lines. If you can read pseudocode, you can read Limceron:
 
 ```limceron
-agent Categorizer {
+agent Bot {
     capabilities: [llm.classify, data.read]
     model: "gpt-4o"
-    budget: { max_tokens: 10000, max_cost: 1.00 }
+    
+    budget: { 
+    	max_tokens: 10000, 
+    	max_cost: 1.00 
+    }
 
     fn classify(comment: string) -> Result {
         let result = ask(comment)
-        if result.confidence > 0.85 { result }
-        else { "REVIEW:" + result }
+        if result.confidence > 0.85 { 
+        	result 
+        } else { 
+        	"REVIEW:" + result 
+        }
     }
 }
 ```
 
+### What just happened?
+
+* `ask()` returns **confidence**
+* low-confidence outputs are **automatically escalated**
+* spending is **bounded**
+* access is **restricted**
+
+No extra code. No wrappers.
+
 No boilerplate. No decorators. No YAML. The `ask()` call returns a confidence score on every response -- Shannon entropy of the LLM's probability distribution, normalized to [0, 1]. High confidence auto-commits. Low confidence escalates to a human. You never have to guess whether your agent is guessing.
 
-### The Same Agent as Markdown
+## You Can Start Even Simpler (Markdown)
 
 You don't need to learn a new language. A `.lceron.md` file compiles to the **exact same binary**:
 
 ```markdown
-# agent Categorizer
+# agent Bot
 
 > Classify comments into categories.
 
@@ -66,6 +132,7 @@ gpt-4o
 - max_tokens: 10000
 - max_cost: 1.00
 ```
+👉 This compiles to the exact same binary.
 
 Markdown is source code. A product manager can write the spec, a developer can extend it with code blocks, and the compiler treats both the same. Progressive disclosure: start with Markdown, add code when you need it, graduate to full `.lceron` when you're ready.
 
@@ -78,7 +145,9 @@ In every other framework, you add health checks after the first outage. You add 
 In Limceron, the language has these built in:
 
 ```limceron
-health { ready: model.loaded(), live: true, port: 9090 }
+health { 
+	ready: model.loaded(), live: true, port: 9090 
+}
 
 metrics {
     counter processed_total "Records categorized"
@@ -111,7 +180,7 @@ In Limceron, the agent has self-awareness about its own uncertainty and autonomo
 
 ```limceron
 agent Categorizer {
-    model: "patana"
+    model: "bert"
     endpoint: "local"                    // ONNX model, no API, no GPU
     entropy_budget: {
         max_avg_entropy: 0.7             // stop if predictions become uncertain
@@ -143,16 +212,7 @@ A Limceron agent categorized **thousands of radiology return records** from medi
 
 ```limceron
 use driver("mysql") as db
-use model("patana.onnx") as bert
-
-enum DevolucionCategoria {
-    CALIDAD_TECNICA
-    ERROR_INGRESO_PRESTACION
-    FALTA_ANTECEDENTES
-    FALTA_EXAMEN_PREVIO
-    IMAGENES_INCOMPLETAS
-    SIN_CATEGORIA
-}
+use model("bert-model.onnx") as bert
 
 capability filesystem {
     allow path "/tmp/**" { mode: [read, write] }
@@ -165,15 +225,15 @@ taint user_input
 
 fn main() -> Result {
     let conn = db.connect(env("DB_HOST"), env("DB_USER"), env("DB_PASS"), env("DB_NAME"), 3306)
-    let rows = db.query(conn, "SELECT id, Comentario FROM staging WHERE Categoria IS NULL LIMIT 500")
+    let rows = db.query(conn, "SELECT id, Comment FROM staging WHERE Category IS NULL LIMIT 500")
 
     for i in 0..db.row_count(rows) {
-        let comment = db.get(rows, i, "Comentario")
+        let comment = db.get(rows, i, "Comment")
         let prediction = bert.predict(comment)
 
         if prediction.confidence >= 85 {
             let safe_cat = sql_escape(prediction.label)
-            db.execute(conn, "UPDATE staging SET Categoria = '" + safe_cat + "' WHERE id = " + id)
+            db.execute(conn, "UPDATE staging SET Category = '" + safe_cat + "' WHERE id = " + id)
         }
     }
 
@@ -182,7 +242,7 @@ fn main() -> Result {
 }
 ```
 
-| Metric | LLM (Qwen3-8B) | Fine-tuned BERT (Patana) |
+| Metric | LLM (Qwen3-8B) | Fine-tuned BERT |
 |---|---|---|
 | Accuracy vs human | 82.6% | **93.1%** |
 | Auto-commit accuracy (>95% conf) | N/A | **98.8%** |
