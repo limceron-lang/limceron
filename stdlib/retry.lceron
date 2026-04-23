@@ -1,0 +1,5 @@
+// Retry with exponential backoff for LLM calls
+// Budget-aware: won't retry if budget is exhausted.
+
+fn retry_ask(prompt: string, max_attempts: i64) -> Result { }  // builtin
+fn retry_ask_backoff(prompt: string, max_attempts: i64, base_ms: i64) -> Result { }  // builtin

@@ -1,0 +1,24 @@
+Limceron
+Copyright 2025-2026 Mikel Carozzi
+
+This product includes software developed by Mikel Carozzi.
+
+== Compiler Output ==
+
+The output of the Limceron compiler — including generated C code,
+assembly files, and compiled binaries — is NOT covered by this
+license. You own your compiled programs entirely.
+
+The Limceron runtime library, when statically linked into your
+programs, is licensed under Apache 2.0 + MIT dual license. Both
+are permissive and impose no copyleft obligations on your code.
+You may distribute binaries containing the linked runtime without
+restriction.
+
+== Third-Party Components ==
+
+SQLite (public domain) — embedded in runtime/sqlite3.c
+  https://www.sqlite.org/copyright.html
+
+WordPiece tokenizer — embedded in runtime/onnx_model.c
+  Derived from BERT reference implementation (Apache 2.0)

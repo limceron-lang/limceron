@@ -1,0 +1,9 @@
+// JSON parsing and manipulation
+// All functions are compiler builtins handled by codegen.
+
+fn json_parse(text: string) -> Json { }              // builtin
+fn json_get(doc: Json, key: string) -> string { }    // builtin
+fn json_get_number(doc: Json, key: string) -> f64 { }  // builtin
+fn json_array_len(arr: Json) -> i64 { }              // builtin
+fn json_array_get(arr: Json, index: i64) -> Json { } // builtin
+fn json_stringify(doc: Json) -> string { }            // builtin

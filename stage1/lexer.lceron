@@ -1,0 +1,531 @@
+// stage1/lexer.lceron
+// Limceron Lexer — Written in Limceron (self-hosting, Stage 1)
+//
+// First piece of the self-hosting compiler. Tokenizes .lceron source files
+// into a stream of tokens stored in parallel Vecs.
+//
+// Usage:
+//   ./build/limceron-stage0 build stage1/lexer.lceron -o build/limceron-lexer
+//   LEX_FILE=examples/language/01_hello_agent.lceron ./build/limceron-lexer
+//
+// Language constraints (Stage 0 compiler subset):
+//   - } else if must be on same line (ASI inserts ; after })
+//   - Vecs cannot be passed to functions (passed by value in C codegen)
+//   - No structs — parallel Vecs for token storage
+//   - if/else as expression doesn't work with blocks — use assignment pattern
+//   - str_char_is_alpha includes '_' (good for identifiers)
+
+// ── Token Kind Constants ────────────────────────────────────
+// Encoded as int literals. We use inline numbers since the codegen
+// has issues calling user-defined functions (lcn_ prefix mismatch).
+
+// TOK_EOF         = 0
+// TOK_IDENT       = 1
+// TOK_INT_LIT     = 2
+// TOK_STRING_LIT  = 3
+// TOK_KEYWORD     = 4
+// TOK_FLOAT_LIT   = 5
+// TOK_PLUS        = 10   TOK_MINUS    = 11   TOK_STAR     = 12
+// TOK_SLASH       = 13   TOK_EQ       = 14   TOK_EQ_EQ    = 15
+// TOK_BANG        = 16   TOK_BANG_EQ  = 17   TOK_LT       = 18
+// TOK_GT          = 19   TOK_LT_EQ   = 20   TOK_GT_EQ    = 21
+// TOK_ARROW       = 22   TOK_COLON   = 23   TOK_COMMA    = 24
+// TOK_DOT         = 25   TOK_PIPE    = 26   TOK_AMP      = 27
+// TOK_QUESTION    = 28   TOK_AT      = 29   TOK_HASH     = 30
+// TOK_SEMICOLON   = 31   TOK_DOT_DOT = 32   TOK_PIPE_GT  = 33
+// TOK_LPAREN      = 40   TOK_RPAREN  = 41
+// TOK_LBRACE      = 42   TOK_RBRACE  = 43
+// TOK_LBRACKET    = 44   TOK_RBRACKET = 45
+// TOK_ERROR       = 99
+
+// ── Keyword Recognition ─────────────────────────────────────
+
+fn is_keyword(word: string) -> bool {
+    let r = false
+    if str_eq(word, "fn") { r = true
+    } else if str_eq(word, "let") { r = true
+    } else if str_eq(word, "if") { r = true
+    } else if str_eq(word, "else") { r = true
+    } else if str_eq(word, "for") { r = true
+    } else if str_eq(word, "in") { r = true
+    } else if str_eq(word, "match") { r = true
+    } else if str_eq(word, "return") { r = true
+    } else if str_eq(word, "break") { r = true
+    } else if str_eq(word, "continue") { r = true
+    } else if str_eq(word, "while") { r = true
+    } else if str_eq(word, "loop") { r = true
+    } else if str_eq(word, "true") { r = true
+    } else if str_eq(word, "false") { r = true
+    } else if str_eq(word, "none") { r = true
+    } else if str_eq(word, "use") { r = true
+    } else if str_eq(word, "as") { r = true
+    } else if str_eq(word, "struct") { r = true
+    } else if str_eq(word, "enum") { r = true
+    } else if str_eq(word, "impl") { r = true
+    } else if str_eq(word, "trait") { r = true
+    } else if str_eq(word, "type") { r = true
+    } else if str_eq(word, "const") { r = true
+    } else if str_eq(word, "mut") { r = true
+    } else if str_eq(word, "ref") { r = true
+    } else if str_eq(word, "defer") { r = true
+    } else if str_eq(word, "spawn") { r = true
+    } else if str_eq(word, "await") { r = true
+    } else if str_eq(word, "select") { r = true
+    } else if str_eq(word, "try") { r = true
+    } else if str_eq(word, "unsafe") { r = true
+    } else if str_eq(word, "comptime") { r = true
+    } else if str_eq(word, "agent") { r = true
+    } else if str_eq(word, "capability") { r = true
+    } else if str_eq(word, "guard") { r = true
+    } else if str_eq(word, "budget") { r = true
+    } else if str_eq(word, "tool") { r = true
+    } else if str_eq(word, "ask") { r = true
+    } else if str_eq(word, "allow") { r = true
+    } else if str_eq(word, "deny") { r = true
+    } else if str_eq(word, "ensure") { r = true
+    } else if str_eq(word, "repeat") { r = true
+    } else if str_eq(word, "endpoint") { r = true
+    } else if str_eq(word, "driver") { r = true
+    } else if str_eq(word, "about") { r = true
+    } else if str_eq(word, "chan") { r = true
+    } else if str_eq(word, "channel") { r = true
+    } else if str_eq(word, "choices") { r = true
+    } else if str_eq(word, "each") { r = true
+    } else if str_eq(word, "guardset") { r = true
+    } else if str_eq(word, "interface") { r = true
+    } else if str_eq(word, "invariant") { r = true
+    } else if str_eq(word, "is") { r = true
+    } else if str_eq(word, "keep") { r = true
+    } else if str_eq(word, "memory") { r = true
+    } else if str_eq(word, "mesh") { r = true
+    } else if str_eq(word, "mod") { r = true
+    } else if str_eq(word, "otherwise") { r = true
+    } else if str_eq(word, "priv") { r = true
+    } else if str_eq(word, "prompt") { r = true
+    } else if str_eq(word, "pub") { r = true
+    } else if str_eq(word, "requires") { r = true
+    } else if str_eq(word, "route") { r = true
+    } else if str_eq(word, "router") { r = true
+    } else if str_eq(word, "secret") { r = true
+    } else if str_eq(word, "showing") { r = true
+    } else if str_eq(word, "skill") { r = true
+    } else if str_eq(word, "strategy") { r = true
+    } else if str_eq(word, "supervisor") { r = true
+    } else if str_eq(word, "taint") { r = true
+    } else if str_eq(word, "tell") { r = true
+    } else if str_eq(word, "timeout") { r = true
+    } else if str_eq(word, "times") { r = true
+    } else if str_eq(word, "until") { r = true
+    } else if str_eq(word, "wait") { r = true
+    } else if str_eq(word, "where") { r = true
+    }
+    r
+}
+
+// ── Token Name (for display) ────────────────────────────────
+
+fn token_name(kind: int) -> string {
+    let n = "?"
+    if kind == 0 { n = "EOF"
+    } else if kind == 1 { n = "IDENT"
+    } else if kind == 2 { n = "INT"
+    } else if kind == 3 { n = "STRING"
+    } else if kind == 4 { n = "KW"
+    } else if kind == 5 { n = "FLOAT"
+    } else if kind == 10 { n = "PLUS"
+    } else if kind == 11 { n = "MINUS"
+    } else if kind == 12 { n = "STAR"
+    } else if kind == 13 { n = "SLASH"
+    } else if kind == 14 { n = "EQ"
+    } else if kind == 15 { n = "EQ_EQ"
+    } else if kind == 16 { n = "BANG"
+    } else if kind == 17 { n = "BANG_EQ"
+    } else if kind == 18 { n = "LT"
+    } else if kind == 19 { n = "GT"
+    } else if kind == 20 { n = "LT_EQ"
+    } else if kind == 21 { n = "GT_EQ"
+    } else if kind == 22 { n = "ARROW"
+    } else if kind == 23 { n = "COLON"
+    } else if kind == 24 { n = "COMMA"
+    } else if kind == 25 { n = "DOT"
+    } else if kind == 26 { n = "PIPE"
+    } else if kind == 27 { n = "AMP"
+    } else if kind == 28 { n = "QUESTION"
+    } else if kind == 29 { n = "AT"
+    } else if kind == 30 { n = "HASH"
+    } else if kind == 31 { n = "SEMI"
+    } else if kind == 32 { n = "DOT_DOT"
+    } else if kind == 33 { n = "PIPE_GT"
+    } else if kind == 40 { n = "LPAREN"
+    } else if kind == 41 { n = "RPAREN"
+    } else if kind == 42 { n = "LBRACE"
+    } else if kind == 43 { n = "RBRACE"
+    } else if kind == 44 { n = "LBRACKET"
+    } else if kind == 45 { n = "RBRACKET"
+    } else if kind == 99 { n = "ERROR"
+    }
+    n
+}
+
+// ── Entry Point ─────────────────────────────────────────────
+// All lexing happens in main() because Vecs cannot be passed to
+// helper functions (the C codegen passes LcnVec by value).
+
+fn main() -> Result {
+    let file_path = env("LEX_FILE")
+    ensure str_len(file_path) > 0, "Set LEX_FILE to the .lceron file to tokenize"
+
+    let source = read_file(file_path)
+    ensure str_len(source) > 0, "Could not read file or file is empty"
+
+    let src_len = str_len(source)
+
+    // Token storage — parallel Vecs
+    let kinds = vec_new()
+    let values = vec_new()
+    let lines = vec_new()
+
+    let pos = 0
+    let line = 1
+    let count = 0
+
+    // ── Main lex loop ───────────────────────────────────
+    for _tick in 0..500000 {
+        if pos >= src_len {
+            break
+        }
+
+        let ch = char_at(source, pos)
+        let code = char_code(ch)
+
+        // Whitespace (space=32, tab=9, CR=13) — skip
+        if code == 32 { pos = pos + 1
+        } else if code == 9 { pos = pos + 1
+        } else if code == 13 { pos = pos + 1
+
+        // Newline (LF=10) — track line numbers
+        } else if code == 10 {
+            line = line + 1
+            pos = pos + 1
+
+        // Line comment: // (slash=47)
+        } else if code == 47 {
+            let is_comment = false
+            if pos + 1 < src_len {
+                if char_code(char_at(source, pos + 1)) == 47 {
+                    is_comment = true
+                }
+            }
+            if is_comment {
+                pos = pos + 2
+                for _cmt in 0..500000 {
+                    if pos >= src_len { break }
+                    if char_code(char_at(source, pos)) == 10 { break }
+                    pos = pos + 1
+                }
+            } else {
+                vec_push(kinds, to_string(13))
+                vec_push(values, "/")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 1
+            }
+
+        // Identifiers and keywords (starts with alpha or _)
+        } else if str_char_is_alpha(ch) {
+            let start = pos
+            pos = pos + 1
+            for _id in 0..10000 {
+                if pos >= src_len { break }
+                if str_char_is_alnum(char_at(source, pos)) {
+                    pos = pos + 1
+                } else { break }
+            }
+            let word = str_slice(source, start, pos)
+            if is_keyword(word) {
+                vec_push(kinds, to_string(4))
+            } else {
+                vec_push(kinds, to_string(1))
+            }
+            vec_push(values, word)
+            vec_push(lines, to_string(line))
+            count = count + 1
+
+        // Numbers (starts with digit)
+        } else if str_char_is_digit(ch) {
+            let nstart = pos
+            pos = pos + 1
+            for _d in 0..10000 {
+                if pos >= src_len { break }
+                if str_char_is_digit(char_at(source, pos)) { pos = pos + 1
+                } else { break }
+            }
+            // Check for decimal point (float) — but not '..' range
+            let is_float = false
+            if pos < src_len {
+                if char_code(char_at(source, pos)) == 46 {
+                    let has_digit_after = false
+                    if pos + 1 < src_len {
+                        if str_char_is_digit(char_at(source, pos + 1)) {
+                            has_digit_after = true
+                        }
+                    }
+                    if has_digit_after {
+                        is_float = true
+                        pos = pos + 1
+                        for _fd in 0..10000 {
+                            if pos >= src_len { break }
+                            if str_char_is_digit(char_at(source, pos)) { pos = pos + 1
+                            } else { break }
+                        }
+                    }
+                }
+            }
+            let num_text = str_slice(source, nstart, pos)
+            if is_float {
+                vec_push(kinds, to_string(5))
+            } else {
+                vec_push(kinds, to_string(2))
+            }
+            vec_push(values, num_text)
+            vec_push(lines, to_string(line))
+            count = count + 1
+
+        // String literal: "..." (double-quote=34, backslash=92)
+        } else if code == 34 {
+            pos = pos + 1
+            let sstart = pos
+            for _s in 0..500000 {
+                if pos >= src_len { break }
+                let sc = char_code(char_at(source, pos))
+                if sc == 92 { pos = pos + 2
+                } else if sc == 34 { break
+                } else {
+                    if sc == 10 { line = line + 1 }
+                    pos = pos + 1
+                }
+            }
+            let str_val = str_slice(source, sstart, pos)
+            if pos < src_len { pos = pos + 1 }
+            vec_push(kinds, to_string(3))
+            vec_push(values, str_val)
+            vec_push(lines, to_string(line))
+            count = count + 1
+
+        // Raw string: `...` (backtick=96)
+        } else if code == 96 {
+            pos = pos + 1
+            let rstart = pos
+            for _r in 0..500000 {
+                if pos >= src_len { break }
+                if char_code(char_at(source, pos)) == 96 { break }
+                if char_code(char_at(source, pos)) == 10 { line = line + 1 }
+                pos = pos + 1
+            }
+            let raw_val = str_slice(source, rstart, pos)
+            if pos < src_len { pos = pos + 1 }
+            vec_push(kinds, to_string(3))
+            vec_push(values, raw_val)
+            vec_push(lines, to_string(line))
+            count = count + 1
+
+        // ( ) { } [ ]
+        } else if code == 40 { vec_push(kinds, to_string(40)); vec_push(values, "("); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 41 { vec_push(kinds, to_string(41)); vec_push(values, ")"); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 123 { vec_push(kinds, to_string(42)); vec_push(values, "{"); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 125 { vec_push(kinds, to_string(43)); vec_push(values, "}"); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 91 { vec_push(kinds, to_string(44)); vec_push(values, "["); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 93 { vec_push(kinds, to_string(45)); vec_push(values, "]"); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+
+        // + * , ? @ # & ;
+        } else if code == 43 { vec_push(kinds, to_string(10)); vec_push(values, "+"); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 42 { vec_push(kinds, to_string(12)); vec_push(values, "*"); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 44 { vec_push(kinds, to_string(24)); vec_push(values, ","); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 63 { vec_push(kinds, to_string(28)); vec_push(values, "?"); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 64 { vec_push(kinds, to_string(29)); vec_push(values, "@"); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 35 { vec_push(kinds, to_string(30)); vec_push(values, "#"); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 38 { vec_push(kinds, to_string(27)); vec_push(values, "&"); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+        } else if code == 59 { vec_push(kinds, to_string(31)); vec_push(values, ";"); vec_push(lines, to_string(line)); count = count + 1; pos = pos + 1
+
+        // : (colon=58)
+        } else if code == 58 {
+            vec_push(kinds, to_string(23))
+            vec_push(values, ":")
+            vec_push(lines, to_string(line))
+            count = count + 1
+            pos = pos + 1
+
+        // . or .. (dot=46)
+        } else if code == 46 {
+            let is_dotdot = false
+            if pos + 1 < src_len {
+                if char_code(char_at(source, pos + 1)) == 46 { is_dotdot = true }
+            }
+            if is_dotdot {
+                vec_push(kinds, to_string(32))
+                vec_push(values, "..")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 2
+            } else {
+                vec_push(kinds, to_string(25))
+                vec_push(values, ".")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 1
+            }
+
+        // | or |> (pipe=124, gt=62)
+        } else if code == 124 {
+            let is_pipe_gt = false
+            if pos + 1 < src_len {
+                if char_code(char_at(source, pos + 1)) == 62 { is_pipe_gt = true }
+            }
+            if is_pipe_gt {
+                vec_push(kinds, to_string(33))
+                vec_push(values, "|>")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 2
+            } else {
+                vec_push(kinds, to_string(26))
+                vec_push(values, "|")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 1
+            }
+
+        // - or -> (minus=45, gt=62)
+        } else if code == 45 {
+            let is_arrow = false
+            if pos + 1 < src_len {
+                if char_code(char_at(source, pos + 1)) == 62 { is_arrow = true }
+            }
+            if is_arrow {
+                vec_push(kinds, to_string(22))
+                vec_push(values, "->")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 2
+            } else {
+                vec_push(kinds, to_string(11))
+                vec_push(values, "-")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 1
+            }
+
+        // = or == (eq=61)
+        } else if code == 61 {
+            let is_eq_eq = false
+            if pos + 1 < src_len {
+                if char_code(char_at(source, pos + 1)) == 61 { is_eq_eq = true }
+            }
+            if is_eq_eq {
+                vec_push(kinds, to_string(15))
+                vec_push(values, "==")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 2
+            } else {
+                vec_push(kinds, to_string(14))
+                vec_push(values, "=")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 1
+            }
+
+        // < or <= (lt=60)
+        } else if code == 60 {
+            let is_lt_eq = false
+            if pos + 1 < src_len {
+                if char_code(char_at(source, pos + 1)) == 61 { is_lt_eq = true }
+            }
+            if is_lt_eq {
+                vec_push(kinds, to_string(20))
+                vec_push(values, "<=")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 2
+            } else {
+                vec_push(kinds, to_string(18))
+                vec_push(values, "<")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 1
+            }
+
+        // > or >= (gt=62)
+        } else if code == 62 {
+            let is_gt_eq = false
+            if pos + 1 < src_len {
+                if char_code(char_at(source, pos + 1)) == 61 { is_gt_eq = true }
+            }
+            if is_gt_eq {
+                vec_push(kinds, to_string(21))
+                vec_push(values, ">=")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 2
+            } else {
+                vec_push(kinds, to_string(19))
+                vec_push(values, ">")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 1
+            }
+
+        // ! or != (bang=33)
+        } else if code == 33 {
+            let is_bang_eq = false
+            if pos + 1 < src_len {
+                if char_code(char_at(source, pos + 1)) == 61 { is_bang_eq = true }
+            }
+            if is_bang_eq {
+                vec_push(kinds, to_string(17))
+                vec_push(values, "!=")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 2
+            } else {
+                vec_push(kinds, to_string(16))
+                vec_push(values, "!")
+                vec_push(lines, to_string(line))
+                count = count + 1
+                pos = pos + 1
+            }
+
+        // Unknown character — skip
+        } else {
+            pos = pos + 1
+        }
+    }
+
+    // Append EOF sentinel
+    vec_push(kinds, to_string(0))
+    vec_push(values, "")
+    vec_push(lines, to_string(line))
+    count = count + 1
+
+    // ── Print output ────────────────────────────────────
+    println("=== Limceron Lexer (self-hosted) ===")
+    println("File: " + file_path)
+    println("Source: " + to_string(src_len) + " bytes")
+    println("Tokens: " + to_string(count))
+    println("------------------------------------")
+
+    for i in 0..count {
+        let kind = to_int(vec_get(kinds, i))
+        let value = vec_get(values, i)
+        let ln = vec_get(lines, i)
+        let name: string = token_name(kind)
+        if str_len(value) > 0 {
+            println(ln + ":\t" + name + "\t" + value)
+        } else {
+            println(ln + ":\t" + name)
+        }
+    }
+
+    println("------------------------------------")
+    println("Done.")
+}

@@ -1,0 +1,7 @@
+// Batch processing for agent workloads
+// Handles chunking, progress reporting, and partial failure.
+
+fn batch_size() -> i64 { }            // builtin — reads BATCH_SIZE env var, default 50
+fn batch_offset() -> i64 { }          // builtin — reads BATCH_OFFSET env var, default 0
+fn batch_dry_run() -> bool { }        // builtin — reads DRY_RUN env var
+fn batch_progress(current: i64, total: i64) -> void { }  // builtin — prints progress to stderr

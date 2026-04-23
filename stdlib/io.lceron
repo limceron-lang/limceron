@@ -1,0 +1,8 @@
+// Standard I/O — print, read, file operations
+// All functions are compiler builtins handled by codegen.
+
+fn print(text: string) -> void { }      // builtin
+fn println(text: string) -> void { }    // builtin
+fn read_line() -> string { }            // builtin — reads from stdin
+fn read_file(path: string) -> string { }    // builtin
+fn write_file(path: string, content: string) -> bool { }  // builtin

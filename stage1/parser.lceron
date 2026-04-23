@@ -1,0 +1,2474 @@
+// stage1/parser.lceron
+// Limceron Parser — Written in Limceron (self-hosting, Stage 1)
+//
+// Second piece of the self-hosting compiler. Takes .lceron source,
+// lexes it, then parses into an S-expression AST string.
+//
+// Usage:
+//   ./build/limceron-stage0 build stage1/parser.lceron -o build/limceron-parser
+//   LEX_FILE=examples/language/01_hello_agent.lceron ./build/limceron-parser
+//
+// Design:
+//   - Lexer is inlined (Vecs can't cross function boundaries)
+//   - After lexing, tokens are encoded into a flat string: "kind\tvalue\n..."
+//   - Parse functions take (tokens_string, char_offset) and return "new_offset\tS-expr"
+//   - Recursive descent with pack/unpack for position threading
+
+// ── Token Kind Constants ────────────────────────────────────
+// 0=EOF  1=IDENT  2=INT  3=STRING  4=KEYWORD  5=FLOAT
+// 10=+  11=-  12=*  13=/  14==  15===  16=!  17=!=
+// 18=<  19=>  20=<=  21=>=  22=->  23=:  24=,  25=.
+// 26=|  27=&  28=?  29=@  30=#  31=;  32=..  33=|>
+// 40=(  41=)  42={  43=}  44=[  45=]
+
+// ── Keyword Recognition ─────────────────────────────────────
+
+fn is_keyword(word: string) -> bool {
+    let r = false
+    if str_eq(word, "fn") { r = true
+    } else if str_eq(word, "let") { r = true
+    } else if str_eq(word, "if") { r = true
+    } else if str_eq(word, "else") { r = true
+    } else if str_eq(word, "for") { r = true
+    } else if str_eq(word, "in") { r = true
+    } else if str_eq(word, "match") { r = true
+    } else if str_eq(word, "return") { r = true
+    } else if str_eq(word, "break") { r = true
+    } else if str_eq(word, "continue") { r = true
+    } else if str_eq(word, "while") { r = true
+    } else if str_eq(word, "loop") { r = true
+    } else if str_eq(word, "true") { r = true
+    } else if str_eq(word, "false") { r = true
+    } else if str_eq(word, "none") { r = true
+    } else if str_eq(word, "use") { r = true
+    } else if str_eq(word, "as") { r = true
+    } else if str_eq(word, "struct") { r = true
+    } else if str_eq(word, "enum") { r = true
+    } else if str_eq(word, "impl") { r = true
+    } else if str_eq(word, "trait") { r = true
+    } else if str_eq(word, "type") { r = true
+    } else if str_eq(word, "const") { r = true
+    } else if str_eq(word, "mut") { r = true
+    } else if str_eq(word, "ref") { r = true
+    } else if str_eq(word, "defer") { r = true
+    } else if str_eq(word, "spawn") { r = true
+    } else if str_eq(word, "await") { r = true
+    } else if str_eq(word, "select") { r = true
+    } else if str_eq(word, "try") { r = true
+    } else if str_eq(word, "unsafe") { r = true
+    } else if str_eq(word, "comptime") { r = true
+    } else if str_eq(word, "agent") { r = true
+    } else if str_eq(word, "capability") { r = true
+    } else if str_eq(word, "guard") { r = true
+    } else if str_eq(word, "budget") { r = true
+    } else if str_eq(word, "tool") { r = true
+    } else if str_eq(word, "ask") { r = true
+    } else if str_eq(word, "allow") { r = true
+    } else if str_eq(word, "deny") { r = true
+    } else if str_eq(word, "ensure") { r = true
+    } else if str_eq(word, "repeat") { r = true
+    } else if str_eq(word, "endpoint") { r = true
+    } else if str_eq(word, "driver") { r = true
+    } else if str_eq(word, "supervisor") { r = true
+    } else if str_eq(word, "mesh") { r = true
+    } else if str_eq(word, "router") { r = true
+    } else if str_eq(word, "route") { r = true
+    } else if str_eq(word, "interface") { r = true
+    }
+    r
+}
+
+// ── Token Access Helpers ────────────────────────────────────
+// Tokens are encoded as "kind\tvalue\nkind\tvalue\n..."
+// These functions extract token data at a given character offset.
+
+fn tok_kind(toks: string, off: int) -> int {
+    let tlen = str_len(toks)
+    let r = 0
+    if off >= tlen {
+        r = 0
+    } else {
+        let rest = str_slice(toks, off, tlen)
+        let tab = str_find(rest, "\t")
+        if tab < 0 {
+            r = 0
+        } else {
+            r = to_int(str_slice(toks, off, off + tab))
+        }
+    }
+    r
+}
+
+fn tok_val(toks: string, off: int) -> string {
+    let tlen = str_len(toks)
+    let r = ""
+    if off >= tlen {
+        r = ""
+    } else {
+        let rest = str_slice(toks, off, tlen)
+        let tab = str_find(rest, "\t")
+        if tab < 0 {
+            r = ""
+        } else {
+            let after = off + tab + 1
+            let rest2 = str_slice(toks, after, tlen)
+            let nl = str_find(rest2, "\n")
+            if nl < 0 {
+                r = str_slice(toks, after, tlen)
+            } else {
+                r = str_slice(toks, after, after + nl)
+            }
+        }
+    }
+    r
+}
+
+fn tok_next(toks: string, off: int) -> int {
+    let tlen = str_len(toks)
+    let r = off
+    if off >= tlen {
+        r = tlen
+    } else {
+        let rest = str_slice(toks, off, tlen)
+        let nl = str_find(rest, "\n")
+        if nl < 0 {
+            r = tlen
+        } else {
+            r = off + nl + 1
+        }
+    }
+    r
+}
+
+// ── Pack / Unpack (position + AST result) ───────────────────
+// Parse functions return "offset\tast_string" so callers can
+// recover both the new position and the parsed S-expression.
+
+fn pack(p: int, ast: string) -> string {
+    to_string(p) + "\t" + ast
+}
+
+fn upos(r: string) -> int {
+    let tab = str_find(r, "\t")
+    let result = 0
+    if tab < 0 {
+        result = 0
+    } else {
+        result = to_int(str_slice(r, 0, tab))
+    }
+    result
+}
+
+fn uast(r: string) -> string {
+    let tab = str_find(r, "\t")
+    let result = r
+    if tab < 0 {
+        result = r
+    } else {
+        result = str_slice(r, tab + 1, str_len(r))
+    }
+    result
+}
+
+// ── Parse: Primary Expressions ──────────────────────────────
+
+fn parse_primary(toks: string, pos: int) -> string {
+    let k = tok_kind(toks, pos)
+    let v = tok_val(toks, pos)
+    let r = ""
+
+    if k == 2 {
+        // Integer literal
+        r = pack(tok_next(toks, pos), "(int " + v + ")")
+
+    } else if k == 5 {
+        // Float literal
+        r = pack(tok_next(toks, pos), "(float " + v + ")")
+
+    } else if k == 3 {
+        // String literal
+        let sb = sb_new()
+        sb_append(sb, "(string \"")
+        sb_append(sb, v)
+        sb_append(sb, "\")")
+        r = pack(tok_next(toks, pos), sb_to_string(sb))
+
+    } else if k == 4 {
+        // Keywords used as expressions
+        if str_eq(v, "true") {
+            r = pack(tok_next(toks, pos), "(bool true)")
+        } else if str_eq(v, "false") {
+            r = pack(tok_next(toks, pos), "(bool false)")
+        } else if str_eq(v, "none") {
+            r = pack(tok_next(toks, pos), "(none)")
+        } else if str_eq(v, "ask") {
+            // ask(expr) — built-in call
+            let p2 = tok_next(toks, pos)
+            if tok_kind(toks, p2) == 40 {
+                let p3 = tok_next(toks, p2)
+                let arg_r = parse_expr(toks, p3)
+                let p4 = upos(arg_r)
+                let arg_ast = uast(arg_r)
+                if tok_kind(toks, p4) == 41 {
+                    p4 = tok_next(toks, p4)
+                }
+                r = pack(p4, "(ask " + arg_ast + ")")
+            } else {
+                r = pack(p2, "(ask)")
+            }
+        } else if str_eq(v, "comptime") {
+            // comptime { block }
+            let p2 = tok_next(toks, pos)
+            let blk = parse_block(toks, p2)
+            r = pack(upos(blk), "(comptime " + uast(blk) + ")")
+        } else if str_eq(v, "spawn") {
+            // spawn expr
+            let p2 = tok_next(toks, pos)
+            let val = parse_expr(toks, p2)
+            r = pack(upos(val), "(spawn " + uast(val) + ")")
+        } else {
+            // Other keywords as identifiers (e.g., agent name refs)
+            r = pack(tok_next(toks, pos), "(ident " + v + ")")
+        }
+
+    } else if k == 1 {
+        // Identifier — might be fn call, struct init, field access, or bare ident
+        // task_group { block } — structured concurrency (parsed as identifier, not keyword)
+        if str_eq(v, "task_group") {
+            let p2 = tok_next(toks, pos)
+            if tok_kind(toks, p2) == 42 {
+                let blk = parse_block(toks, p2)
+                r = pack(upos(blk), "(task_group " + uast(blk) + ")")
+            } else {
+                r = pack(p2, "(ident " + v + ")")
+            }
+        } else {
+        let p2 = tok_next(toks, pos)
+        let k2 = tok_kind(toks, p2)
+        if k2 == 40 {
+            // Function call: name(args...)
+            r = parse_call(toks, pos)
+        } else if k2 == 42 {
+            // Could be struct init: Name { field: expr, ... }
+            // Look ahead: if token after '{' is IDENT followed by ':', it's struct init
+            let p3 = tok_next(toks, p2)
+            let k3 = tok_kind(toks, p3)
+            let p4 = tok_next(toks, p3)
+            let k4 = tok_kind(toks, p4)
+            if k3 == 1 {
+                if k4 == 23 {
+                    // struct init: Name { field: expr, ... }
+                    r = parse_struct_init(toks, pos)
+                } else {
+                    r = pack(p2, "(ident " + v + ")")
+                }
+            } else {
+                r = pack(p2, "(ident " + v + ")")
+            }
+        } else {
+            r = pack(p2, "(ident " + v + ")")
+        }
+        }
+
+    } else if k == 40 {
+        // Parenthesized expression
+        let p2 = tok_next(toks, pos)
+        let inner = parse_expr(toks, p2)
+        let p3 = upos(inner)
+        if tok_kind(toks, p3) == 41 {
+            p3 = tok_next(toks, p3)
+        }
+        r = pack(p3, uast(inner))
+
+    } else if k == 11 {
+        // Unary minus: -expr
+        let p2 = tok_next(toks, pos)
+        let inner = parse_primary(toks, p2)
+        r = pack(upos(inner), "(neg " + uast(inner) + ")")
+
+    } else if k == 16 {
+        // Unary not: !expr
+        let p2 = tok_next(toks, pos)
+        let inner = parse_primary(toks, p2)
+        r = pack(upos(inner), "(not " + uast(inner) + ")")
+
+    } else if k == 44 {
+        // Array literal: [expr, expr, ...]
+        let p2 = tok_next(toks, pos)
+        let sb = sb_new()
+        sb_append(sb, "(array")
+        let done = false
+        let cur = p2
+        for _a in 0..1000 {
+            if done { break }
+            if tok_kind(toks, cur) == 45 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else {
+                let elem = parse_expr(toks, cur)
+                cur = upos(elem)
+                sb_append(sb, " ")
+                sb_append(sb, uast(elem))
+                if tok_kind(toks, cur) == 24 {
+                    cur = tok_next(toks, cur)
+                }
+            }
+        }
+        if tok_kind(toks, cur) == 45 {
+            cur = tok_next(toks, cur)
+        }
+        sb_append(sb, ")")
+        r = pack(cur, sb_to_string(sb))
+
+    } else {
+        // Unknown — skip token
+        r = pack(tok_next(toks, pos), "(error unknown-primary)")
+    }
+    r
+}
+
+// ── Parse: Function Call ────────────────────────────────────
+
+fn parse_call(toks: string, pos: int) -> string {
+    let name = tok_val(toks, pos)
+    let p2 = tok_next(toks, pos)
+    // skip '('
+    let p3 = tok_next(toks, p2)
+
+    let sb = sb_new()
+    sb_append(sb, "(call ")
+    sb_append(sb, name)
+
+    let done = false
+    let cur = p3
+    for _c in 0..100 {
+        if done { break }
+        if tok_kind(toks, cur) == 41 {
+            done = true
+        } else if tok_kind(toks, cur) == 0 {
+            done = true
+        } else {
+            let arg = parse_expr(toks, cur)
+            cur = upos(arg)
+            sb_append(sb, " ")
+            sb_append(sb, uast(arg))
+            if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            }
+        }
+    }
+    if tok_kind(toks, cur) == 41 {
+        cur = tok_next(toks, cur)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: Struct Initialization ────────────────────────────
+// Name { field: expr, field: expr, ... }
+// Produces: (map Name (entry field expr) (entry field expr) ...)
+
+fn parse_struct_init(toks: string, pos: int) -> string {
+    let name = tok_val(toks, pos)
+    let cur = tok_next(toks, pos)
+    // skip '{'
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(map ")
+    sb_append(sb, name)
+
+    let done = false
+    for _si in 0..100 {
+        if done { break }
+        if tok_kind(toks, cur) == 43 {
+            // '}'
+            done = true
+        } else if tok_kind(toks, cur) == 0 {
+            done = true
+        } else {
+            // expect: fieldname ':' expr [',']
+            let fname = tok_val(toks, cur)
+            cur = tok_next(toks, cur)
+            // skip ':'
+            if tok_kind(toks, cur) == 23 {
+                cur = tok_next(toks, cur)
+            }
+            let val = parse_expr(toks, cur)
+            cur = upos(val)
+            sb_append(sb, " (entry ")
+            sb_append(sb, fname)
+            sb_append(sb, " ")
+            sb_append(sb, uast(val))
+            sb_append(sb, ")")
+            // skip optional ','
+            if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            }
+        }
+    }
+    if tok_kind(toks, cur) == 43 {
+        cur = tok_next(toks, cur)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: Postfix (dot access, method calls) ───────────────
+
+fn parse_postfix(toks: string, pos: int) -> string {
+    let left = parse_primary(toks, pos)
+    let cur = upos(left)
+    let ast = uast(left)
+
+    let done = false
+    for _dot in 0..100 {
+        if done { break }
+        if tok_kind(toks, cur) == 25 {
+            // dot access: expr.field or expr.method(args)
+            let p2 = tok_next(toks, cur)
+            let field = tok_val(toks, p2)
+            let p3 = tok_next(toks, p2)
+            if tok_kind(toks, p3) == 40 {
+                // method call: expr.method(args...)
+                let p4 = tok_next(toks, p3)
+                let sb = sb_new()
+                sb_append(sb, "(method ")
+                sb_append(sb, ast)
+                sb_append(sb, " ")
+                sb_append(sb, field)
+                let mdone = false
+                let mcur = p4
+                for _m in 0..100 {
+                    if mdone { break }
+                    if tok_kind(toks, mcur) == 41 {
+                        mdone = true
+                    } else if tok_kind(toks, mcur) == 0 {
+                        mdone = true
+                    } else {
+                        let marg = parse_expr(toks, mcur)
+                        mcur = upos(marg)
+                        sb_append(sb, " ")
+                        sb_append(sb, uast(marg))
+                        if tok_kind(toks, mcur) == 24 {
+                            mcur = tok_next(toks, mcur)
+                        }
+                    }
+                }
+                if tok_kind(toks, mcur) == 41 {
+                    mcur = tok_next(toks, mcur)
+                }
+                sb_append(sb, ")")
+                ast = sb_to_string(sb)
+                cur = mcur
+            } else {
+                // field access: expr.field
+                ast = "(field " + ast + " " + field + ")"
+                cur = p3
+            }
+        } else {
+            done = true
+        }
+    }
+    pack(cur, ast)
+}
+
+// ── Parse: Binary Expressions (precedence climbing) ─────────
+
+fn op_prec(toks: string, pos: int) -> int {
+    let k = tok_kind(toks, pos)
+    let r = 0
+    if k == 15 { r = 3
+    } else if k == 17 { r = 3
+    } else if k == 18 { r = 4
+    } else if k == 19 { r = 4
+    } else if k == 20 { r = 4
+    } else if k == 21 { r = 4
+    } else if k == 10 { r = 5
+    } else if k == 11 { r = 5
+    } else if k == 12 { r = 6
+    } else if k == 13 { r = 6
+    } else if k == 33 { r = 2
+    }
+    r
+}
+
+fn op_str(kind: int) -> string {
+    let r = "?"
+    if kind == 10 { r = "+"
+    } else if kind == 11 { r = "-"
+    } else if kind == 12 { r = "*"
+    } else if kind == 13 { r = "/"
+    } else if kind == 15 { r = "=="
+    } else if kind == 17 { r = "!="
+    } else if kind == 18 { r = "<"
+    } else if kind == 19 { r = ">"
+    } else if kind == 20 { r = "<="
+    } else if kind == 21 { r = ">="
+    } else if kind == 33 { r = "|>"
+    }
+    r
+}
+
+fn parse_expr_prec(toks: string, pos: int, min_prec: int) -> string {
+    let left = parse_postfix(toks, pos)
+    let cur = upos(left)
+    let ast = uast(left)
+
+    let done = false
+    for _bp in 0..200 {
+        if done { break }
+        let prec = op_prec(toks, cur)
+        if prec < min_prec {
+            done = true
+        } else if prec == 0 {
+            done = true
+        } else {
+            let opk = tok_kind(toks, cur)
+            let op = op_str(opk)
+            let next_pos = tok_next(toks, cur)
+            let right = parse_expr_prec(toks, next_pos, prec + 1)
+            cur = upos(right)
+            let sb = sb_new()
+            sb_append(sb, "(")
+            sb_append(sb, op)
+            sb_append(sb, " ")
+            sb_append(sb, ast)
+            sb_append(sb, " ")
+            sb_append(sb, uast(right))
+            sb_append(sb, ")")
+            ast = sb_to_string(sb)
+        }
+    }
+    pack(cur, ast)
+}
+
+fn parse_expr(toks: string, pos: int) -> string {
+    parse_expr_prec(toks, pos, 1)
+}
+
+// ── Parse: Block { stmt; stmt; ... } ────────────────────────
+
+fn parse_block(toks: string, pos: int) -> string {
+    // expect '{'
+    let cur = pos
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+    }
+
+    let sb = sb_new()
+    sb_append(sb, "(block")
+
+    let done = false
+    for _b in 0..5000 {
+        if done { break }
+        // skip semicolons
+        if tok_kind(toks, cur) == 31 {
+            cur = tok_next(toks, cur)
+        } else if tok_kind(toks, cur) == 43 {
+            done = true
+        } else if tok_kind(toks, cur) == 0 {
+            done = true
+        } else {
+            let stmt = parse_statement(toks, cur)
+            cur = upos(stmt)
+            sb_append(sb, " ")
+            sb_append(sb, uast(stmt))
+        }
+    }
+    if tok_kind(toks, cur) == 43 {
+        cur = tok_next(toks, cur)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: Statements ───────────────────────────────────────
+
+fn parse_statement(toks: string, pos: int) -> string {
+    let k = tok_kind(toks, pos)
+    let v = tok_val(toks, pos)
+    let r = ""
+
+    if k == 4 {
+        if str_eq(v, "let") {
+            r = parse_let(toks, pos)
+        } else if str_eq(v, "if") {
+            r = parse_if(toks, pos)
+        } else if str_eq(v, "for") {
+            r = parse_for(toks, pos)
+        } else if str_eq(v, "match") {
+            r = parse_match(toks, pos)
+        } else if str_eq(v, "return") {
+            let p2 = tok_next(toks, pos)
+            let kn = tok_kind(toks, p2)
+            // return with value if next token is not } or ; or EOF
+            if kn == 43 {
+                r = pack(p2, "(return)")
+            } else if kn == 31 {
+                r = pack(p2, "(return)")
+            } else if kn == 0 {
+                r = pack(p2, "(return)")
+            } else {
+                let val = parse_expr(toks, p2)
+                r = pack(upos(val), "(return " + uast(val) + ")")
+            }
+        } else if str_eq(v, "break") {
+            r = pack(tok_next(toks, pos), "(break)")
+        } else if str_eq(v, "continue") {
+            r = pack(tok_next(toks, pos), "(continue)")
+        } else if str_eq(v, "ensure") {
+            r = parse_ensure(toks, pos)
+        } else if str_eq(v, "while") {
+            r = parse_while(toks, pos)
+        } else if str_eq(v, "loop") {
+            let p2 = tok_next(toks, pos)
+            let body = parse_block(toks, p2)
+            r = pack(upos(body), "(loop " + uast(body) + ")")
+        } else {
+            // keyword used as expression statement
+            let expr = parse_expr(toks, pos)
+            let ep = upos(expr)
+            let ea = uast(expr)
+            // check for assignment: expr = value
+            if tok_kind(toks, ep) == 14 {
+                let p2 = tok_next(toks, ep)
+                let val = parse_expr(toks, p2)
+                r = pack(upos(val), "(assign " + ea + " " + uast(val) + ")")
+            } else {
+                r = pack(ep, ea)
+            }
+        }
+    } else {
+        // Expression statement (possibly assignment)
+        let expr = parse_expr(toks, pos)
+        let ep = upos(expr)
+        let ea = uast(expr)
+        // check for assignment: expr = value
+        if tok_kind(toks, ep) == 14 {
+            let p2 = tok_next(toks, ep)
+            let val = parse_expr(toks, p2)
+            r = pack(upos(val), "(assign " + ea + " " + uast(val) + ")")
+        } else {
+            r = pack(ep, ea)
+        }
+    }
+    r
+}
+
+// ── Parse: let ──────────────────────────────────────────────
+
+fn parse_let(toks: string, pos: int) -> string {
+    // let name [: type] = expr
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    // optional type annotation
+    let ty = ""
+    if tok_kind(toks, cur) == 23 {
+        cur = tok_next(toks, cur)
+        ty = tok_val(toks, cur)
+        cur = tok_next(toks, cur)
+    }
+
+    let r = ""
+    if tok_kind(toks, cur) == 14 {
+        // has initializer
+        cur = tok_next(toks, cur)
+        let val = parse_expr(toks, cur)
+        let sb = sb_new()
+        sb_append(sb, "(let ")
+        sb_append(sb, name)
+        if str_len(ty) > 0 {
+            sb_append(sb, " :")
+            sb_append(sb, ty)
+        }
+        sb_append(sb, " ")
+        sb_append(sb, uast(val))
+        sb_append(sb, ")")
+        r = pack(upos(val), sb_to_string(sb))
+    } else {
+        // no initializer
+        let sb = sb_new()
+        sb_append(sb, "(let ")
+        sb_append(sb, name)
+        if str_len(ty) > 0 {
+            sb_append(sb, " :")
+            sb_append(sb, ty)
+        }
+        sb_append(sb, ")")
+        r = pack(cur, sb_to_string(sb))
+    }
+    r
+}
+
+// ── Parse: if/else ──────────────────────────────────────────
+
+fn parse_if(toks: string, pos: int) -> string {
+    // if condition { block } [else { block }]
+    let cur = tok_next(toks, pos)
+    let cond = parse_expr(toks, cur)
+    cur = upos(cond)
+
+    let then_b = parse_block(toks, cur)
+    cur = upos(then_b)
+
+    let sb = sb_new()
+    sb_append(sb, "(if ")
+    sb_append(sb, uast(cond))
+    sb_append(sb, " ")
+    sb_append(sb, uast(then_b))
+
+    // check for else
+    if tok_kind(toks, cur) == 4 {
+        if str_eq(tok_val(toks, cur), "else") {
+            cur = tok_next(toks, cur)
+            // else if or else block
+            if tok_kind(toks, cur) == 4 {
+                if str_eq(tok_val(toks, cur), "if") {
+                    let elif = parse_if(toks, cur)
+                    cur = upos(elif)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(elif))
+                } else {
+                    let else_b = parse_block(toks, cur)
+                    cur = upos(else_b)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(else_b))
+                }
+            } else {
+                let else_b = parse_block(toks, cur)
+                cur = upos(else_b)
+                sb_append(sb, " ")
+                sb_append(sb, uast(else_b))
+            }
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: for ──────────────────────────────────────────────
+
+fn parse_for(toks: string, pos: int) -> string {
+    // for ident in expr..expr { block }
+    // for ident in expr { block }
+    let cur = tok_next(toks, pos)
+    let var_name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    // expect 'in'
+    if tok_kind(toks, cur) == 4 {
+        if str_eq(tok_val(toks, cur), "in") {
+            cur = tok_next(toks, cur)
+        }
+    }
+
+    let start_e = parse_expr(toks, cur)
+    cur = upos(start_e)
+
+    let sb = sb_new()
+    // check for range (..)
+    if tok_kind(toks, cur) == 32 {
+        cur = tok_next(toks, cur)
+        let end_e = parse_expr(toks, cur)
+        cur = upos(end_e)
+        let body = parse_block(toks, cur)
+        cur = upos(body)
+        sb_append(sb, "(for ")
+        sb_append(sb, var_name)
+        sb_append(sb, " (range ")
+        sb_append(sb, uast(start_e))
+        sb_append(sb, " ")
+        sb_append(sb, uast(end_e))
+        sb_append(sb, ") ")
+        sb_append(sb, uast(body))
+        sb_append(sb, ")")
+    } else {
+        // for-in collection
+        let body = parse_block(toks, cur)
+        cur = upos(body)
+        sb_append(sb, "(for ")
+        sb_append(sb, var_name)
+        sb_append(sb, " ")
+        sb_append(sb, uast(start_e))
+        sb_append(sb, " ")
+        sb_append(sb, uast(body))
+        sb_append(sb, ")")
+    }
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: while ────────────────────────────────────────────
+
+fn parse_while(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let cond = parse_expr(toks, cur)
+    cur = upos(cond)
+    let body = parse_block(toks, cur)
+    cur = upos(body)
+    let sb = sb_new()
+    sb_append(sb, "(while ")
+    sb_append(sb, uast(cond))
+    sb_append(sb, " ")
+    sb_append(sb, uast(body))
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: match ────────────────────────────────────────────
+
+fn parse_match(toks: string, pos: int) -> string {
+    // match expr { pattern => expr, ... }
+    let cur = tok_next(toks, pos)
+    let subj = parse_expr(toks, cur)
+    cur = upos(subj)
+
+    let sb = sb_new()
+    sb_append(sb, "(match ")
+    sb_append(sb, uast(subj))
+
+    // expect '{'
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+    }
+
+    let done = false
+    for _m in 0..200 {
+        if done { break }
+        if tok_kind(toks, cur) == 43 {
+            done = true
+        } else if tok_kind(toks, cur) == 0 {
+            done = true
+        } else if tok_kind(toks, cur) == 24 {
+            // skip comma
+            cur = tok_next(toks, cur)
+        } else {
+            // parse pattern => body
+            let pat = parse_expr(toks, cur)
+            cur = upos(pat)
+            // expect =>  (which is = followed by >)
+            // Actually in Limceron, => is parsed as = then >
+            // The lexer produces EQ(14) then GT(19) for =>
+            if tok_kind(toks, cur) == 14 {
+                cur = tok_next(toks, cur)
+                if tok_kind(toks, cur) == 19 {
+                    cur = tok_next(toks, cur)
+                }
+            } else if tok_kind(toks, cur) == 22 {
+                // -> used as match arm separator
+                cur = tok_next(toks, cur)
+            }
+            // parse body — could be block or expression
+            let body_r = ""
+            if tok_kind(toks, cur) == 42 {
+                body_r = parse_block(toks, cur)
+            } else {
+                body_r = parse_expr(toks, cur)
+            }
+            cur = upos(body_r)
+            sb_append(sb, " (arm ")
+            sb_append(sb, uast(pat))
+            sb_append(sb, " ")
+            sb_append(sb, uast(body_r))
+            sb_append(sb, ")")
+        }
+    }
+    if tok_kind(toks, cur) == 43 {
+        cur = tok_next(toks, cur)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: ensure ───────────────────────────────────────────
+
+fn parse_ensure(toks: string, pos: int) -> string {
+    // ensure condition, "message"
+    let cur = tok_next(toks, pos)
+    let cond = parse_expr(toks, cur)
+    cur = upos(cond)
+
+    let msg = ""
+    if tok_kind(toks, cur) == 24 {
+        cur = tok_next(toks, cur)
+        let msg_e = parse_expr(toks, cur)
+        cur = upos(msg_e)
+        msg = uast(msg_e)
+    }
+
+    let sb = sb_new()
+    sb_append(sb, "(ensure ")
+    sb_append(sb, uast(cond))
+    if str_len(msg) > 0 {
+        sb_append(sb, " ")
+        sb_append(sb, msg)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: fn declaration ───────────────────────────────────
+
+fn parse_fn(toks: string, pos: int) -> string {
+    // fn name(params) [-> type] { block }
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(fn ")
+    sb_append(sb, name)
+    sb_append(sb, " (params")
+
+    // parse params
+    if tok_kind(toks, cur) == 40 {
+        cur = tok_next(toks, cur)
+        let pdone = false
+        for _p in 0..50 {
+            if pdone { break }
+            if tok_kind(toks, cur) == 41 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 0 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else {
+                let pname = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                let pty = ""
+                if tok_kind(toks, cur) == 23 {
+                    cur = tok_next(toks, cur)
+                    pty = tok_val(toks, cur)
+                    cur = tok_next(toks, cur)
+                }
+                sb_append(sb, " (")
+                sb_append(sb, pname)
+                if str_len(pty) > 0 {
+                    sb_append(sb, " :")
+                    sb_append(sb, pty)
+                }
+                sb_append(sb, ")")
+            }
+        }
+        if tok_kind(toks, cur) == 41 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+
+    // return type
+    if tok_kind(toks, cur) == 22 {
+        cur = tok_next(toks, cur)
+        let rtype = tok_val(toks, cur)
+        cur = tok_next(toks, cur)
+        sb_append(sb, " ->")
+        sb_append(sb, rtype)
+    }
+
+    // body (optional — absent in trait/interface signatures)
+    if tok_kind(toks, cur) == 42 {
+        sb_append(sb, " ")
+        let body = parse_block(toks, cur)
+        cur = upos(body)
+        sb_append(sb, uast(body))
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: agent declaration ────────────────────────────────
+
+fn parse_agent(toks: string, pos: int) -> string {
+    // agent Name { fields and methods }
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(agent ")
+    sb_append(sb, name)
+
+    // expect '{'
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+    }
+
+    let done = false
+    for _a in 0..500 {
+        if done { break }
+        if tok_kind(toks, cur) == 43 {
+            done = true
+        } else if tok_kind(toks, cur) == 0 {
+            done = true
+        } else if tok_kind(toks, cur) == 31 {
+            cur = tok_next(toks, cur)
+        } else if tok_kind(toks, cur) == 4 {
+            if str_eq(tok_val(toks, cur), "fn") {
+                // method
+                let meth = parse_fn(toks, cur)
+                cur = upos(meth)
+                sb_append(sb, " ")
+                sb_append(sb, uast(meth))
+            } else {
+                // agent keyword field (model, prompt, budget, etc.)
+                let fld = parse_agent_field(toks, cur)
+                cur = upos(fld)
+                sb_append(sb, " ")
+                sb_append(sb, uast(fld))
+            }
+        } else if tok_kind(toks, cur) == 1 {
+            // identifier field (capabilities, model, prompt, etc.)
+            let fld = parse_agent_field(toks, cur)
+            cur = upos(fld)
+            sb_append(sb, " ")
+            sb_append(sb, uast(fld))
+        } else {
+            cur = tok_next(toks, cur)
+        }
+    }
+    if tok_kind(toks, cur) == 43 {
+        cur = tok_next(toks, cur)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: agent field (key: value) ─────────────────────────
+
+fn parse_agent_field(toks: string, pos: int) -> string {
+    let fname = tok_val(toks, pos)
+    let cur = tok_next(toks, pos)
+    let r = ""
+
+    if tok_kind(toks, cur) == 23 {
+        // field: value
+        cur = tok_next(toks, cur)
+
+        if tok_kind(toks, cur) == 44 {
+            // array value: [item, item, ...]
+            cur = tok_next(toks, cur)
+            let sb = sb_new()
+            sb_append(sb, "(field ")
+            sb_append(sb, fname)
+            sb_append(sb, " (array")
+            let adone = false
+            for _af in 0..100 {
+                if adone { break }
+                if tok_kind(toks, cur) == 45 {
+                    adone = true
+                } else if tok_kind(toks, cur) == 0 {
+                    adone = true
+                } else if tok_kind(toks, cur) == 24 {
+                    cur = tok_next(toks, cur)
+                } else {
+                    // Could be dotted name like llm.complete
+                    let elem = parse_expr(toks, cur)
+                    cur = upos(elem)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(elem))
+                }
+            }
+            if tok_kind(toks, cur) == 45 {
+                cur = tok_next(toks, cur)
+            }
+            sb_append(sb, "))")
+            r = pack(cur, sb_to_string(sb))
+        } else if tok_kind(toks, cur) == 42 {
+            // inline block value: { key: val, ... }
+            let blk = parse_agent_inline_block(toks, cur)
+            cur = upos(blk)
+            r = pack(cur, "(field " + fname + " " + uast(blk) + ")")
+        } else {
+            let val = parse_expr(toks, cur)
+            cur = upos(val)
+            r = pack(cur, "(field " + fname + " " + uast(val) + ")")
+        }
+    } else {
+        // bare identifier (like 'complete' in capability)
+        r = pack(cur, "(field " + fname + ")")
+    }
+    r
+}
+
+// ── Parse: inline block { key: val, ... } ───────────────────
+
+fn parse_agent_inline_block(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let sb = sb_new()
+    sb_append(sb, "(obj")
+    let done = false
+    for _o in 0..100 {
+        if done { break }
+        if tok_kind(toks, cur) == 43 {
+            done = true
+        } else if tok_kind(toks, cur) == 0 {
+            done = true
+        } else if tok_kind(toks, cur) == 24 {
+            cur = tok_next(toks, cur)
+        } else {
+            let key = tok_val(toks, cur)
+            cur = tok_next(toks, cur)
+            if tok_kind(toks, cur) == 23 {
+                cur = tok_next(toks, cur)
+                let val = parse_expr(toks, cur)
+                cur = upos(val)
+                sb_append(sb, " (")
+                sb_append(sb, key)
+                sb_append(sb, " ")
+                sb_append(sb, uast(val))
+                sb_append(sb, ")")
+            } else {
+                sb_append(sb, " (")
+                sb_append(sb, key)
+                sb_append(sb, ")")
+            }
+        }
+    }
+    if tok_kind(toks, cur) == 43 {
+        cur = tok_next(toks, cur)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: capability declaration ───────────────────────────
+
+fn parse_capability(toks: string, pos: int) -> string {
+    // capability name { members... }
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(capability ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _c in 0..100 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else {
+                let cap_name = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                // check for 'requires'
+                if tok_kind(toks, cur) == 1 {
+                    if str_eq(tok_val(toks, cur), "requires") {
+                        cur = tok_next(toks, cur)
+                        let req = tok_val(toks, cur)
+                        cur = tok_next(toks, cur)
+                        sb_append(sb, " (cap ")
+                        sb_append(sb, cap_name)
+                        sb_append(sb, " requires ")
+                        sb_append(sb, req)
+                        sb_append(sb, ")")
+                    } else {
+                        sb_append(sb, " (cap ")
+                        sb_append(sb, cap_name)
+                        sb_append(sb, ")")
+                    }
+                } else {
+                    sb_append(sb, " (cap ")
+                    sb_append(sb, cap_name)
+                    sb_append(sb, ")")
+                }
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: budget declaration ───────────────────────────────
+
+fn parse_budget(toks: string, pos: int) -> string {
+    // budget Name { field: value, ... }
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(budget ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _b in 0..100 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else {
+                let field = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                if tok_kind(toks, cur) == 23 {
+                    cur = tok_next(toks, cur)
+                    let val = parse_expr(toks, cur)
+                    cur = upos(val)
+                    sb_append(sb, " (")
+                    sb_append(sb, field)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(val))
+                    sb_append(sb, ")")
+                }
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: tool declaration ─────────────────────────────────
+
+fn parse_tool(toks: string, pos: int) -> string {
+    // tool name(params) -> type { body }
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(tool ")
+    sb_append(sb, name)
+    sb_append(sb, " (params")
+
+    if tok_kind(toks, cur) == 40 {
+        cur = tok_next(toks, cur)
+        let pdone = false
+        for _p in 0..50 {
+            if pdone { break }
+            if tok_kind(toks, cur) == 41 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 0 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else {
+                let pname = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                let pty = ""
+                if tok_kind(toks, cur) == 23 {
+                    cur = tok_next(toks, cur)
+                    pty = tok_val(toks, cur)
+                    cur = tok_next(toks, cur)
+                }
+                sb_append(sb, " (")
+                sb_append(sb, pname)
+                if str_len(pty) > 0 {
+                    sb_append(sb, " :")
+                    sb_append(sb, pty)
+                }
+                sb_append(sb, ")")
+            }
+        }
+        if tok_kind(toks, cur) == 41 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+
+    if tok_kind(toks, cur) == 22 {
+        cur = tok_next(toks, cur)
+        let rtype = tok_val(toks, cur)
+        cur = tok_next(toks, cur)
+        sb_append(sb, " ->")
+        sb_append(sb, rtype)
+    }
+
+    // body (like agent, has field: value and fn)
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let tdone = false
+        for _t in 0..200 {
+            if tdone { break }
+            if tok_kind(toks, cur) == 43 {
+                tdone = true
+            } else if tok_kind(toks, cur) == 0 {
+                tdone = true
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else {
+                let fld = parse_agent_field(toks, cur)
+                cur = upos(fld)
+                sb_append(sb, " ")
+                sb_append(sb, uast(fld))
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: guard declaration ────────────────────────────────
+
+fn parse_guard(toks: string, pos: int) -> string {
+    // guard name(params) { body }
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(guard ")
+    sb_append(sb, name)
+    sb_append(sb, " (params")
+
+    if tok_kind(toks, cur) == 40 {
+        cur = tok_next(toks, cur)
+        let pdone = false
+        for _p in 0..50 {
+            if pdone { break }
+            if tok_kind(toks, cur) == 41 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 0 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else {
+                let pname = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                let pty = ""
+                if tok_kind(toks, cur) == 23 {
+                    cur = tok_next(toks, cur)
+                    pty = tok_val(toks, cur)
+                    cur = tok_next(toks, cur)
+                }
+                sb_append(sb, " (")
+                sb_append(sb, pname)
+                if str_len(pty) > 0 {
+                    sb_append(sb, " :")
+                    sb_append(sb, pty)
+                }
+                sb_append(sb, ")")
+            }
+        }
+        if tok_kind(toks, cur) == 41 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+
+    let body = parse_block(toks, cur)
+    cur = upos(body)
+    sb_append(sb, " ")
+    sb_append(sb, uast(body))
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: Top-level Declaration ────────────────────────────
+
+fn parse_declaration(toks: string, pos: int) -> string {
+    let k = tok_kind(toks, pos)
+    let v = tok_val(toks, pos)
+    let r = ""
+
+    if k == 4 {
+        if str_eq(v, "fn") {
+            r = parse_fn(toks, pos)
+        } else if str_eq(v, "agent") {
+            r = parse_agent(toks, pos)
+        } else if str_eq(v, "capability") {
+            r = parse_capability(toks, pos)
+        } else if str_eq(v, "budget") {
+            r = parse_budget(toks, pos)
+        } else if str_eq(v, "tool") {
+            r = parse_tool(toks, pos)
+        } else if str_eq(v, "guard") {
+            r = parse_guard(toks, pos)
+        } else if str_eq(v, "use") {
+            // use module
+            let cur = tok_next(toks, pos)
+            let mod_name = tok_val(toks, cur)
+            cur = tok_next(toks, cur)
+            r = pack(cur, "(use " + mod_name + ")")
+        } else if str_eq(v, "struct") {
+            r = parse_struct(toks, pos)
+        } else if str_eq(v, "enum") {
+            r = parse_enum(toks, pos)
+        } else if str_eq(v, "endpoint") {
+            // endpoint "url"
+            let cur = tok_next(toks, pos)
+            let val = parse_expr(toks, cur)
+            r = pack(upos(val), "(endpoint " + uast(val) + ")")
+        } else if str_eq(v, "supervisor") {
+            r = parse_supervisor(toks, pos)
+        } else if str_eq(v, "mesh") {
+            r = parse_mesh(toks, pos)
+        } else if str_eq(v, "router") {
+            r = parse_router(toks, pos)
+        } else if str_eq(v, "interface") {
+            r = parse_interface(toks, pos)
+        } else if str_eq(v, "type") {
+            r = parse_type_alias(toks, pos)
+        } else if str_eq(v, "comptime") {
+            // comptime { block } at top level
+            let cur = tok_next(toks, pos)
+            let blk = parse_block(toks, cur)
+            r = pack(upos(blk), "(comptime " + uast(blk) + ")")
+        } else if str_eq(v, "const") {
+            r = parse_const(toks, pos)
+        } else if str_eq(v, "impl") {
+            r = parse_impl(toks, pos)
+        } else if str_eq(v, "trait") {
+            r = parse_trait(toks, pos)
+        } else {
+            // skip unknown keyword at top level
+            r = pack(tok_next(toks, pos), "(unknown " + v + ")")
+        }
+    } else if k == 1 {
+        // top-level identifier: could be link, extern, or expression
+        if str_eq(v, "link") {
+            // link "flags" — FFI link directive
+            let cur = tok_next(toks, pos)
+            let flags = tok_val(toks, cur)
+            cur = tok_next(toks, cur)
+            let sb = sb_new()
+            sb_append(sb, "(link \"")
+            sb_append(sb, flags)
+            sb_append(sb, "\")")
+            r = pack(cur, sb_to_string(sb))
+        } else if str_eq(v, "extern") {
+            // extern fn name(params) -> type
+            r = parse_extern_fn(toks, pos)
+        } else {
+            let stmt = parse_statement(toks, pos)
+            r = stmt
+        }
+    } else {
+        r = pack(tok_next(toks, pos), "(skip)")
+    }
+    r
+}
+
+// ── Parse: struct declaration ───────────────────────────────
+
+fn parse_struct(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(struct ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _s in 0..100 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else {
+                let field = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                if tok_kind(toks, cur) == 23 {
+                    cur = tok_next(toks, cur)
+                    let ftype = tok_val(toks, cur)
+                    cur = tok_next(toks, cur)
+                    sb_append(sb, " (")
+                    sb_append(sb, field)
+                    sb_append(sb, " :")
+                    sb_append(sb, ftype)
+                    sb_append(sb, ")")
+                }
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: enum declaration ─────────────────────────────────
+
+fn parse_enum(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(enum ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _e in 0..100 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else {
+                let vname = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                sb_append(sb, " ")
+                sb_append(sb, vname)
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: supervisor declaration ──────────────────────────
+// supervisor Name { field: value, ... }
+// Produces: (supervisor Name (field key val) ...)
+
+fn parse_supervisor(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(supervisor ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _sv in 0..200 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else {
+                let fld = parse_agent_field(toks, cur)
+                cur = upos(fld)
+                sb_append(sb, " ")
+                sb_append(sb, uast(fld))
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: mesh declaration ───────────────────────────────
+// mesh Name { route Source -> Target, ... }
+// Produces: (mesh Name (route Source Target) ...)
+
+fn parse_mesh(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(mesh ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _ms in 0..200 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 4 {
+                if str_eq(tok_val(toks, cur), "route") {
+                    // route Source -> Target or route [A, B] -> Target
+                    cur = tok_next(toks, cur)
+                    let rsb = sb_new()
+                    sb_append(rsb, "(route")
+                    // parse source: single ident or [list]
+                    if tok_kind(toks, cur) == 44 {
+                        // [A, B, C]
+                        cur = tok_next(toks, cur)
+                        sb_append(rsb, " [")
+                        let first_s = true
+                        let ldone = false
+                        for _ls in 0..50 {
+                            if ldone { break }
+                            if tok_kind(toks, cur) == 45 {
+                                ldone = true
+                            } else if tok_kind(toks, cur) == 0 {
+                                ldone = true
+                            } else if tok_kind(toks, cur) == 24 {
+                                cur = tok_next(toks, cur)
+                            } else {
+                                if first_s { first_s = false
+                                } else { sb_append(rsb, " ") }
+                                sb_append(rsb, tok_val(toks, cur))
+                                cur = tok_next(toks, cur)
+                            }
+                        }
+                        if tok_kind(toks, cur) == 45 {
+                            cur = tok_next(toks, cur)
+                        }
+                        sb_append(rsb, "]")
+                    } else {
+                        sb_append(rsb, " ")
+                        sb_append(rsb, tok_val(toks, cur))
+                        cur = tok_next(toks, cur)
+                    }
+                    // expect ->
+                    if tok_kind(toks, cur) == 22 {
+                        cur = tok_next(toks, cur)
+                    }
+                    // parse target: single ident or [list]
+                    if tok_kind(toks, cur) == 44 {
+                        cur = tok_next(toks, cur)
+                        sb_append(rsb, " [")
+                        let first_t = true
+                        let tdone = false
+                        for _lt in 0..50 {
+                            if tdone { break }
+                            if tok_kind(toks, cur) == 45 {
+                                tdone = true
+                            } else if tok_kind(toks, cur) == 0 {
+                                tdone = true
+                            } else if tok_kind(toks, cur) == 24 {
+                                cur = tok_next(toks, cur)
+                            } else {
+                                if first_t { first_t = false
+                                } else { sb_append(rsb, " ") }
+                                sb_append(rsb, tok_val(toks, cur))
+                                cur = tok_next(toks, cur)
+                            }
+                        }
+                        if tok_kind(toks, cur) == 45 {
+                            cur = tok_next(toks, cur)
+                        }
+                        sb_append(rsb, "]")
+                    } else {
+                        sb_append(rsb, " ")
+                        sb_append(rsb, tok_val(toks, cur))
+                        cur = tok_next(toks, cur)
+                    }
+                    sb_append(rsb, ")")
+                    sb_append(sb, " ")
+                    sb_append(sb, sb_to_string(rsb))
+                } else {
+                    // other keyword field
+                    let fld = parse_agent_field(toks, cur)
+                    cur = upos(fld)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(fld))
+                }
+            } else {
+                // identifier field
+                let fld = parse_agent_field(toks, cur)
+                cur = upos(fld)
+                sb_append(sb, " ")
+                sb_append(sb, uast(fld))
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: router declaration ─────────────────────────────
+// router Name { route "tier" -> [model1, model2]; field: value }
+// Produces: (router Name (route_rule "tier" model1 model2) (field key val) ...)
+
+fn parse_router(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(router ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _rt in 0..200 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 4 {
+                if str_eq(tok_val(toks, cur), "route") {
+                    // route "tier" -> [model1, model2]
+                    cur = tok_next(toks, cur)
+                    let tier = tok_val(toks, cur)
+                    cur = tok_next(toks, cur)
+                    let rsb = sb_new()
+                    sb_append(rsb, "(route_rule \"")
+                    sb_append(rsb, tier)
+                    sb_append(rsb, "\"")
+                    // expect ->
+                    if tok_kind(toks, cur) == 22 {
+                        cur = tok_next(toks, cur)
+                    }
+                    // expect [model1, model2, ...]
+                    if tok_kind(toks, cur) == 44 {
+                        cur = tok_next(toks, cur)
+                        let mdone = false
+                        for _rm in 0..50 {
+                            if mdone { break }
+                            if tok_kind(toks, cur) == 45 {
+                                mdone = true
+                            } else if tok_kind(toks, cur) == 0 {
+                                mdone = true
+                            } else if tok_kind(toks, cur) == 24 {
+                                cur = tok_next(toks, cur)
+                            } else {
+                                sb_append(rsb, " ")
+                                sb_append(rsb, tok_val(toks, cur))
+                                cur = tok_next(toks, cur)
+                            }
+                        }
+                        if tok_kind(toks, cur) == 45 {
+                            cur = tok_next(toks, cur)
+                        }
+                    }
+                    sb_append(rsb, ")")
+                    sb_append(sb, " ")
+                    sb_append(sb, sb_to_string(rsb))
+                } else {
+                    let fld = parse_agent_field(toks, cur)
+                    cur = upos(fld)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(fld))
+                }
+            } else {
+                let fld = parse_agent_field(toks, cur)
+                cur = upos(fld)
+                sb_append(sb, " ")
+                sb_append(sb, uast(fld))
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: interface declaration ──────────────────────────
+// interface Name { fn sig1(...) -> Type; fn sig2(...) -> Type }
+// Produces: (interface Name (fn sig1 ...) (fn sig2 ...))
+
+fn parse_interface(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(interface ")
+    sb_append(sb, name)
+
+    // interface Name = A + B (type combination) handled by looking for '='
+    if tok_kind(toks, cur) == 14 {
+        cur = tok_next(toks, cur)
+        let tsb = sb_new()
+        let first = true
+        let tdone = false
+        for _tc in 0..50 {
+            if tdone { break }
+            let tk = tok_kind(toks, cur)
+            if tk == 0 { tdone = true
+            } else if tk == 31 { tdone = true
+            } else if tk == 42 { tdone = true
+            } else if tk == 43 { tdone = true
+            } else if tk == 10 {
+                // + separator
+                cur = tok_next(toks, cur)
+            } else {
+                if first { first = false
+                } else { sb_append(tsb, " ") }
+                sb_append(tsb, tok_val(toks, cur))
+                cur = tok_next(toks, cur)
+            }
+        }
+        sb_append(sb, " = ")
+        sb_append(sb, sb_to_string(tsb))
+        sb_append(sb, ")")
+        pack(cur, sb_to_string(sb))
+    } else {
+        // interface Name { fn sig1; fn sig2 }
+        if tok_kind(toks, cur) == 42 {
+            cur = tok_next(toks, cur)
+            let done = false
+            for _if in 0..200 {
+                if done { break }
+                if tok_kind(toks, cur) == 43 {
+                    done = true
+                } else if tok_kind(toks, cur) == 0 {
+                    done = true
+                } else if tok_kind(toks, cur) == 31 {
+                    cur = tok_next(toks, cur)
+                } else if tok_kind(toks, cur) == 4 {
+                    if str_eq(tok_val(toks, cur), "fn") {
+                        let meth = parse_fn(toks, cur)
+                        cur = upos(meth)
+                        sb_append(sb, " ")
+                        sb_append(sb, uast(meth))
+                    } else {
+                        cur = tok_next(toks, cur)
+                    }
+                } else {
+                    cur = tok_next(toks, cur)
+                }
+            }
+            if tok_kind(toks, cur) == 43 {
+                cur = tok_next(toks, cur)
+            }
+        }
+        sb_append(sb, ")")
+        pack(cur, sb_to_string(sb))
+    }
+}
+
+// ── Parse: type alias declaration ─────────────────────────
+// type Name = Type1 | Type2
+// Produces: (type_alias Name (union Type1 Type2)) or (type_alias Name Type1)
+
+fn parse_type_alias(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    // expect '='
+    if tok_kind(toks, cur) == 14 {
+        cur = tok_next(toks, cur)
+    }
+
+    // parse types separated by |
+    // Stop when we hit EOF, semicolon, brace, or a keyword that starts a new declaration
+    let types_sb = sb_new()
+    let type_count = 0
+    let tdone = false
+    for _ta in 0..50 {
+        if tdone { break }
+        let tk = tok_kind(toks, cur)
+        if tk == 0 { tdone = true
+        } else if tk == 31 { tdone = true
+        } else if tk == 42 { tdone = true
+        } else if tk == 43 { tdone = true
+        } else if tk == 26 {
+            // | separator (kind 26 = pipe)
+            cur = tok_next(toks, cur)
+        } else if tk == 4 {
+            // keyword: if it's a declaration keyword, stop; otherwise treat as type name
+            let kv = tok_val(toks, cur)
+            if str_eq(kv, "fn") { tdone = true
+            } else if str_eq(kv, "agent") { tdone = true
+            } else if str_eq(kv, "struct") { tdone = true
+            } else if str_eq(kv, "enum") { tdone = true
+            } else if str_eq(kv, "trait") { tdone = true
+            } else if str_eq(kv, "impl") { tdone = true
+            } else if str_eq(kv, "interface") { tdone = true
+            } else if str_eq(kv, "type") { tdone = true
+            } else if str_eq(kv, "const") { tdone = true
+            } else if str_eq(kv, "use") { tdone = true
+            } else if str_eq(kv, "capability") { tdone = true
+            } else if str_eq(kv, "budget") { tdone = true
+            } else if str_eq(kv, "tool") { tdone = true
+            } else if str_eq(kv, "guard") { tdone = true
+            } else if str_eq(kv, "supervisor") { tdone = true
+            } else if str_eq(kv, "mesh") { tdone = true
+            } else if str_eq(kv, "router") { tdone = true
+            } else if str_eq(kv, "comptime") { tdone = true
+            } else if str_eq(kv, "endpoint") { tdone = true
+            } else {
+                // keyword used as type name (e.g., Result)
+                if type_count > 0 {
+                    sb_append(types_sb, " ")
+                }
+                sb_append(types_sb, kv)
+                cur = tok_next(toks, cur)
+                type_count = type_count + 1
+            }
+        } else if tk == 1 {
+            // identifier: could be a type name, but also could be "link" or "extern"
+            // which are top-level declaration identifiers
+            let iv = tok_val(toks, cur)
+            if str_eq(iv, "link") { tdone = true
+            } else if str_eq(iv, "extern") { tdone = true
+            } else {
+                if type_count > 0 {
+                    sb_append(types_sb, " ")
+                }
+                sb_append(types_sb, iv)
+                cur = tok_next(toks, cur)
+                type_count = type_count + 1
+            }
+        } else {
+            if type_count > 0 {
+                sb_append(types_sb, " ")
+            }
+            sb_append(types_sb, tok_val(toks, cur))
+            cur = tok_next(toks, cur)
+            type_count = type_count + 1
+        }
+    }
+
+    let sb = sb_new()
+    sb_append(sb, "(type_alias ")
+    sb_append(sb, name)
+    sb_append(sb, " ")
+    if type_count > 1 {
+        sb_append(sb, "(union ")
+        sb_append(sb, sb_to_string(types_sb))
+        sb_append(sb, ")")
+    } else {
+        sb_append(sb, sb_to_string(types_sb))
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: const declaration ──────────────────────────────
+// const NAME [: type] = expr
+// Produces: (const NAME expr)
+
+fn parse_const(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    // optional type annotation
+    if tok_kind(toks, cur) == 23 {
+        cur = tok_next(toks, cur)
+        // skip the type name
+        cur = tok_next(toks, cur)
+    }
+
+    // expect '='
+    if tok_kind(toks, cur) == 14 {
+        cur = tok_next(toks, cur)
+    }
+
+    let val = parse_expr(toks, cur)
+    cur = upos(val)
+    let sb = sb_new()
+    sb_append(sb, "(const ")
+    sb_append(sb, name)
+    sb_append(sb, " ")
+    sb_append(sb, uast(val))
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: impl declaration ───────────────────────────────
+// impl [TraitName for] TypeName { fn methods... }
+// Produces: (impl TypeName (fn ...) ...) or (impl TraitName TypeName (fn ...) ...)
+
+fn parse_impl(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let first_name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(impl")
+
+    // check for "for" keyword -> impl Trait for Type
+    if tok_kind(toks, cur) == 4 {
+        if str_eq(tok_val(toks, cur), "for") {
+            cur = tok_next(toks, cur)
+            let type_name = tok_val(toks, cur)
+            cur = tok_next(toks, cur)
+            sb_append(sb, " ")
+            sb_append(sb, first_name)
+            sb_append(sb, " ")
+            sb_append(sb, type_name)
+        } else {
+            sb_append(sb, " ")
+            sb_append(sb, first_name)
+        }
+    } else {
+        sb_append(sb, " ")
+        sb_append(sb, first_name)
+    }
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _im in 0..500 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 4 {
+                if str_eq(tok_val(toks, cur), "fn") {
+                    let meth = parse_fn(toks, cur)
+                    cur = upos(meth)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(meth))
+                } else {
+                    cur = tok_next(toks, cur)
+                }
+            } else {
+                cur = tok_next(toks, cur)
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: trait declaration ──────────────────────────────
+// trait Name { fn sig1(...) -> Type; fn sig2(...) -> Type }
+// Produces: (trait Name (fn sig1 ...) (fn sig2 ...))
+
+fn parse_trait(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(trait ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _tr in 0..200 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 4 {
+                if str_eq(tok_val(toks, cur), "fn") {
+                    let meth = parse_fn(toks, cur)
+                    cur = upos(meth)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(meth))
+                } else {
+                    cur = tok_next(toks, cur)
+                }
+            } else {
+                cur = tok_next(toks, cur)
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: extern fn declaration ──────────────────────────
+// extern fn name(params) -> type
+// Produces: (extern_fn name (params ...) ->type)
+
+fn parse_extern_fn(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    // expect 'fn' keyword
+    if tok_kind(toks, cur) == 4 {
+        if str_eq(tok_val(toks, cur), "fn") {
+            let fn_r = parse_fn(toks, cur)
+            let fn_ast = uast(fn_r)
+            // rewrite (fn ...) to (extern_fn ...)
+            let new_ast = "(extern_" + str_slice(fn_ast, 1, str_len(fn_ast))
+            pack(upos(fn_r), new_ast)
+        } else {
+            pack(cur, "(extern)")
+        }
+    } else {
+        pack(cur, "(extern)")
+    }
+}
+
+// ── Parse: Program (top-level) ──────────────────────────────
+
+fn parse_program(toks: string, pos: int) -> string {
+    let sb = sb_new()
+    sb_append(sb, "(program")
+
+    let cur = pos
+    let done = false
+    for _prog in 0..5000 {
+        if done { break }
+        let k = tok_kind(toks, cur)
+        if k == 0 {
+            done = true
+        } else if k == 31 {
+            // skip semicolons
+            cur = tok_next(toks, cur)
+        } else {
+            let decl = parse_declaration(toks, cur)
+            let new_pos = upos(decl)
+            // safety: avoid infinite loop if parser didn't advance
+            if new_pos == cur {
+                cur = tok_next(toks, cur)
+            } else {
+                cur = new_pos
+            }
+            sb_append(sb, "\n  ")
+            sb_append(sb, uast(decl))
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Entry Point ─────────────────────────────────────────────
+// Lexing is done inline in main (Vecs can't cross function boundaries).
+// After lexing, tokens are encoded into a flat string and passed to the parser.
+
+fn main() -> Result {
+    let file_path = env("LEX_FILE")
+    ensure str_len(file_path) > 0, "Set LEX_FILE to the .lceron file to parse"
+
+    let source = read_file(file_path)
+    ensure str_len(source) > 0, "Could not read file or file is empty"
+
+    let src_len = str_len(source)
+
+    // ── Lexer (inline) ──────────────────────────────────
+    let kinds = vec_new()
+    let values = vec_new()
+
+    let lpos = 0
+    let line = 1
+    let tok_count = 0
+
+    for _tick in 0..500000 {
+        if lpos >= src_len { break }
+        let ch = char_at(source, lpos)
+        let code = char_code(ch)
+
+        if code == 32 { lpos = lpos + 1
+        } else if code == 9 { lpos = lpos + 1
+        } else if code == 13 { lpos = lpos + 1
+        } else if code == 10 {
+            line = line + 1
+            lpos = lpos + 1
+        } else if code == 47 {
+            let is_comment = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 47 {
+                    is_comment = true
+                }
+            }
+            if is_comment {
+                lpos = lpos + 2
+                for _cmt in 0..500000 {
+                    if lpos >= src_len { break }
+                    if char_code(char_at(source, lpos)) == 10 { break }
+                    lpos = lpos + 1
+                }
+            } else {
+                vec_push(kinds, to_string(13))
+                vec_push(values, "/")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if str_char_is_alpha(ch) {
+            let start = lpos
+            lpos = lpos + 1
+            for _id in 0..10000 {
+                if lpos >= src_len { break }
+                if str_char_is_alnum(char_at(source, lpos)) {
+                    lpos = lpos + 1
+                } else { break }
+            }
+            let word = str_slice(source, start, lpos)
+            if is_keyword(word) {
+                vec_push(kinds, to_string(4))
+            } else {
+                vec_push(kinds, to_string(1))
+            }
+            vec_push(values, word)
+            tok_count = tok_count + 1
+        } else if str_char_is_digit(ch) {
+            let nstart = lpos
+            lpos = lpos + 1
+            for _d in 0..10000 {
+                if lpos >= src_len { break }
+                if str_char_is_digit(char_at(source, lpos)) { lpos = lpos + 1
+                } else { break }
+            }
+            let is_float = false
+            if lpos < src_len {
+                if char_code(char_at(source, lpos)) == 46 {
+                    let has_digit_after = false
+                    if lpos + 1 < src_len {
+                        if str_char_is_digit(char_at(source, lpos + 1)) {
+                            has_digit_after = true
+                        }
+                    }
+                    if has_digit_after {
+                        is_float = true
+                        lpos = lpos + 1
+                        for _fd in 0..10000 {
+                            if lpos >= src_len { break }
+                            if str_char_is_digit(char_at(source, lpos)) { lpos = lpos + 1
+                            } else { break }
+                        }
+                    }
+                }
+            }
+            let num_text = str_slice(source, nstart, lpos)
+            if is_float {
+                vec_push(kinds, to_string(5))
+            } else {
+                vec_push(kinds, to_string(2))
+            }
+            vec_push(values, num_text)
+            tok_count = tok_count + 1
+        } else if code == 34 {
+            lpos = lpos + 1
+            let sstart = lpos
+            for _s in 0..500000 {
+                if lpos >= src_len { break }
+                let sc = char_code(char_at(source, lpos))
+                if sc == 92 { lpos = lpos + 2
+                } else if sc == 34 { break
+                } else {
+                    if sc == 10 { line = line + 1 }
+                    lpos = lpos + 1
+                }
+            }
+            let str_val = str_slice(source, sstart, lpos)
+            if lpos < src_len { lpos = lpos + 1 }
+            vec_push(kinds, to_string(3))
+            vec_push(values, str_val)
+            tok_count = tok_count + 1
+        } else if code == 96 {
+            lpos = lpos + 1
+            let rstart = lpos
+            for _r in 0..500000 {
+                if lpos >= src_len { break }
+                if char_code(char_at(source, lpos)) == 96 { break }
+                if char_code(char_at(source, lpos)) == 10 { line = line + 1 }
+                lpos = lpos + 1
+            }
+            let raw_val = str_slice(source, rstart, lpos)
+            if lpos < src_len { lpos = lpos + 1 }
+            vec_push(kinds, to_string(3))
+            vec_push(values, raw_val)
+            tok_count = tok_count + 1
+        } else if code == 40 { vec_push(kinds, to_string(40)); vec_push(values, "("); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 41 { vec_push(kinds, to_string(41)); vec_push(values, ")"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 123 { vec_push(kinds, to_string(42)); vec_push(values, "{"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 125 { vec_push(kinds, to_string(43)); vec_push(values, "}"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 91 { vec_push(kinds, to_string(44)); vec_push(values, "["); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 93 { vec_push(kinds, to_string(45)); vec_push(values, "]"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 43 { vec_push(kinds, to_string(10)); vec_push(values, "+"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 42 { vec_push(kinds, to_string(12)); vec_push(values, "*"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 44 { vec_push(kinds, to_string(24)); vec_push(values, ","); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 63 { vec_push(kinds, to_string(28)); vec_push(values, "?"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 64 { vec_push(kinds, to_string(29)); vec_push(values, "@"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 35 { vec_push(kinds, to_string(30)); vec_push(values, "#"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 38 { vec_push(kinds, to_string(27)); vec_push(values, "&"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 59 { vec_push(kinds, to_string(31)); vec_push(values, ";"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 58 {
+            vec_push(kinds, to_string(23))
+            vec_push(values, ":")
+            tok_count = tok_count + 1
+            lpos = lpos + 1
+        } else if code == 46 {
+            let is_dotdot = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 46 { is_dotdot = true }
+            }
+            if is_dotdot {
+                vec_push(kinds, to_string(32))
+                vec_push(values, "..")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(25))
+                vec_push(values, ".")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 124 {
+            let is_pipe_gt = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 62 { is_pipe_gt = true }
+            }
+            if is_pipe_gt {
+                vec_push(kinds, to_string(33))
+                vec_push(values, "|>")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(26))
+                vec_push(values, "|")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 45 {
+            let is_arrow = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 62 { is_arrow = true }
+            }
+            if is_arrow {
+                vec_push(kinds, to_string(22))
+                vec_push(values, "->")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(11))
+                vec_push(values, "-")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 61 {
+            let is_eq_eq = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 61 { is_eq_eq = true }
+            }
+            if is_eq_eq {
+                vec_push(kinds, to_string(15))
+                vec_push(values, "==")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(14))
+                vec_push(values, "=")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 60 {
+            let is_lt_eq = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 61 { is_lt_eq = true }
+            }
+            if is_lt_eq {
+                vec_push(kinds, to_string(20))
+                vec_push(values, "<=")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(18))
+                vec_push(values, "<")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 62 {
+            let is_gt_eq = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 61 { is_gt_eq = true }
+            }
+            if is_gt_eq {
+                vec_push(kinds, to_string(21))
+                vec_push(values, ">=")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(19))
+                vec_push(values, ">")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 33 {
+            let is_bang_eq = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 61 { is_bang_eq = true }
+            }
+            if is_bang_eq {
+                vec_push(kinds, to_string(17))
+                vec_push(values, "!=")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(16))
+                vec_push(values, "!")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else {
+            lpos = lpos + 1
+        }
+    }
+
+    // EOF sentinel
+    vec_push(kinds, to_string(0))
+    vec_push(values, "")
+    tok_count = tok_count + 1
+
+    // ── Encode tokens into flat string ──────────────────
+    let tsb = sb_new()
+    for i in 0..tok_count {
+        let tk = vec_get(kinds, i)
+        let tv = vec_get(values, i)
+        sb_append(tsb, tk)
+        sb_append(tsb, "\t")
+        sb_append(tsb, tv)
+        sb_append(tsb, "\n")
+    }
+    let toks = sb_to_string(tsb)
+
+    // ── Parse ───────────────────────────────────────────
+    let result = parse_program(toks, 0)
+    let ast = uast(result)
+
+    // ── Output ──────────────────────────────────────────
+    println("=== Limceron Parser (self-hosted) ===")
+    println("File: " + file_path)
+    println("Tokens: " + to_string(tok_count))
+    println("------------------------------------")
+    println(ast)
+    println("------------------------------------")
+    println("Done.")
+}

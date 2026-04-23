@@ -1,0 +1,7 @@
+// Time operations
+// All functions are compiler builtins handled by codegen.
+
+fn now_ms() -> i64 { }              // builtin — milliseconds since epoch
+fn sleep_ms(ms: i64) -> void { }    // builtin
+fn elapsed_ms(start: i64) -> i64 { }  // builtin — now_ms() - start
+fn format_timestamp(ms: i64) -> string { }  // builtin — ISO 8601

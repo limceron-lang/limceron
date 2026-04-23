@@ -1,0 +1,15 @@
+// String operations
+// All functions are compiler builtins handled by codegen.
+
+fn len(s: string) -> i64 { }                    // builtin
+fn contains(haystack: string, needle: string) -> bool { }   // builtin
+fn starts_with(s: string, prefix: string) -> bool { }       // builtin
+fn ends_with(s: string, suffix: string) -> bool { }         // builtin
+fn str_eq(a: string, b: string) -> bool { }                 // builtin
+fn str_replace(s: string, old: string, new: string) -> string { }  // builtin
+fn str_trim(s: string) -> string { }                        // builtin
+fn str_substring(s: string, start: i64, end: i64) -> string { }   // builtin
+fn to_string(n: i64) -> string { }                          // builtin
+fn to_int(s: string) -> i64 { }                             // builtin
+fn split(s: string, delim: string) -> Vec { }               // builtin
+fn format(template: string, args: string) -> string { }     // builtin

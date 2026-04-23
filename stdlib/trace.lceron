@@ -1,0 +1,7 @@
+// Distributed tracing for agent pipelines
+// Integrates with the built-in dashboard event system.
+
+fn trace_begin(name: string) -> i64 { }       // builtin — returns span ID
+fn trace_end(span_id: i64) -> void { }        // builtin
+fn trace_tag(span_id: i64, key: string, value: string) -> void { }  // builtin
+fn trace_event(name: string, data: string) -> void { }  // builtin

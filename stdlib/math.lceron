@@ -1,0 +1,13 @@
+// Math operations
+// All functions are compiler builtins handled by codegen.
+
+fn abs(x: i64) -> i64 { }           // builtin
+fn min(a: i64, b: i64) -> i64 { }   // builtin
+fn max(a: i64, b: i64) -> i64 { }   // builtin
+fn clamp(x: i64, lo: i64, hi: i64) -> i64 { }  // builtin
+fn floor(x: f64) -> i64 { }         // builtin
+fn ceil(x: f64) -> i64 { }          // builtin
+fn round(x: f64) -> i64 { }         // builtin
+fn abs_f(x: f64) -> f64 { }         // builtin
+fn min_f(a: f64, b: f64) -> f64 { } // builtin
+fn max_f(a: f64, b: f64) -> f64 { } // builtin

@@ -1,0 +1,9 @@
+// Runtime budget introspection
+// Allows agents to make decisions based on remaining budget.
+
+fn budget_tokens_left() -> i64 { }      // builtin
+fn budget_tokens_used() -> i64 { }      // builtin
+fn budget_cost_used() -> f64 { }        // builtin
+fn budget_cost_left() -> f64 { }        // builtin
+fn budget_percentage() -> f64 { }       // builtin — 0.0 to 100.0
+fn budget_elapsed_ms() -> i64 { }       // builtin

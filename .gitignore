@@ -1,0 +1,14 @@
+private/
+build/
+.nova-cache/
+.lceron-cache/
+cmsg.txt
+varios/
+categorizador
+.DS_Store
+*.o
+*.dSYM/
+/tmp/
+
+.claude/
+.env

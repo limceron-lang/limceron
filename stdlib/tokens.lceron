@@ -1,0 +1,5 @@
+// Token estimation without calling the LLM
+// Uses BPE tokenization (cl100k_base compatible).
+
+fn estimate_tokens(text: string) -> i64 { }  // builtin — approximate token count
+fn fits_in_budget(text: string, max_tokens: i64) -> bool { }  // builtin

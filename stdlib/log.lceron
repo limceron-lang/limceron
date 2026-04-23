@@ -1,0 +1,7 @@
+// Structured logging (JSON to stderr)
+// All functions are compiler builtins handled by codegen.
+
+fn log_info(msg: string) -> void { }     // builtin
+fn log_warn(msg: string) -> void { }     // builtin
+fn log_error(msg: string) -> void { }    // builtin
+fn log_debug(msg: string) -> void { }    // builtin

@@ -1,0 +1,2683 @@
+// stage1/typecheck.lceron
+// Limceron Type Checker — Written in Limceron (self-hosting, Stage 1)
+//
+// Third piece of the self-hosting compiler. Takes a .lceron source file,
+// lexes+parses it (reusing parser logic), then walks the S-expression AST
+// performing semantic checks:
+//   1. Symbol resolution — every identifier must be defined
+//   2. Duplicate detection — no two definitions with the same name in same scope
+//   3. Function arity — calls must match parameter count
+//   4. Agent capability verification — agents using ask() need llm.* capability
+//   5. Budget enforcement — agents with tool calls should declare a budget
+//   6. Taint flow — warn if tainted variables flow into ask() unsanitized
+//
+// Usage:
+//   ./build/limceron-stage0 build stage1/typecheck.lceron -o build/limceron-typecheck
+//   LEX_FILE=examples/language/01_hello_agent.lceron ./build/limceron-typecheck
+//
+// Design:
+//   - Lexer + parser are inlined (same as parser.lceron)
+//   - After parsing, walks S-expression AST string
+//   - Symbol table as parallel Vecs (all in main, since Vecs can't cross fn boundaries)
+//   - S-expression navigation via pure string helper functions
+
+// ── Keyword Recognition ─────────────────────────────────────
+
+fn is_keyword(word: string) -> bool {
+    let r = false
+    if str_eq(word, "fn") { r = true
+    } else if str_eq(word, "let") { r = true
+    } else if str_eq(word, "if") { r = true
+    } else if str_eq(word, "else") { r = true
+    } else if str_eq(word, "for") { r = true
+    } else if str_eq(word, "in") { r = true
+    } else if str_eq(word, "match") { r = true
+    } else if str_eq(word, "return") { r = true
+    } else if str_eq(word, "break") { r = true
+    } else if str_eq(word, "continue") { r = true
+    } else if str_eq(word, "while") { r = true
+    } else if str_eq(word, "loop") { r = true
+    } else if str_eq(word, "true") { r = true
+    } else if str_eq(word, "false") { r = true
+    } else if str_eq(word, "none") { r = true
+    } else if str_eq(word, "use") { r = true
+    } else if str_eq(word, "as") { r = true
+    } else if str_eq(word, "struct") { r = true
+    } else if str_eq(word, "enum") { r = true
+    } else if str_eq(word, "impl") { r = true
+    } else if str_eq(word, "trait") { r = true
+    } else if str_eq(word, "type") { r = true
+    } else if str_eq(word, "const") { r = true
+    } else if str_eq(word, "mut") { r = true
+    } else if str_eq(word, "ref") { r = true
+    } else if str_eq(word, "defer") { r = true
+    } else if str_eq(word, "spawn") { r = true
+    } else if str_eq(word, "await") { r = true
+    } else if str_eq(word, "select") { r = true
+    } else if str_eq(word, "try") { r = true
+    } else if str_eq(word, "unsafe") { r = true
+    } else if str_eq(word, "comptime") { r = true
+    } else if str_eq(word, "agent") { r = true
+    } else if str_eq(word, "capability") { r = true
+    } else if str_eq(word, "guard") { r = true
+    } else if str_eq(word, "budget") { r = true
+    } else if str_eq(word, "tool") { r = true
+    } else if str_eq(word, "ask") { r = true
+    } else if str_eq(word, "allow") { r = true
+    } else if str_eq(word, "deny") { r = true
+    } else if str_eq(word, "ensure") { r = true
+    } else if str_eq(word, "repeat") { r = true
+    } else if str_eq(word, "endpoint") { r = true
+    } else if str_eq(word, "driver") { r = true
+    }
+    r
+}
+
+// ── Token Access Helpers ────────────────────────────────────
+// Tokens are encoded as "kind\tvalue\nkind\tvalue\n..."
+
+fn tok_kind(toks: string, off: int) -> int {
+    let tlen = str_len(toks)
+    let r = 0
+    if off >= tlen {
+        r = 0
+    } else {
+        let rest = str_slice(toks, off, tlen)
+        let tab = str_find(rest, "\t")
+        if tab < 0 {
+            r = 0
+        } else {
+            r = to_int(str_slice(toks, off, off + tab))
+        }
+    }
+    r
+}
+
+fn tok_val(toks: string, off: int) -> string {
+    let tlen = str_len(toks)
+    let r = ""
+    if off >= tlen {
+        r = ""
+    } else {
+        let rest = str_slice(toks, off, tlen)
+        let tab = str_find(rest, "\t")
+        if tab < 0 {
+            r = ""
+        } else {
+            let after = off + tab + 1
+            let rest2 = str_slice(toks, after, tlen)
+            let nl = str_find(rest2, "\n")
+            if nl < 0 {
+                r = str_slice(toks, after, tlen)
+            } else {
+                r = str_slice(toks, after, after + nl)
+            }
+        }
+    }
+    r
+}
+
+fn tok_next(toks: string, off: int) -> int {
+    let tlen = str_len(toks)
+    let r = off
+    if off >= tlen {
+        r = tlen
+    } else {
+        let rest = str_slice(toks, off, tlen)
+        let nl = str_find(rest, "\n")
+        if nl < 0 {
+            r = tlen
+        } else {
+            r = off + nl + 1
+        }
+    }
+    r
+}
+
+// ── Pack / Unpack (position + AST result) ───────────────────
+
+fn pack(p: int, ast: string) -> string {
+    to_string(p) + "\t" + ast
+}
+
+fn upos(r: string) -> int {
+    let tab = str_find(r, "\t")
+    let result = 0
+    if tab < 0 {
+        result = 0
+    } else {
+        result = to_int(str_slice(r, 0, tab))
+    }
+    result
+}
+
+fn uast(r: string) -> string {
+    let tab = str_find(r, "\t")
+    let result = r
+    if tab < 0 {
+        result = r
+    } else {
+        result = str_slice(r, tab + 1, str_len(r))
+    }
+    result
+}
+
+// ── Parse: Primary Expressions ──────────────────────────────
+
+fn parse_primary(toks: string, pos: int) -> string {
+    let k = tok_kind(toks, pos)
+    let v = tok_val(toks, pos)
+    let r = ""
+
+    if k == 2 {
+        r = pack(tok_next(toks, pos), "(int " + v + ")")
+    } else if k == 5 {
+        r = pack(tok_next(toks, pos), "(float " + v + ")")
+    } else if k == 3 {
+        let sb = sb_new()
+        sb_append(sb, "(string \"")
+        sb_append(sb, v)
+        sb_append(sb, "\")")
+        r = pack(tok_next(toks, pos), sb_to_string(sb))
+    } else if k == 4 {
+        if str_eq(v, "true") {
+            r = pack(tok_next(toks, pos), "(bool true)")
+        } else if str_eq(v, "false") {
+            r = pack(tok_next(toks, pos), "(bool false)")
+        } else if str_eq(v, "none") {
+            r = pack(tok_next(toks, pos), "(none)")
+        } else if str_eq(v, "ask") {
+            let p2 = tok_next(toks, pos)
+            if tok_kind(toks, p2) == 40 {
+                let p3 = tok_next(toks, p2)
+                let arg_r = parse_expr(toks, p3)
+                let p4 = upos(arg_r)
+                let arg_ast = uast(arg_r)
+                if tok_kind(toks, p4) == 41 {
+                    p4 = tok_next(toks, p4)
+                }
+                r = pack(p4, "(ask " + arg_ast + ")")
+            } else {
+                r = pack(p2, "(ask)")
+            }
+        } else {
+            r = pack(tok_next(toks, pos), "(ident " + v + ")")
+        }
+    } else if k == 1 {
+        let p2 = tok_next(toks, pos)
+        let k2 = tok_kind(toks, p2)
+        if k2 == 40 {
+            r = parse_call(toks, pos)
+        } else {
+            r = pack(p2, "(ident " + v + ")")
+        }
+    } else if k == 40 {
+        let p2 = tok_next(toks, pos)
+        let inner = parse_expr(toks, p2)
+        let p3 = upos(inner)
+        if tok_kind(toks, p3) == 41 {
+            p3 = tok_next(toks, p3)
+        }
+        r = pack(p3, uast(inner))
+    } else if k == 11 {
+        let p2 = tok_next(toks, pos)
+        let inner = parse_primary(toks, p2)
+        r = pack(upos(inner), "(neg " + uast(inner) + ")")
+    } else if k == 16 {
+        let p2 = tok_next(toks, pos)
+        let inner = parse_primary(toks, p2)
+        r = pack(upos(inner), "(not " + uast(inner) + ")")
+    } else if k == 44 {
+        let p2 = tok_next(toks, pos)
+        let sb = sb_new()
+        sb_append(sb, "(array")
+        let done = false
+        let cur = p2
+        for _a in 0..1000 {
+            if done { break }
+            if tok_kind(toks, cur) == 45 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else {
+                let elem = parse_expr(toks, cur)
+                cur = upos(elem)
+                sb_append(sb, " ")
+                sb_append(sb, uast(elem))
+                if tok_kind(toks, cur) == 24 {
+                    cur = tok_next(toks, cur)
+                }
+            }
+        }
+        if tok_kind(toks, cur) == 45 {
+            cur = tok_next(toks, cur)
+        }
+        sb_append(sb, ")")
+        r = pack(cur, sb_to_string(sb))
+    } else {
+        r = pack(tok_next(toks, pos), "(error unknown-primary)")
+    }
+    r
+}
+
+// ── Parse: Function Call ────────────────────────────────────
+
+fn parse_call(toks: string, pos: int) -> string {
+    let name = tok_val(toks, pos)
+    let p2 = tok_next(toks, pos)
+    let p3 = tok_next(toks, p2)
+
+    let sb = sb_new()
+    sb_append(sb, "(call ")
+    sb_append(sb, name)
+
+    let done = false
+    let cur = p3
+    for _c in 0..100 {
+        if done { break }
+        if tok_kind(toks, cur) == 41 {
+            done = true
+        } else if tok_kind(toks, cur) == 0 {
+            done = true
+        } else {
+            let arg = parse_expr(toks, cur)
+            cur = upos(arg)
+            sb_append(sb, " ")
+            sb_append(sb, uast(arg))
+            if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            }
+        }
+    }
+    if tok_kind(toks, cur) == 41 {
+        cur = tok_next(toks, cur)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: Postfix ──────────────────────────────────────────
+
+fn parse_postfix(toks: string, pos: int) -> string {
+    let left = parse_primary(toks, pos)
+    let cur = upos(left)
+    let ast = uast(left)
+
+    let done = false
+    for _dot in 0..100 {
+        if done { break }
+        if tok_kind(toks, cur) == 25 {
+            let p2 = tok_next(toks, cur)
+            let field = tok_val(toks, p2)
+            let p3 = tok_next(toks, p2)
+            if tok_kind(toks, p3) == 40 {
+                let p4 = tok_next(toks, p3)
+                let sb = sb_new()
+                sb_append(sb, "(method ")
+                sb_append(sb, ast)
+                sb_append(sb, " ")
+                sb_append(sb, field)
+                let mdone = false
+                let mcur = p4
+                for _m in 0..100 {
+                    if mdone { break }
+                    if tok_kind(toks, mcur) == 41 {
+                        mdone = true
+                    } else if tok_kind(toks, mcur) == 0 {
+                        mdone = true
+                    } else {
+                        let marg = parse_expr(toks, mcur)
+                        mcur = upos(marg)
+                        sb_append(sb, " ")
+                        sb_append(sb, uast(marg))
+                        if tok_kind(toks, mcur) == 24 {
+                            mcur = tok_next(toks, mcur)
+                        }
+                    }
+                }
+                if tok_kind(toks, mcur) == 41 {
+                    mcur = tok_next(toks, mcur)
+                }
+                sb_append(sb, ")")
+                ast = sb_to_string(sb)
+                cur = mcur
+            } else {
+                ast = "(field " + ast + " " + field + ")"
+                cur = p3
+            }
+        } else {
+            done = true
+        }
+    }
+    pack(cur, ast)
+}
+
+// ── Parse: Binary Expressions ───────────────────────────────
+
+fn op_prec(toks: string, pos: int) -> int {
+    let k = tok_kind(toks, pos)
+    let r = 0
+    if k == 15 { r = 3
+    } else if k == 17 { r = 3
+    } else if k == 18 { r = 4
+    } else if k == 19 { r = 4
+    } else if k == 20 { r = 4
+    } else if k == 21 { r = 4
+    } else if k == 10 { r = 5
+    } else if k == 11 { r = 5
+    } else if k == 12 { r = 6
+    } else if k == 13 { r = 6
+    } else if k == 33 { r = 2
+    }
+    r
+}
+
+fn op_str(kind: int) -> string {
+    let r = "?"
+    if kind == 10 { r = "+"
+    } else if kind == 11 { r = "-"
+    } else if kind == 12 { r = "*"
+    } else if kind == 13 { r = "/"
+    } else if kind == 15 { r = "=="
+    } else if kind == 17 { r = "!="
+    } else if kind == 18 { r = "<"
+    } else if kind == 19 { r = ">"
+    } else if kind == 20 { r = "<="
+    } else if kind == 21 { r = ">="
+    } else if kind == 33 { r = "|>"
+    }
+    r
+}
+
+fn parse_expr_prec(toks: string, pos: int, min_prec: int) -> string {
+    let left = parse_postfix(toks, pos)
+    let cur = upos(left)
+    let ast = uast(left)
+
+    let done = false
+    for _bp in 0..200 {
+        if done { break }
+        let prec = op_prec(toks, cur)
+        if prec < min_prec {
+            done = true
+        } else if prec == 0 {
+            done = true
+        } else {
+            let opk = tok_kind(toks, cur)
+            let op = op_str(opk)
+            let next_pos = tok_next(toks, cur)
+            let right = parse_expr_prec(toks, next_pos, prec + 1)
+            cur = upos(right)
+            let sb = sb_new()
+            sb_append(sb, "(")
+            sb_append(sb, op)
+            sb_append(sb, " ")
+            sb_append(sb, ast)
+            sb_append(sb, " ")
+            sb_append(sb, uast(right))
+            sb_append(sb, ")")
+            ast = sb_to_string(sb)
+        }
+    }
+    pack(cur, ast)
+}
+
+fn parse_expr(toks: string, pos: int) -> string {
+    parse_expr_prec(toks, pos, 1)
+}
+
+// ── Parse: Block ────────────────────────────────────────────
+
+fn parse_block(toks: string, pos: int) -> string {
+    let cur = pos
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+    }
+
+    let sb = sb_new()
+    sb_append(sb, "(block")
+
+    let done = false
+    for _b in 0..5000 {
+        if done { break }
+        if tok_kind(toks, cur) == 31 {
+            cur = tok_next(toks, cur)
+        } else if tok_kind(toks, cur) == 43 {
+            done = true
+        } else if tok_kind(toks, cur) == 0 {
+            done = true
+        } else {
+            let stmt = parse_statement(toks, cur)
+            cur = upos(stmt)
+            sb_append(sb, " ")
+            sb_append(sb, uast(stmt))
+        }
+    }
+    if tok_kind(toks, cur) == 43 {
+        cur = tok_next(toks, cur)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: Statements ───────────────────────────────────────
+
+fn parse_statement(toks: string, pos: int) -> string {
+    let k = tok_kind(toks, pos)
+    let v = tok_val(toks, pos)
+    let r = ""
+
+    if k == 4 {
+        if str_eq(v, "let") {
+            r = parse_let(toks, pos)
+        } else if str_eq(v, "if") {
+            r = parse_if(toks, pos)
+        } else if str_eq(v, "for") {
+            r = parse_for(toks, pos)
+        } else if str_eq(v, "match") {
+            r = parse_match(toks, pos)
+        } else if str_eq(v, "return") {
+            let p2 = tok_next(toks, pos)
+            let kn = tok_kind(toks, p2)
+            if kn == 43 {
+                r = pack(p2, "(return)")
+            } else if kn == 31 {
+                r = pack(p2, "(return)")
+            } else if kn == 0 {
+                r = pack(p2, "(return)")
+            } else {
+                let val = parse_expr(toks, p2)
+                r = pack(upos(val), "(return " + uast(val) + ")")
+            }
+        } else if str_eq(v, "break") {
+            r = pack(tok_next(toks, pos), "(break)")
+        } else if str_eq(v, "continue") {
+            r = pack(tok_next(toks, pos), "(continue)")
+        } else if str_eq(v, "ensure") {
+            r = parse_ensure(toks, pos)
+        } else if str_eq(v, "while") {
+            r = parse_while(toks, pos)
+        } else if str_eq(v, "loop") {
+            let p2 = tok_next(toks, pos)
+            let body = parse_block(toks, p2)
+            r = pack(upos(body), "(loop " + uast(body) + ")")
+        } else {
+            let expr = parse_expr(toks, pos)
+            let ep = upos(expr)
+            let ea = uast(expr)
+            if tok_kind(toks, ep) == 14 {
+                let p2 = tok_next(toks, ep)
+                let val = parse_expr(toks, p2)
+                r = pack(upos(val), "(assign " + ea + " " + uast(val) + ")")
+            } else {
+                r = pack(ep, ea)
+            }
+        }
+    } else {
+        let expr = parse_expr(toks, pos)
+        let ep = upos(expr)
+        let ea = uast(expr)
+        if tok_kind(toks, ep) == 14 {
+            let p2 = tok_next(toks, ep)
+            let val = parse_expr(toks, p2)
+            r = pack(upos(val), "(assign " + ea + " " + uast(val) + ")")
+        } else {
+            r = pack(ep, ea)
+        }
+    }
+    r
+}
+
+// ── Parse: let ──────────────────────────────────────────────
+
+fn parse_let(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let ty = ""
+    if tok_kind(toks, cur) == 23 {
+        cur = tok_next(toks, cur)
+        ty = tok_val(toks, cur)
+        cur = tok_next(toks, cur)
+    }
+
+    let r = ""
+    if tok_kind(toks, cur) == 14 {
+        cur = tok_next(toks, cur)
+        let val = parse_expr(toks, cur)
+        let sb = sb_new()
+        sb_append(sb, "(let ")
+        sb_append(sb, name)
+        if str_len(ty) > 0 {
+            sb_append(sb, " :")
+            sb_append(sb, ty)
+        }
+        sb_append(sb, " ")
+        sb_append(sb, uast(val))
+        sb_append(sb, ")")
+        r = pack(upos(val), sb_to_string(sb))
+    } else {
+        let sb = sb_new()
+        sb_append(sb, "(let ")
+        sb_append(sb, name)
+        if str_len(ty) > 0 {
+            sb_append(sb, " :")
+            sb_append(sb, ty)
+        }
+        sb_append(sb, ")")
+        r = pack(cur, sb_to_string(sb))
+    }
+    r
+}
+
+// ── Parse: if/else ──────────────────────────────────────────
+
+fn parse_if(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let cond = parse_expr(toks, cur)
+    cur = upos(cond)
+
+    let then_b = parse_block(toks, cur)
+    cur = upos(then_b)
+
+    let sb = sb_new()
+    sb_append(sb, "(if ")
+    sb_append(sb, uast(cond))
+    sb_append(sb, " ")
+    sb_append(sb, uast(then_b))
+
+    if tok_kind(toks, cur) == 4 {
+        if str_eq(tok_val(toks, cur), "else") {
+            cur = tok_next(toks, cur)
+            if tok_kind(toks, cur) == 4 {
+                if str_eq(tok_val(toks, cur), "if") {
+                    let elif = parse_if(toks, cur)
+                    cur = upos(elif)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(elif))
+                } else {
+                    let else_b = parse_block(toks, cur)
+                    cur = upos(else_b)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(else_b))
+                }
+            } else {
+                let else_b = parse_block(toks, cur)
+                cur = upos(else_b)
+                sb_append(sb, " ")
+                sb_append(sb, uast(else_b))
+            }
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: for ──────────────────────────────────────────────
+
+fn parse_for(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let var_name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    if tok_kind(toks, cur) == 4 {
+        if str_eq(tok_val(toks, cur), "in") {
+            cur = tok_next(toks, cur)
+        }
+    }
+
+    let start_e = parse_expr(toks, cur)
+    cur = upos(start_e)
+
+    let sb = sb_new()
+    if tok_kind(toks, cur) == 32 {
+        cur = tok_next(toks, cur)
+        let end_e = parse_expr(toks, cur)
+        cur = upos(end_e)
+        let body = parse_block(toks, cur)
+        cur = upos(body)
+        sb_append(sb, "(for ")
+        sb_append(sb, var_name)
+        sb_append(sb, " (range ")
+        sb_append(sb, uast(start_e))
+        sb_append(sb, " ")
+        sb_append(sb, uast(end_e))
+        sb_append(sb, ") ")
+        sb_append(sb, uast(body))
+        sb_append(sb, ")")
+    } else {
+        let body = parse_block(toks, cur)
+        cur = upos(body)
+        sb_append(sb, "(for ")
+        sb_append(sb, var_name)
+        sb_append(sb, " ")
+        sb_append(sb, uast(start_e))
+        sb_append(sb, " ")
+        sb_append(sb, uast(body))
+        sb_append(sb, ")")
+    }
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: while ────────────────────────────────────────────
+
+fn parse_while(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let cond = parse_expr(toks, cur)
+    cur = upos(cond)
+    let body = parse_block(toks, cur)
+    cur = upos(body)
+    let sb = sb_new()
+    sb_append(sb, "(while ")
+    sb_append(sb, uast(cond))
+    sb_append(sb, " ")
+    sb_append(sb, uast(body))
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: match ────────────────────────────────────────────
+
+fn parse_match(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let subj = parse_expr(toks, cur)
+    cur = upos(subj)
+
+    let sb = sb_new()
+    sb_append(sb, "(match ")
+    sb_append(sb, uast(subj))
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+    }
+
+    let done = false
+    for _m in 0..200 {
+        if done { break }
+        if tok_kind(toks, cur) == 43 {
+            done = true
+        } else if tok_kind(toks, cur) == 0 {
+            done = true
+        } else if tok_kind(toks, cur) == 24 {
+            cur = tok_next(toks, cur)
+        } else {
+            let pat = parse_expr(toks, cur)
+            cur = upos(pat)
+            if tok_kind(toks, cur) == 14 {
+                cur = tok_next(toks, cur)
+                if tok_kind(toks, cur) == 19 {
+                    cur = tok_next(toks, cur)
+                }
+            } else if tok_kind(toks, cur) == 22 {
+                cur = tok_next(toks, cur)
+            }
+            let body_r = ""
+            if tok_kind(toks, cur) == 42 {
+                body_r = parse_block(toks, cur)
+            } else {
+                body_r = parse_expr(toks, cur)
+            }
+            cur = upos(body_r)
+            sb_append(sb, " (arm ")
+            sb_append(sb, uast(pat))
+            sb_append(sb, " ")
+            sb_append(sb, uast(body_r))
+            sb_append(sb, ")")
+        }
+    }
+    if tok_kind(toks, cur) == 43 {
+        cur = tok_next(toks, cur)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: ensure ───────────────────────────────────────────
+
+fn parse_ensure(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let cond = parse_expr(toks, cur)
+    cur = upos(cond)
+
+    let msg = ""
+    if tok_kind(toks, cur) == 24 {
+        cur = tok_next(toks, cur)
+        let msg_e = parse_expr(toks, cur)
+        cur = upos(msg_e)
+        msg = uast(msg_e)
+    }
+
+    let sb = sb_new()
+    sb_append(sb, "(ensure ")
+    sb_append(sb, uast(cond))
+    if str_len(msg) > 0 {
+        sb_append(sb, " ")
+        sb_append(sb, msg)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: fn declaration ───────────────────────────────────
+
+fn parse_fn(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(fn ")
+    sb_append(sb, name)
+    sb_append(sb, " (params")
+
+    if tok_kind(toks, cur) == 40 {
+        cur = tok_next(toks, cur)
+        let pdone = false
+        for _p in 0..50 {
+            if pdone { break }
+            if tok_kind(toks, cur) == 41 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 0 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else {
+                let pname = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                let pty = ""
+                if tok_kind(toks, cur) == 23 {
+                    cur = tok_next(toks, cur)
+                    pty = tok_val(toks, cur)
+                    cur = tok_next(toks, cur)
+                }
+                sb_append(sb, " (")
+                sb_append(sb, pname)
+                if str_len(pty) > 0 {
+                    sb_append(sb, " :")
+                    sb_append(sb, pty)
+                }
+                sb_append(sb, ")")
+            }
+        }
+        if tok_kind(toks, cur) == 41 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+
+    if tok_kind(toks, cur) == 22 {
+        cur = tok_next(toks, cur)
+        let rtype = tok_val(toks, cur)
+        cur = tok_next(toks, cur)
+        sb_append(sb, " ->")
+        sb_append(sb, rtype)
+    }
+
+    sb_append(sb, " ")
+    let body = parse_block(toks, cur)
+    cur = upos(body)
+    sb_append(sb, uast(body))
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: agent declaration ────────────────────────────────
+
+fn parse_agent(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(agent ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+    }
+
+    let done = false
+    for _a in 0..500 {
+        if done { break }
+        if tok_kind(toks, cur) == 43 {
+            done = true
+        } else if tok_kind(toks, cur) == 0 {
+            done = true
+        } else if tok_kind(toks, cur) == 31 {
+            cur = tok_next(toks, cur)
+        } else if tok_kind(toks, cur) == 4 {
+            if str_eq(tok_val(toks, cur), "fn") {
+                let meth = parse_fn(toks, cur)
+                cur = upos(meth)
+                sb_append(sb, " ")
+                sb_append(sb, uast(meth))
+            } else {
+                let fld = parse_agent_field(toks, cur)
+                cur = upos(fld)
+                sb_append(sb, " ")
+                sb_append(sb, uast(fld))
+            }
+        } else if tok_kind(toks, cur) == 1 {
+            let fld = parse_agent_field(toks, cur)
+            cur = upos(fld)
+            sb_append(sb, " ")
+            sb_append(sb, uast(fld))
+        } else {
+            cur = tok_next(toks, cur)
+        }
+    }
+    if tok_kind(toks, cur) == 43 {
+        cur = tok_next(toks, cur)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: agent field ──────────────────────────────────────
+
+fn parse_agent_field(toks: string, pos: int) -> string {
+    let fname = tok_val(toks, pos)
+    let cur = tok_next(toks, pos)
+    let r = ""
+
+    if tok_kind(toks, cur) == 23 {
+        cur = tok_next(toks, cur)
+
+        if tok_kind(toks, cur) == 44 {
+            cur = tok_next(toks, cur)
+            let sb = sb_new()
+            sb_append(sb, "(field ")
+            sb_append(sb, fname)
+            sb_append(sb, " (array")
+            let adone = false
+            for _af in 0..100 {
+                if adone { break }
+                if tok_kind(toks, cur) == 45 {
+                    adone = true
+                } else if tok_kind(toks, cur) == 0 {
+                    adone = true
+                } else if tok_kind(toks, cur) == 24 {
+                    cur = tok_next(toks, cur)
+                } else {
+                    let elem = parse_expr(toks, cur)
+                    cur = upos(elem)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(elem))
+                }
+            }
+            if tok_kind(toks, cur) == 45 {
+                cur = tok_next(toks, cur)
+            }
+            sb_append(sb, "))")
+            r = pack(cur, sb_to_string(sb))
+        } else if tok_kind(toks, cur) == 42 {
+            let blk = parse_agent_inline_block(toks, cur)
+            cur = upos(blk)
+            r = pack(cur, "(field " + fname + " " + uast(blk) + ")")
+        } else {
+            let val = parse_expr(toks, cur)
+            cur = upos(val)
+            r = pack(cur, "(field " + fname + " " + uast(val) + ")")
+        }
+    } else {
+        r = pack(cur, "(field " + fname + ")")
+    }
+    r
+}
+
+// ── Parse: inline block ─────────────────────────────────────
+
+fn parse_agent_inline_block(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let sb = sb_new()
+    sb_append(sb, "(obj")
+    let done = false
+    for _o in 0..100 {
+        if done { break }
+        if tok_kind(toks, cur) == 43 {
+            done = true
+        } else if tok_kind(toks, cur) == 0 {
+            done = true
+        } else if tok_kind(toks, cur) == 24 {
+            cur = tok_next(toks, cur)
+        } else {
+            let key = tok_val(toks, cur)
+            cur = tok_next(toks, cur)
+            if tok_kind(toks, cur) == 23 {
+                cur = tok_next(toks, cur)
+                let val = parse_expr(toks, cur)
+                cur = upos(val)
+                sb_append(sb, " (")
+                sb_append(sb, key)
+                sb_append(sb, " ")
+                sb_append(sb, uast(val))
+                sb_append(sb, ")")
+            } else {
+                sb_append(sb, " (")
+                sb_append(sb, key)
+                sb_append(sb, ")")
+            }
+        }
+    }
+    if tok_kind(toks, cur) == 43 {
+        cur = tok_next(toks, cur)
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: capability declaration ───────────────────────────
+
+fn parse_capability(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(capability ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _c in 0..100 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else {
+                let cap_name = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                if tok_kind(toks, cur) == 1 {
+                    if str_eq(tok_val(toks, cur), "requires") {
+                        cur = tok_next(toks, cur)
+                        let req = tok_val(toks, cur)
+                        cur = tok_next(toks, cur)
+                        sb_append(sb, " (cap ")
+                        sb_append(sb, cap_name)
+                        sb_append(sb, " requires ")
+                        sb_append(sb, req)
+                        sb_append(sb, ")")
+                    } else {
+                        sb_append(sb, " (cap ")
+                        sb_append(sb, cap_name)
+                        sb_append(sb, ")")
+                    }
+                } else {
+                    sb_append(sb, " (cap ")
+                    sb_append(sb, cap_name)
+                    sb_append(sb, ")")
+                }
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: budget declaration ───────────────────────────────
+
+fn parse_budget(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(budget ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _b in 0..100 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else {
+                let field = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                if tok_kind(toks, cur) == 23 {
+                    cur = tok_next(toks, cur)
+                    let val = parse_expr(toks, cur)
+                    cur = upos(val)
+                    sb_append(sb, " (")
+                    sb_append(sb, field)
+                    sb_append(sb, " ")
+                    sb_append(sb, uast(val))
+                    sb_append(sb, ")")
+                }
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: tool declaration ─────────────────────────────────
+
+fn parse_tool(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(tool ")
+    sb_append(sb, name)
+    sb_append(sb, " (params")
+
+    if tok_kind(toks, cur) == 40 {
+        cur = tok_next(toks, cur)
+        let pdone = false
+        for _p in 0..50 {
+            if pdone { break }
+            if tok_kind(toks, cur) == 41 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 0 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else {
+                let pname = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                let pty = ""
+                if tok_kind(toks, cur) == 23 {
+                    cur = tok_next(toks, cur)
+                    pty = tok_val(toks, cur)
+                    cur = tok_next(toks, cur)
+                }
+                sb_append(sb, " (")
+                sb_append(sb, pname)
+                if str_len(pty) > 0 {
+                    sb_append(sb, " :")
+                    sb_append(sb, pty)
+                }
+                sb_append(sb, ")")
+            }
+        }
+        if tok_kind(toks, cur) == 41 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+
+    if tok_kind(toks, cur) == 22 {
+        cur = tok_next(toks, cur)
+        let rtype = tok_val(toks, cur)
+        cur = tok_next(toks, cur)
+        sb_append(sb, " ->")
+        sb_append(sb, rtype)
+    }
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let tdone = false
+        for _t in 0..200 {
+            if tdone { break }
+            if tok_kind(toks, cur) == 43 {
+                tdone = true
+            } else if tok_kind(toks, cur) == 0 {
+                tdone = true
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else {
+                let fld = parse_agent_field(toks, cur)
+                cur = upos(fld)
+                sb_append(sb, " ")
+                sb_append(sb, uast(fld))
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: guard declaration ────────────────────────────────
+
+fn parse_guard(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(guard ")
+    sb_append(sb, name)
+    sb_append(sb, " (params")
+
+    if tok_kind(toks, cur) == 40 {
+        cur = tok_next(toks, cur)
+        let pdone = false
+        for _p in 0..50 {
+            if pdone { break }
+            if tok_kind(toks, cur) == 41 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 0 {
+                pdone = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else {
+                let pname = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                let pty = ""
+                if tok_kind(toks, cur) == 23 {
+                    cur = tok_next(toks, cur)
+                    pty = tok_val(toks, cur)
+                    cur = tok_next(toks, cur)
+                }
+                sb_append(sb, " (")
+                sb_append(sb, pname)
+                if str_len(pty) > 0 {
+                    sb_append(sb, " :")
+                    sb_append(sb, pty)
+                }
+                sb_append(sb, ")")
+            }
+        }
+        if tok_kind(toks, cur) == 41 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+
+    let body = parse_block(toks, cur)
+    cur = upos(body)
+    sb_append(sb, " ")
+    sb_append(sb, uast(body))
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: struct declaration ───────────────────────────────
+
+fn parse_struct(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(struct ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _s in 0..100 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else {
+                let field = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                if tok_kind(toks, cur) == 23 {
+                    cur = tok_next(toks, cur)
+                    let ftype = tok_val(toks, cur)
+                    cur = tok_next(toks, cur)
+                    sb_append(sb, " (")
+                    sb_append(sb, field)
+                    sb_append(sb, " :")
+                    sb_append(sb, ftype)
+                    sb_append(sb, ")")
+                }
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: enum declaration ─────────────────────────────────
+
+fn parse_enum(toks: string, pos: int) -> string {
+    let cur = tok_next(toks, pos)
+    let name = tok_val(toks, cur)
+    cur = tok_next(toks, cur)
+
+    let sb = sb_new()
+    sb_append(sb, "(enum ")
+    sb_append(sb, name)
+
+    if tok_kind(toks, cur) == 42 {
+        cur = tok_next(toks, cur)
+        let done = false
+        for _e in 0..100 {
+            if done { break }
+            if tok_kind(toks, cur) == 43 {
+                done = true
+            } else if tok_kind(toks, cur) == 0 {
+                done = true
+            } else if tok_kind(toks, cur) == 24 {
+                cur = tok_next(toks, cur)
+            } else if tok_kind(toks, cur) == 31 {
+                cur = tok_next(toks, cur)
+            } else {
+                let vname = tok_val(toks, cur)
+                cur = tok_next(toks, cur)
+                sb_append(sb, " ")
+                sb_append(sb, vname)
+            }
+        }
+        if tok_kind(toks, cur) == 43 {
+            cur = tok_next(toks, cur)
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ── Parse: Top-level Declaration ────────────────────────────
+
+fn parse_declaration(toks: string, pos: int) -> string {
+    let k = tok_kind(toks, pos)
+    let v = tok_val(toks, pos)
+    let r = ""
+
+    if k == 4 {
+        if str_eq(v, "fn") {
+            r = parse_fn(toks, pos)
+        } else if str_eq(v, "agent") {
+            r = parse_agent(toks, pos)
+        } else if str_eq(v, "capability") {
+            r = parse_capability(toks, pos)
+        } else if str_eq(v, "budget") {
+            r = parse_budget(toks, pos)
+        } else if str_eq(v, "tool") {
+            r = parse_tool(toks, pos)
+        } else if str_eq(v, "guard") {
+            r = parse_guard(toks, pos)
+        } else if str_eq(v, "use") {
+            let cur = tok_next(toks, pos)
+            let mod_name = tok_val(toks, cur)
+            cur = tok_next(toks, cur)
+            r = pack(cur, "(use " + mod_name + ")")
+        } else if str_eq(v, "struct") {
+            r = parse_struct(toks, pos)
+        } else if str_eq(v, "enum") {
+            r = parse_enum(toks, pos)
+        } else if str_eq(v, "endpoint") {
+            let cur = tok_next(toks, pos)
+            let val = parse_expr(toks, cur)
+            r = pack(upos(val), "(endpoint " + uast(val) + ")")
+        } else {
+            r = pack(tok_next(toks, pos), "(unknown " + v + ")")
+        }
+    } else if k == 1 {
+        let stmt = parse_statement(toks, pos)
+        r = stmt
+    } else {
+        r = pack(tok_next(toks, pos), "(skip)")
+    }
+    r
+}
+
+// ── Parse: Program ──────────────────────────────────────────
+
+fn parse_program(toks: string, pos: int) -> string {
+    let sb = sb_new()
+    sb_append(sb, "(program")
+
+    let cur = pos
+    let done = false
+    for _prog in 0..5000 {
+        if done { break }
+        let k = tok_kind(toks, cur)
+        if k == 0 {
+            done = true
+        } else if k == 31 {
+            cur = tok_next(toks, cur)
+        } else {
+            let decl = parse_declaration(toks, cur)
+            let new_pos = upos(decl)
+            if new_pos == cur {
+                cur = tok_next(toks, cur)
+            } else {
+                cur = new_pos
+            }
+            sb_append(sb, "\n  ")
+            sb_append(sb, uast(decl))
+        }
+    }
+    sb_append(sb, ")")
+    pack(cur, sb_to_string(sb))
+}
+
+// ══════════════════════════════════════════════════════════════
+// S-EXPRESSION WALKER HELPERS
+// These functions navigate the S-expression AST string.
+// ══════════════════════════════════════════════════════════════
+
+// Skip whitespace in an S-expression string starting at pos
+fn sexp_skip_ws(s: string, pos: int) -> int {
+    let slen = str_len(s)
+    let p = pos
+    for _w in 0..100000 {
+        if p >= slen { break }
+        let c = char_code(char_at(s, p))
+        if c == 32 { p = p + 1
+        } else if c == 10 { p = p + 1
+        } else if c == 13 { p = p + 1
+        } else if c == 9 { p = p + 1
+        } else { break }
+    }
+    p
+}
+
+// Get the "kind" of the S-expression node at pos.
+// If pos points to '(', read the atom after it. E.g. "(fn " -> "fn"
+// If pos points to a non-paren char, read the atom. E.g. "hello)" -> "hello"
+fn sexp_kind(s: string, pos: int) -> string {
+    let slen = str_len(s)
+    let p = sexp_skip_ws(s, pos)
+    let r = ""
+    if p >= slen {
+        r = ""
+    } else if char_code(char_at(s, p)) == 40 {
+        // opening paren — skip it, then read atom
+        p = p + 1
+        p = sexp_skip_ws(s, p)
+        let start = p
+        for _k in 0..1000 {
+            if p >= slen { break }
+            let c = char_code(char_at(s, p))
+            if c == 32 { break
+            } else if c == 41 { break
+            } else if c == 40 { break
+            } else if c == 10 { break
+            } else { p = p + 1 }
+        }
+        r = str_slice(s, start, p)
+    } else {
+        // bare atom
+        let start = p
+        for _k in 0..1000 {
+            if p >= slen { break }
+            let c = char_code(char_at(s, p))
+            if c == 32 { break
+            } else if c == 41 { break
+            } else if c == 40 { break
+            } else if c == 10 { break
+            } else { p = p + 1 }
+        }
+        r = str_slice(s, start, p)
+    }
+    r
+}
+
+// Read an atom (non-paren, non-space sequence) at pos, return "end_pos\tatom"
+fn sexp_read_atom(s: string, pos: int) -> string {
+    let slen = str_len(s)
+    let p = sexp_skip_ws(s, pos)
+    let start = p
+    let is_quoted = false
+    // handle quoted strings
+    if p < slen {
+        if char_code(char_at(s, p)) == 34 {
+            is_quoted = true
+            p = p + 1
+            for _q in 0..100000 {
+                if p >= slen { break }
+                let c = char_code(char_at(s, p))
+                if c == 92 { p = p + 2
+                } else if c == 34 { p = p + 1; break
+                } else { p = p + 1 }
+            }
+        }
+    }
+    if is_quoted == false {
+        for _a in 0..10000 {
+            if p >= slen { break }
+            let c = char_code(char_at(s, p))
+            if c == 32 { break
+            } else if c == 41 { break
+            } else if c == 40 { break
+            } else if c == 10 { break
+            } else { p = p + 1 }
+        }
+    }
+    pack(p, str_slice(s, start, p))
+}
+
+// Skip over a complete S-expression (balanced parens or one atom).
+// Returns the position after the S-expression.
+fn sexp_skip(s: string, pos: int) -> int {
+    let slen = str_len(s)
+    let p = sexp_skip_ws(s, pos)
+    let r = p
+    if p >= slen {
+        r = slen
+    } else if char_code(char_at(s, p)) == 40 {
+        // opening paren — find matching close
+        let depth = 1
+        p = p + 1
+        for _sk in 0..500000 {
+            if p >= slen { break }
+            if depth == 0 { break }
+            let c = char_code(char_at(s, p))
+            if c == 40 { depth = depth + 1; p = p + 1
+            } else if c == 41 { depth = depth - 1; p = p + 1
+            } else if c == 34 {
+                // skip quoted string
+                p = p + 1
+                for _q in 0..100000 {
+                    if p >= slen { break }
+                    let qc = char_code(char_at(s, p))
+                    if qc == 92 { p = p + 2
+                    } else if qc == 34 { p = p + 1; break
+                    } else { p = p + 1 }
+                }
+            } else { p = p + 1 }
+        }
+        r = p
+    } else {
+        // atom — skip it
+        let ar = sexp_read_atom(s, p)
+        r = upos(ar)
+    }
+    r
+}
+
+// Count child S-expressions inside a node.
+// Assumes pos is right after the opening "(" and the kind atom.
+// E.g., for "(fn main (params) ->Result (block ...))" and pos pointing
+// to "main", this returns 4 (main, (params), ->Result, (block ...))
+fn sexp_count_children(s: string, pos: int) -> int {
+    let slen = str_len(s)
+    let p = sexp_skip_ws(s, pos)
+    let count = 0
+    for _cc in 0..10000 {
+        if p >= slen { break }
+        let c = char_code(char_at(s, p))
+        if c == 41 { break }
+        p = sexp_skip(s, p)
+        p = sexp_skip_ws(s, p)
+        count = count + 1
+    }
+    count
+}
+
+// Get the Nth child of an S-expression (0-based).
+// pos should point to the opening '(' of the parent node.
+// Child 0 is the kind atom.
+// Returns pack(child_start_pos, child_text) or pack(slen, "") if not found.
+fn sexp_nth_child(s: string, pos: int, n: int) -> string {
+    let slen = str_len(s)
+    let p = sexp_skip_ws(s, pos)
+    let r = pack(slen, "")
+    let found = false
+    if p < slen {
+        // skip opening paren if present
+        if char_code(char_at(s, p)) == 40 {
+            p = p + 1
+        }
+        p = sexp_skip_ws(s, p)
+
+        let idx = 0
+        for _nc in 0..10000 {
+            if p >= slen { break }
+            if found { break }
+            let c = char_code(char_at(s, p))
+            if c == 41 { break }
+            if idx == n {
+                let end = sexp_skip(s, p)
+                r = pack(p, str_slice(s, p, end))
+                found = true
+            } else {
+                p = sexp_skip(s, p)
+                p = sexp_skip_ws(s, p)
+                idx = idx + 1
+            }
+        }
+    }
+    r
+}
+
+// Check if a name is a known builtin function
+fn is_builtin(name: string) -> bool {
+    let r = false
+    if str_eq(name, "print") { r = true
+    } else if str_eq(name, "println") { r = true
+    } else if str_eq(name, "len") { r = true
+    } else if str_eq(name, "contains") { r = true
+    } else if str_eq(name, "starts_with") { r = true
+    } else if str_eq(name, "ends_with") { r = true
+    } else if str_eq(name, "env") { r = true
+    } else if str_eq(name, "env_or") { r = true
+    } else if str_eq(name, "str_eq") { r = true
+    } else if str_eq(name, "str_replace") { r = true
+    } else if str_eq(name, "str_trim") { r = true
+    } else if str_eq(name, "str_substring") { r = true
+    } else if str_eq(name, "to_string") { r = true
+    } else if str_eq(name, "to_int") { r = true
+    } else if str_eq(name, "split") { r = true
+    } else if str_eq(name, "format") { r = true
+    } else if str_eq(name, "json_parse") { r = true
+    } else if str_eq(name, "json_get") { r = true
+    } else if str_eq(name, "json_get_number") { r = true
+    } else if str_eq(name, "json_array_len") { r = true
+    } else if str_eq(name, "json_array_get") { r = true
+    } else if str_eq(name, "json_stringify") { r = true
+    } else if str_eq(name, "abs") { r = true
+    } else if str_eq(name, "min") { r = true
+    } else if str_eq(name, "max") { r = true
+    } else if str_eq(name, "clamp") { r = true
+    } else if str_eq(name, "floor") { r = true
+    } else if str_eq(name, "ceil") { r = true
+    } else if str_eq(name, "round") { r = true
+    } else if str_eq(name, "now_ms") { r = true
+    } else if str_eq(name, "sleep_ms") { r = true
+    } else if str_eq(name, "read_file") { r = true
+    } else if str_eq(name, "write_file") { r = true
+    } else if str_eq(name, "read_line") { r = true
+    } else if str_eq(name, "retry_ask") { r = true
+    } else if str_eq(name, "retry_ask_backoff") { r = true
+    } else if str_eq(name, "char_at") { r = true
+    } else if str_eq(name, "char_code") { r = true
+    } else if str_eq(name, "str_from_code") { r = true
+    } else if str_eq(name, "str_slice") { r = true
+    } else if str_eq(name, "str_len") { r = true
+    } else if str_eq(name, "str_find") { r = true
+    } else if str_eq(name, "str_char_is_alpha") { r = true
+    } else if str_eq(name, "str_char_is_digit") { r = true
+    } else if str_eq(name, "str_char_is_alnum") { r = true
+    } else if str_eq(name, "arg") { r = true
+    } else if str_eq(name, "arg_count") { r = true
+    } else if str_eq(name, "sb_new") { r = true
+    } else if str_eq(name, "sb_append") { r = true
+    } else if str_eq(name, "sb_to_string") { r = true
+    } else if str_eq(name, "sb_peek") { r = true
+    } else if str_eq(name, "vec_new") { r = true
+    } else if str_eq(name, "vec_push") { r = true
+    } else if str_eq(name, "vec_get") { r = true
+    } else if str_eq(name, "vec_len") { r = true
+    } else if str_eq(name, "delegate") { r = true
+    } else if str_eq(name, "revoke") { r = true
+    } else if str_eq(name, "revoke_all") { r = true
+    } else if str_eq(name, "has_capability") { r = true
+    } else if str_eq(name, "log_info") { r = true
+    } else if str_eq(name, "log_warn") { r = true
+    } else if str_eq(name, "log_error") { r = true
+    } else if str_eq(name, "log_debug") { r = true
+    } else if str_eq(name, "unwrap") { r = true
+    } else if str_eq(name, "sql_escape") { r = true
+    } else if str_eq(name, "estimate_tokens") { r = true
+    } else if str_eq(name, "fits_in_budget") { r = true
+    }
+    r
+}
+
+// ══════════════════════════════════════════════════════════════
+// ENTRY POINT
+// ══════════════════════════════════════════════════════════════
+// All type checking logic lives in main() because Vecs cannot
+// cross function boundaries in the Stage 0 C codegen.
+
+fn main() -> Result {
+    let file_path = env("LEX_FILE")
+    ensure str_len(file_path) > 0, "Set LEX_FILE to the .lceron file to type-check"
+
+    let source = read_file(file_path)
+    ensure str_len(source) > 0, "Could not read file or file is empty"
+
+    let src_len = str_len(source)
+
+    // ── Lexer (inline) ──────────────────────────────────
+    let kinds = vec_new()
+    let values = vec_new()
+
+    let lpos = 0
+    let line = 1
+    let tok_count = 0
+
+    for _tick in 0..500000 {
+        if lpos >= src_len { break }
+        let ch = char_at(source, lpos)
+        let code = char_code(ch)
+
+        if code == 32 { lpos = lpos + 1
+        } else if code == 9 { lpos = lpos + 1
+        } else if code == 13 { lpos = lpos + 1
+        } else if code == 10 {
+            line = line + 1
+            lpos = lpos + 1
+        } else if code == 47 {
+            let is_comment = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 47 {
+                    is_comment = true
+                }
+            }
+            if is_comment {
+                lpos = lpos + 2
+                for _cmt in 0..500000 {
+                    if lpos >= src_len { break }
+                    if char_code(char_at(source, lpos)) == 10 { break }
+                    lpos = lpos + 1
+                }
+            } else {
+                vec_push(kinds, to_string(13))
+                vec_push(values, "/")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if str_char_is_alpha(ch) {
+            let start = lpos
+            lpos = lpos + 1
+            for _id in 0..10000 {
+                if lpos >= src_len { break }
+                if str_char_is_alnum(char_at(source, lpos)) {
+                    lpos = lpos + 1
+                } else { break }
+            }
+            let word = str_slice(source, start, lpos)
+            if is_keyword(word) {
+                vec_push(kinds, to_string(4))
+            } else {
+                vec_push(kinds, to_string(1))
+            }
+            vec_push(values, word)
+            tok_count = tok_count + 1
+        } else if str_char_is_digit(ch) {
+            let nstart = lpos
+            lpos = lpos + 1
+            for _d in 0..10000 {
+                if lpos >= src_len { break }
+                if str_char_is_digit(char_at(source, lpos)) { lpos = lpos + 1
+                } else { break }
+            }
+            let is_float = false
+            if lpos < src_len {
+                if char_code(char_at(source, lpos)) == 46 {
+                    let has_digit_after = false
+                    if lpos + 1 < src_len {
+                        if str_char_is_digit(char_at(source, lpos + 1)) {
+                            has_digit_after = true
+                        }
+                    }
+                    if has_digit_after {
+                        is_float = true
+                        lpos = lpos + 1
+                        for _fd in 0..10000 {
+                            if lpos >= src_len { break }
+                            if str_char_is_digit(char_at(source, lpos)) { lpos = lpos + 1
+                            } else { break }
+                        }
+                    }
+                }
+            }
+            let num_text = str_slice(source, nstart, lpos)
+            if is_float {
+                vec_push(kinds, to_string(5))
+            } else {
+                vec_push(kinds, to_string(2))
+            }
+            vec_push(values, num_text)
+            tok_count = tok_count + 1
+        } else if code == 34 {
+            lpos = lpos + 1
+            let sstart = lpos
+            for _s in 0..500000 {
+                if lpos >= src_len { break }
+                let sc = char_code(char_at(source, lpos))
+                if sc == 92 { lpos = lpos + 2
+                } else if sc == 34 { break
+                } else {
+                    if sc == 10 { line = line + 1 }
+                    lpos = lpos + 1
+                }
+            }
+            let str_val = str_slice(source, sstart, lpos)
+            if lpos < src_len { lpos = lpos + 1 }
+            vec_push(kinds, to_string(3))
+            vec_push(values, str_val)
+            tok_count = tok_count + 1
+        } else if code == 96 {
+            lpos = lpos + 1
+            let rstart = lpos
+            for _r in 0..500000 {
+                if lpos >= src_len { break }
+                if char_code(char_at(source, lpos)) == 96 { break }
+                if char_code(char_at(source, lpos)) == 10 { line = line + 1 }
+                lpos = lpos + 1
+            }
+            let raw_val = str_slice(source, rstart, lpos)
+            if lpos < src_len { lpos = lpos + 1 }
+            vec_push(kinds, to_string(3))
+            vec_push(values, raw_val)
+            tok_count = tok_count + 1
+        } else if code == 40 { vec_push(kinds, to_string(40)); vec_push(values, "("); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 41 { vec_push(kinds, to_string(41)); vec_push(values, ")"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 123 { vec_push(kinds, to_string(42)); vec_push(values, "{"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 125 { vec_push(kinds, to_string(43)); vec_push(values, "}"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 91 { vec_push(kinds, to_string(44)); vec_push(values, "["); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 93 { vec_push(kinds, to_string(45)); vec_push(values, "]"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 43 { vec_push(kinds, to_string(10)); vec_push(values, "+"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 42 { vec_push(kinds, to_string(12)); vec_push(values, "*"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 44 { vec_push(kinds, to_string(24)); vec_push(values, ","); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 63 { vec_push(kinds, to_string(28)); vec_push(values, "?"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 64 { vec_push(kinds, to_string(29)); vec_push(values, "@"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 35 { vec_push(kinds, to_string(30)); vec_push(values, "#"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 38 { vec_push(kinds, to_string(27)); vec_push(values, "&"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 59 { vec_push(kinds, to_string(31)); vec_push(values, ";"); tok_count = tok_count + 1; lpos = lpos + 1
+        } else if code == 58 {
+            vec_push(kinds, to_string(23))
+            vec_push(values, ":")
+            tok_count = tok_count + 1
+            lpos = lpos + 1
+        } else if code == 46 {
+            let is_dotdot = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 46 { is_dotdot = true }
+            }
+            if is_dotdot {
+                vec_push(kinds, to_string(32))
+                vec_push(values, "..")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(25))
+                vec_push(values, ".")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 124 {
+            let is_pipe_gt = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 62 { is_pipe_gt = true }
+            }
+            if is_pipe_gt {
+                vec_push(kinds, to_string(33))
+                vec_push(values, "|>")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(26))
+                vec_push(values, "|")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 45 {
+            let is_arrow = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 62 { is_arrow = true }
+            }
+            if is_arrow {
+                vec_push(kinds, to_string(22))
+                vec_push(values, "->")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(11))
+                vec_push(values, "-")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 61 {
+            let is_eq_eq = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 61 { is_eq_eq = true }
+            }
+            if is_eq_eq {
+                vec_push(kinds, to_string(15))
+                vec_push(values, "==")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(14))
+                vec_push(values, "=")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 60 {
+            let is_lt_eq = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 61 { is_lt_eq = true }
+            }
+            if is_lt_eq {
+                vec_push(kinds, to_string(20))
+                vec_push(values, "<=")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(18))
+                vec_push(values, "<")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 62 {
+            let is_gt_eq = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 61 { is_gt_eq = true }
+            }
+            if is_gt_eq {
+                vec_push(kinds, to_string(21))
+                vec_push(values, ">=")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(19))
+                vec_push(values, ">")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else if code == 33 {
+            let is_bang_eq = false
+            if lpos + 1 < src_len {
+                if char_code(char_at(source, lpos + 1)) == 61 { is_bang_eq = true }
+            }
+            if is_bang_eq {
+                vec_push(kinds, to_string(17))
+                vec_push(values, "!=")
+                tok_count = tok_count + 1
+                lpos = lpos + 2
+            } else {
+                vec_push(kinds, to_string(16))
+                vec_push(values, "!")
+                tok_count = tok_count + 1
+                lpos = lpos + 1
+            }
+        } else {
+            lpos = lpos + 1
+        }
+    }
+
+    // EOF sentinel
+    vec_push(kinds, to_string(0))
+    vec_push(values, "")
+    tok_count = tok_count + 1
+
+    // ── Encode tokens into flat string ──────────────────
+    let tsb = sb_new()
+    for i in 0..tok_count {
+        let tk = vec_get(kinds, i)
+        let tv = vec_get(values, i)
+        sb_append(tsb, tk)
+        sb_append(tsb, "\t")
+        sb_append(tsb, tv)
+        sb_append(tsb, "\n")
+    }
+    let toks = sb_to_string(tsb)
+
+    // ── Parse ───────────────────────────────────────────
+    let result = parse_program(toks, 0)
+    let ast = uast(result)
+
+    // ══════════════════════════════════════════════════════
+    // TYPE CHECKING PHASE
+    // ══════════════════════════════════════════════════════
+
+    // Symbol table — parallel Vecs
+    // sym_names:  name of the symbol
+    // sym_types:  kind: "fn", "let", "agent", "cap", "budget", "tool", "guard", "struct", "enum", "param"
+    // sym_scopes: scope depth (0 = global)
+    // sym_arities: for fn/tool, number of params; for others, -1
+    let sym_names = vec_new()
+    let sym_types = vec_new()
+    let sym_scopes = vec_new()
+    let sym_arities = vec_new()
+
+    // Agent info — parallel Vecs for per-agent tracking
+    // ag_names: agent name
+    // ag_has_llm: "1" if agent has llm.* capability, "0" otherwise
+    // ag_has_budget: "1" if agent declares budget, "0" otherwise
+    // ag_uses_ask: "1" if agent body contains ask(), "0" otherwise
+    // ag_uses_tool: "1" if agent body calls a tool, "0" otherwise
+    let ag_names = vec_new()
+    let ag_has_llm = vec_new()
+    let ag_has_budget = vec_new()
+    let ag_uses_ask = vec_new()
+    let ag_uses_tool = vec_new()
+
+    // Error collection
+    let errors = vec_new()
+    let warnings = vec_new()
+    let error_count = 0
+    let warn_count = 0
+
+    let scope_depth = 0
+    let ast_len = str_len(ast)
+
+    // ── Pass 1: Register all top-level declarations ─────
+    // Walk the (program ...) children to populate the symbol table.
+    // This allows forward references (fn calling fn defined later).
+    let p1pos = sexp_skip_ws(ast, 0)
+    // skip "(program"
+    if p1pos < ast_len {
+        if char_code(char_at(ast, p1pos)) == 40 {
+            p1pos = p1pos + 1
+        }
+    }
+    // skip "program" atom
+    let p1a = sexp_read_atom(ast, p1pos)
+    p1pos = upos(p1a)
+
+    for _p1 in 0..5000 {
+        p1pos = sexp_skip_ws(ast, p1pos)
+        if p1pos >= ast_len { break }
+        if char_code(char_at(ast, p1pos)) == 41 { break }
+
+        let kind = sexp_kind(ast, p1pos)
+
+        if str_eq(kind, "fn") {
+            // (fn name (params ...) ...)
+            let name_r = sexp_nth_child(ast, p1pos, 1)
+            let fname = uast(name_r)
+            // count params
+            let params_r = sexp_nth_child(ast, p1pos, 2)
+            let params_str = uast(params_r)
+            let pcount = 0
+            if str_len(params_str) > 7 {
+                // "(params ...)" — count children after "params"
+                let pp = sexp_skip_ws(params_str, 0)
+                if pp < str_len(params_str) {
+                    if char_code(char_at(params_str, pp)) == 40 {
+                        pp = pp + 1
+                    }
+                }
+                let pa = sexp_read_atom(params_str, pp)
+                pp = upos(pa)
+                pcount = sexp_count_children(params_str, pp)
+            }
+            // Check for duplicate
+            let dup = false
+            for _d in 0..vec_len(sym_names) {
+                let idx = vec_len(sym_names) - 1 - _d
+                if idx < 0 { break }
+                if str_eq(vec_get(sym_scopes, idx), "0") {
+                    if str_eq(vec_get(sym_names, idx), fname) {
+                        if str_eq(vec_get(sym_types, idx), "fn") {
+                            dup = true
+                        }
+                    }
+                }
+            }
+            if dup {
+                vec_push(errors, "error: duplicate function '" + fname + "'")
+                error_count = error_count + 1
+            }
+            vec_push(sym_names, fname)
+            vec_push(sym_types, "fn")
+            vec_push(sym_scopes, "0")
+            vec_push(sym_arities, to_string(pcount))
+
+        } else if str_eq(kind, "agent") {
+            let name_r = sexp_nth_child(ast, p1pos, 1)
+            let aname = uast(name_r)
+            // Check duplicate
+            let dup = false
+            for _d in 0..vec_len(sym_names) {
+                let idx = vec_len(sym_names) - 1 - _d
+                if idx < 0 { break }
+                if str_eq(vec_get(sym_scopes, idx), "0") {
+                    if str_eq(vec_get(sym_names, idx), aname) {
+                        dup = true
+                    }
+                }
+            }
+            if dup {
+                vec_push(errors, "error: duplicate definition '" + aname + "'")
+                error_count = error_count + 1
+            }
+            vec_push(sym_names, aname)
+            vec_push(sym_types, "agent")
+            vec_push(sym_scopes, "0")
+            vec_push(sym_arities, "-1")
+
+            // Analyze agent: capabilities, budget, ask usage, tool usage
+            let has_llm = false
+            let has_bgt = false
+            let uses_ask = false
+            let uses_tool = false
+
+            // Scan agent children for field nodes
+            let ap = sexp_skip_ws(ast, p1pos)
+            if ap < ast_len {
+                if char_code(char_at(ast, ap)) == 40 {
+                    ap = ap + 1
+                }
+            }
+            let aa = sexp_read_atom(ast, ap)
+            ap = upos(aa)
+            // skip agent name
+            ap = sexp_skip(ast, ap)
+
+            for _af in 0..500 {
+                ap = sexp_skip_ws(ast, ap)
+                if ap >= ast_len { break }
+                if char_code(char_at(ast, ap)) == 41 { break }
+
+                let fkind = sexp_kind(ast, ap)
+
+                if str_eq(fkind, "field") {
+                    let fn_r = sexp_nth_child(ast, ap, 1)
+                    let fld_name = uast(fn_r)
+                    if str_eq(fld_name, "capabilities") {
+                        // Check if any capability starts with "llm"
+                        // The array is child 2: (array (field llm (field complete)) ...)
+                        let arr_r = sexp_nth_child(ast, ap, 2)
+                        let arr_str = uast(arr_r)
+                        // Simple check: does the array text contain "llm"
+                        if str_find(arr_str, "llm") >= 0 {
+                            has_llm = true
+                        }
+                    } else if str_eq(fld_name, "budget") {
+                        has_bgt = true
+                    }
+                } else if str_eq(fkind, "fn") {
+                    // Scan method body for ask() and tool calls
+                    let meth_str = str_slice(ast, ap, sexp_skip(ast, ap))
+                    if str_find(meth_str, "(ask ") >= 0 {
+                        uses_ask = true
+                    }
+                    if str_find(meth_str, "(ask)") >= 0 {
+                        uses_ask = true
+                    }
+                    // Check for calls to any registered tool
+                    if str_find(meth_str, "(call ") >= 0 {
+                        uses_tool = true
+                    }
+                }
+
+                ap = sexp_skip(ast, ap)
+            }
+
+            vec_push(ag_names, aname)
+            if has_llm {
+                vec_push(ag_has_llm, "1")
+            } else {
+                vec_push(ag_has_llm, "0")
+            }
+            if has_bgt {
+                vec_push(ag_has_budget, "1")
+            } else {
+                vec_push(ag_has_budget, "0")
+            }
+            if uses_ask {
+                vec_push(ag_uses_ask, "1")
+            } else {
+                vec_push(ag_uses_ask, "0")
+            }
+            if uses_tool {
+                vec_push(ag_uses_tool, "1")
+            } else {
+                vec_push(ag_uses_tool, "0")
+            }
+
+        } else if str_eq(kind, "capability") {
+            let name_r = sexp_nth_child(ast, p1pos, 1)
+            let cname = uast(name_r)
+            vec_push(sym_names, cname)
+            vec_push(sym_types, "cap")
+            vec_push(sym_scopes, "0")
+            vec_push(sym_arities, "-1")
+
+        } else if str_eq(kind, "budget") {
+            let name_r = sexp_nth_child(ast, p1pos, 1)
+            let bname = uast(name_r)
+            vec_push(sym_names, bname)
+            vec_push(sym_types, "budget")
+            vec_push(sym_scopes, "0")
+            vec_push(sym_arities, "-1")
+
+        } else if str_eq(kind, "tool") {
+            let name_r = sexp_nth_child(ast, p1pos, 1)
+            let tname = uast(name_r)
+            // count params
+            let params_r = sexp_nth_child(ast, p1pos, 2)
+            let params_str = uast(params_r)
+            let pcount = 0
+            if str_len(params_str) > 7 {
+                let pp = sexp_skip_ws(params_str, 0)
+                if pp < str_len(params_str) {
+                    if char_code(char_at(params_str, pp)) == 40 {
+                        pp = pp + 1
+                    }
+                }
+                let pa = sexp_read_atom(params_str, pp)
+                pp = upos(pa)
+                pcount = sexp_count_children(params_str, pp)
+            }
+            vec_push(sym_names, tname)
+            vec_push(sym_types, "tool")
+            vec_push(sym_scopes, "0")
+            vec_push(sym_arities, to_string(pcount))
+
+        } else if str_eq(kind, "guard") {
+            let name_r = sexp_nth_child(ast, p1pos, 1)
+            let gname = uast(name_r)
+            let params_r = sexp_nth_child(ast, p1pos, 2)
+            let params_str = uast(params_r)
+            let pcount = 0
+            if str_len(params_str) > 7 {
+                let pp = sexp_skip_ws(params_str, 0)
+                if pp < str_len(params_str) {
+                    if char_code(char_at(params_str, pp)) == 40 {
+                        pp = pp + 1
+                    }
+                }
+                let pa = sexp_read_atom(params_str, pp)
+                pp = upos(pa)
+                pcount = sexp_count_children(params_str, pp)
+            }
+            vec_push(sym_names, gname)
+            vec_push(sym_types, "guard")
+            vec_push(sym_scopes, "0")
+            vec_push(sym_arities, to_string(pcount))
+
+        } else if str_eq(kind, "struct") {
+            let name_r = sexp_nth_child(ast, p1pos, 1)
+            let sname = uast(name_r)
+            vec_push(sym_names, sname)
+            vec_push(sym_types, "struct")
+            vec_push(sym_scopes, "0")
+            vec_push(sym_arities, "-1")
+
+        } else if str_eq(kind, "enum") {
+            let name_r = sexp_nth_child(ast, p1pos, 1)
+            let ename = uast(name_r)
+            vec_push(sym_names, ename)
+            vec_push(sym_types, "enum")
+            vec_push(sym_scopes, "0")
+            vec_push(sym_arities, "-1")
+
+        } else if str_eq(kind, "use") {
+            // skip — module imports not checked yet
+
+        } else if str_eq(kind, "endpoint") {
+            // skip — endpoint is a configuration, not a symbol
+
+        }
+
+        p1pos = sexp_skip(ast, p1pos)
+    }
+
+    // ── Pass 2: Check function/agent bodies ─────────────
+    // Walk each fn and agent method to check:
+    //   - Variable resolution (let bindings + params in scope)
+    //   - Function call arity
+    //   - ask() without llm capability (checked via agent info)
+    //
+    // We use a "work stack" — Vec of S-expression substrings to visit.
+    // Each entry is "scope_depth\tcontext_agent\tsexp_string"
+    // where context_agent is "" for top-level fns or the agent name for methods.
+
+    let work = vec_new()
+
+    // Enqueue all top-level fn bodies and agent method bodies
+    let p2pos = sexp_skip_ws(ast, 0)
+    if p2pos < ast_len {
+        if char_code(char_at(ast, p2pos)) == 40 {
+            p2pos = p2pos + 1
+        }
+    }
+    let p2a = sexp_read_atom(ast, p2pos)
+    p2pos = upos(p2a)
+
+    for _p2 in 0..5000 {
+        p2pos = sexp_skip_ws(ast, p2pos)
+        if p2pos >= ast_len { break }
+        if char_code(char_at(ast, p2pos)) == 41 { break }
+
+        let kind = sexp_kind(ast, p2pos)
+
+        if str_eq(kind, "fn") {
+            let node_end = sexp_skip(ast, p2pos)
+            let node_str = str_slice(ast, p2pos, node_end)
+            vec_push(work, "1\t\t" + node_str)
+        } else if str_eq(kind, "agent") {
+            // Find agent name and enqueue its methods
+            let aname_r = sexp_nth_child(ast, p2pos, 1)
+            let aname = uast(aname_r)
+            // Scan children for fn nodes
+            let ap = sexp_skip_ws(ast, p2pos)
+            if ap < ast_len {
+                if char_code(char_at(ast, ap)) == 40 {
+                    ap = ap + 1
+                }
+            }
+            let aa = sexp_read_atom(ast, ap)
+            ap = upos(aa)
+            // skip agent name
+            ap = sexp_skip(ast, ap)
+
+            for _am in 0..500 {
+                ap = sexp_skip_ws(ast, ap)
+                if ap >= ast_len { break }
+                if char_code(char_at(ast, ap)) == 41 { break }
+                let mkind = sexp_kind(ast, ap)
+                if str_eq(mkind, "fn") {
+                    let me = sexp_skip(ast, ap)
+                    let mstr = str_slice(ast, ap, me)
+                    vec_push(work, "1\t" + aname + "\t" + mstr)
+                }
+                ap = sexp_skip(ast, ap)
+            }
+        }
+
+        p2pos = sexp_skip(ast, p2pos)
+    }
+
+    // Process the work stack
+    // For each fn node, we:
+    //   1. Add params to a local symbol list
+    //   2. Walk the block checking let bindings, ident resolution, call arity
+    //
+    // Since we need to track local scopes, we encode local symbols as a
+    // flat string: "name\ttype\tarity\n..." that we can search linearly.
+
+    for _wi in 0..vec_len(work) {
+        let work_item = vec_get(work, _wi)
+        // Parse work item: "scope\tagent\tsexp"
+        let wi_tab1 = str_find(work_item, "\t")
+        let wi_rest = str_slice(work_item, wi_tab1 + 1, str_len(work_item))
+        let wi_tab2 = str_find(wi_rest, "\t")
+        let ctx_agent = str_slice(wi_rest, 0, wi_tab2)
+        let fn_sexp = str_slice(wi_rest, wi_tab2 + 1, str_len(wi_rest))
+
+        // Extract fn name and params
+        let fn_name_r = sexp_nth_child(fn_sexp, 0, 1)
+        let fn_name = uast(fn_name_r)
+        let fn_params_r = sexp_nth_child(fn_sexp, 0, 2)
+        let fn_params = uast(fn_params_r)
+
+        // Build local symbol string with params
+        let local_sb = sb_new()
+        // Parse params: (params (name :type) (name :type) ...)
+        let pp = sexp_skip_ws(fn_params, 0)
+        if pp < str_len(fn_params) {
+            if char_code(char_at(fn_params, pp)) == 40 {
+                pp = pp + 1
+            }
+        }
+        let pa = sexp_read_atom(fn_params, pp)
+        pp = upos(pa)
+
+        for _pp in 0..50 {
+            pp = sexp_skip_ws(fn_params, pp)
+            if pp >= str_len(fn_params) { break }
+            if char_code(char_at(fn_params, pp)) == 41 { break }
+            // Each param is (name [:type])
+            let param_r = sexp_nth_child(fn_params, pp, 0)
+            let pname_full = uast(param_r)
+            // The param name might have ":type" suffix — extract just the name
+            let pname: string = pname_full
+            let colon_pos = str_find(pname_full, " :")
+            if colon_pos >= 0 {
+                pname = str_slice(pname_full, 0, colon_pos)
+            }
+            // But for a param node like "(x :int)", nth_child(0,0) is "x"
+            // which won't have the colon. Let's use sexp_nth_child properly.
+            let param_node_end = sexp_skip(fn_params, pp)
+            let param_node = str_slice(fn_params, pp, param_node_end)
+            let pn_r = sexp_nth_child(param_node, 0, 0)
+            pname = uast(pn_r)
+
+            sb_append(local_sb, pname)
+            sb_append(local_sb, "\tparam\t-1\n")
+            pp = sexp_skip(fn_params, pp)
+        }
+        let locals = sb_to_string(local_sb)
+
+        // Find the body block — it's the last child (or near-last if ->type exists)
+        // We need to find the (block ...) child
+        let fn_sexp_len = str_len(fn_sexp)
+        let body_str = ""
+        // Search for "(block" in the fn S-expression
+        let block_pos = str_find(fn_sexp, "(block")
+        if block_pos >= 0 {
+            let block_end = sexp_skip(fn_sexp, block_pos)
+            body_str = str_slice(fn_sexp, block_pos, block_end)
+        }
+
+        if str_len(body_str) > 0 {
+            // Walk the body looking for statements
+            // We'll do a recursive-ish scan using a local work list (encoded as string)
+            // Actually, let's do a linear scan through the body string
+            // looking for specific patterns.
+
+            // Scan for (let name ...) to add to locals
+            // Scan for (ident name) to check resolution
+            // Scan for (call name ...) to check arity
+            // Scan for (ask ...) to check llm capability
+
+            // We'll iterate through the body character by character,
+            // looking for "(" followed by a keyword.
+
+            let bp = 0
+            let body_len = str_len(body_str)
+            let local_lets_sb = sb_new()
+            sb_append(local_lets_sb, locals)
+
+            for _bs in 0..100000 {
+                if bp >= body_len { break }
+                let bc = char_code(char_at(body_str, bp))
+
+                if bc == 40 {
+                    // opening paren — check what follows
+                    let nkind = sexp_kind(body_str, bp)
+
+                    if str_eq(nkind, "let") {
+                        // (let name [...] expr)
+                        let let_name_r = sexp_nth_child(body_str, bp, 1)
+                        let let_name = uast(let_name_r)
+                        // Strip type annotation if present (":type" after name)
+                        let lcolon = str_find(let_name, ":")
+                        if lcolon >= 0 {
+                            let_name = str_slice(let_name, 0, lcolon)
+                        }
+
+                        // Check for duplicate let in same local scope
+                        let cur_locals = sb_peek(local_lets_sb)
+                        let dup_search = let_name + "\t"
+                        if str_find(cur_locals, dup_search) >= 0 {
+                            // Might be a redefinition — but Limceron allows shadowing
+                            // Only warn, don't error
+                            // (skip for bootstrap — shadowing is fine)
+                            let dummy = 0
+                        }
+
+                        sb_append(local_lets_sb, let_name)
+                        sb_append(local_lets_sb, "\tlet\t-1\n")
+                        bp = bp + 1
+
+                    } else if str_eq(nkind, "call") {
+                        // (call name arg1 arg2 ...)
+                        let call_name_r = sexp_nth_child(body_str, bp, 1)
+                        let call_name = uast(call_name_r)
+
+                        // Count arguments (children after name)
+                        let call_end = sexp_skip(body_str, bp)
+                        let call_str = str_slice(body_str, bp, call_end)
+                        // Count children: kind(call), name, arg1, arg2, ...
+                        let cs_p = sexp_skip_ws(call_str, 0)
+                        if cs_p < str_len(call_str) {
+                            if char_code(char_at(call_str, cs_p)) == 40 {
+                                cs_p = cs_p + 1
+                            }
+                        }
+                        let cs_a = sexp_read_atom(call_str, cs_p)
+                        cs_p = upos(cs_a)
+                        // skip name
+                        cs_p = sexp_skip(call_str, cs_p)
+                        let arg_count = sexp_count_children(call_str, cs_p)
+
+                        if is_builtin(call_name) {
+                            // Builtins — skip arity check (variadic)
+                            let dummy = 0
+                        } else {
+                            // Look up in symbol table
+                            let found = false
+                            let expected_arity = -1
+                            for _sl in 0..vec_len(sym_names) {
+                                if str_eq(vec_get(sym_names, _sl), call_name) {
+                                    found = true
+                                    expected_arity = to_int(vec_get(sym_arities, _sl))
+                                }
+                            }
+                            if found {
+                                if expected_arity >= 0 {
+                                    if arg_count != expected_arity {
+                                        vec_push(errors, "error: function '" + call_name + "' expects " + to_string(expected_arity) + " argument(s), got " + to_string(arg_count) + " (in " + fn_name + ")")
+                                        error_count = error_count + 1
+                                    }
+                                }
+                            } else {
+                                // Check locals (might be a variable used as fn)
+                                let cur_locals = sb_peek(local_lets_sb)
+                                let local_search = call_name + "\t"
+                                if str_find(cur_locals, local_search) < 0 {
+                                    vec_push(errors, "error: undefined function '" + call_name + "' (in " + fn_name + ")")
+                                    error_count = error_count + 1
+                                }
+                            }
+                        }
+                        bp = bp + 1
+
+                    } else if str_eq(nkind, "ident") {
+                        // (ident name) — check resolution
+                        let id_name_r = sexp_nth_child(body_str, bp, 1)
+                        let id_name = uast(id_name_r)
+
+                        // Check: is it a local? param? global symbol? builtin? keyword-like?
+                        let resolved = false
+                        // Check locals
+                        let cur_locals = sb_peek(local_lets_sb)
+                        let id_search = id_name + "\t"
+                        if str_find(cur_locals, id_search) >= 0 {
+                            resolved = true
+                        }
+                        // Check global symbols
+                        if resolved == false {
+                            for _gs in 0..vec_len(sym_names) {
+                                if str_eq(vec_get(sym_names, _gs), id_name) {
+                                    resolved = true
+                                }
+                            }
+                        }
+                        // Check builtins
+                        if resolved == false {
+                            if is_builtin(id_name) {
+                                resolved = true
+                            }
+                        }
+                        // Special names that are always valid
+                        if resolved == false {
+                            if str_eq(id_name, "true") { resolved = true
+                            } else if str_eq(id_name, "false") { resolved = true
+                            } else if str_eq(id_name, "none") { resolved = true
+                            } else if str_eq(id_name, "Result") { resolved = true
+                            } else if str_eq(id_name, "Ok") { resolved = true
+                            } else if str_eq(id_name, "Err") { resolved = true
+                            } else if str_eq(id_name, "self") { resolved = true
+                            }
+                        }
+                        // For agent methods, the agent name itself is valid
+                        if resolved == false {
+                            if str_len(ctx_agent) > 0 {
+                                if str_eq(id_name, ctx_agent) {
+                                    resolved = true
+                                }
+                            }
+                        }
+
+                        if resolved == false {
+                            vec_push(warnings, "warning: possibly undefined variable '" + id_name + "' (in " + fn_name + ")")
+                            warn_count = warn_count + 1
+                        }
+                        bp = bp + 1
+
+                    } else if str_eq(nkind, "ask") {
+                        // ask() found — check if we're inside an agent with llm capability
+                        if str_len(ctx_agent) > 0 {
+                            // Find agent in ag_names
+                            let ag_idx = -1
+                            for _ai in 0..vec_len(ag_names) {
+                                if str_eq(vec_get(ag_names, _ai), ctx_agent) {
+                                    ag_idx = _ai
+                                }
+                            }
+                            if ag_idx >= 0 {
+                                if str_eq(vec_get(ag_has_llm, ag_idx), "0") {
+                                    vec_push(errors, "error: agent '" + ctx_agent + "' uses ask() but lacks llm.* capability")
+                                    error_count = error_count + 1
+                                }
+                            }
+                        }
+                        bp = bp + 1
+
+                    } else if str_eq(nkind, "for") {
+                        // (for varname ...) — register loop variable
+                        let for_var_r = sexp_nth_child(body_str, bp, 1)
+                        let for_var = uast(for_var_r)
+                        sb_append(local_lets_sb, for_var)
+                        sb_append(local_lets_sb, "\tlet\t-1\n")
+                        bp = bp + 1
+
+                    } else if str_eq(nkind, "string") {
+                        // (string "...") — skip entire node to avoid
+                        // scanning string literal content as real code
+                        bp = sexp_skip(body_str, bp)
+
+                    } else {
+                        bp = bp + 1
+                    }
+                } else {
+                    bp = bp + 1
+                }
+            }
+        }
+    }
+
+    // ── Pass 3: Agent-level semantic checks ─────────────
+    for _ac in 0..vec_len(ag_names) {
+        let aname = vec_get(ag_names, _ac)
+
+        // Check: agent uses ask() but has no llm capability
+        // (Already checked in Pass 2 per-call, but double-check at agent level)
+
+        // Check: agent uses tool calls but has no budget
+        if str_eq(vec_get(ag_uses_tool, _ac), "1") {
+            if str_eq(vec_get(ag_has_budget, _ac), "0") {
+                vec_push(warnings, "warning: agent '" + aname + "' calls tools but has no budget declaration")
+                warn_count = warn_count + 1
+            }
+        }
+
+        // Check: agent uses ask() but has no budget
+        if str_eq(vec_get(ag_uses_ask, _ac), "1") {
+            if str_eq(vec_get(ag_has_budget, _ac), "0") {
+                vec_push(warnings, "warning: agent '" + aname + "' uses ask() but has no budget declaration")
+                warn_count = warn_count + 1
+            }
+        }
+    }
+
+    // ── Pass 4: Taint flow analysis (lightweight) ───────
+    // Scan the AST for patterns where tainted data flows into ask()
+    // without going through a guard/sanitizer.
+    // This is a very simplified check — look for agents whose methods
+    // pass parameters directly to ask() without a guard call.
+    for _ti in 0..vec_len(work) {
+        let work_item = vec_get(work, _ti)
+        let wi_tab1 = str_find(work_item, "\t")
+        let wi_rest = str_slice(work_item, wi_tab1 + 1, str_len(work_item))
+        let wi_tab2 = str_find(wi_rest, "\t")
+        let ctx_agent = str_slice(wi_rest, 0, wi_tab2)
+        let fn_sexp = str_slice(wi_rest, wi_tab2 + 1, str_len(wi_rest))
+
+        // Only check agent methods
+        if str_len(ctx_agent) > 0 {
+            // Look for (ask (ident param_name)) where param_name is a fn parameter
+            // and there's no guard call in between
+            let fn_params_r = sexp_nth_child(fn_sexp, 0, 2)
+            let fn_params = uast(fn_params_r)
+
+            // Collect param names
+            let param_names_sb = sb_new()
+            let pp = sexp_skip_ws(fn_params, 0)
+            if pp < str_len(fn_params) {
+                if char_code(char_at(fn_params, pp)) == 40 {
+                    pp = pp + 1
+                }
+            }
+            let pa = sexp_read_atom(fn_params, pp)
+            pp = upos(pa)
+            for _pp in 0..50 {
+                pp = sexp_skip_ws(fn_params, pp)
+                if pp >= str_len(fn_params) { break }
+                if char_code(char_at(fn_params, pp)) == 41 { break }
+                let param_node_end = sexp_skip(fn_params, pp)
+                let param_node = str_slice(fn_params, pp, param_node_end)
+                let pn_r = sexp_nth_child(param_node, 0, 0)
+                let pname = uast(pn_r)
+                sb_append(param_names_sb, pname)
+                sb_append(param_names_sb, "|")
+                pp = sexp_skip(fn_params, pp)
+            }
+            let param_names = sb_to_string(param_names_sb)
+
+            // Check if any ask() call uses a parameter directly
+            let has_guard_call = false
+            if str_find(fn_sexp, "(call sanitize") >= 0 {
+                has_guard_call = true
+            }
+            if str_find(fn_sexp, "(call validate") >= 0 {
+                has_guard_call = true
+            }
+            if str_find(fn_sexp, "(call guard") >= 0 {
+                has_guard_call = true
+            }
+            // Also check for guard names in the symbol table
+            for _gs in 0..vec_len(sym_names) {
+                if str_eq(vec_get(sym_types, _gs), "guard") {
+                    let gname = vec_get(sym_names, _gs)
+                    if str_find(fn_sexp, "(call " + gname) >= 0 {
+                        has_guard_call = true
+                    }
+                }
+            }
+
+            if has_guard_call == false {
+                // If ask() is called with an ident that matches a param, warn
+                if str_find(fn_sexp, "(ask (ident ") >= 0 {
+                    let fn_name_r = sexp_nth_child(fn_sexp, 0, 1)
+                    let fn_name = uast(fn_name_r)
+                    vec_push(warnings, "warning: agent '" + ctx_agent + "." + fn_name + "' passes input directly to ask() without sanitization")
+                    warn_count = warn_count + 1
+                }
+            }
+        }
+    }
+
+    // ── Output ──────────────────────────────────────────
+    println("=== Limceron Type Checker (self-hosted) ===")
+    println("File: " + file_path)
+    println("Symbols: " + to_string(vec_len(sym_names)))
+    println("Agents: " + to_string(vec_len(ag_names)))
+    println("--------------------------------------------")
+
+    // Print errors
+    for _ei in 0..vec_len(errors) {
+        println(vec_get(errors, _ei))
+    }
+
+    // Print warnings
+    for _wi in 0..vec_len(warnings) {
+        println(vec_get(warnings, _wi))
+    }
+
+    println("--------------------------------------------")
+    if error_count > 0 {
+        println("ERRORS: " + to_string(error_count))
+    } else if warn_count > 0 {
+        println("OK (with " + to_string(warn_count) + " warning(s))")
+    } else {
+        println("OK")
+    }
+}
