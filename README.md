@@ -228,7 +228,9 @@ Every feature exists to prevent something you fear.
 
 Limceron compiles itself. The Stage 1 self-hosted compiler is **8,755+ lines of Limceron** -- lexer, parser, type checker, and code generator.
 
-The bootstrap chain is verified to a **fixed point**: Stage 0 (C99) compiles Stage 1 (Limceron). Stage 1 compiles itself, producing Stage 2. Stage 2 compiles itself, producing Stage 3. **Stages 2 and 3 produce identical output.** The compiler is stable.
+The bootstrap chain is verified to a **fixed point**: Stage 0 (C99) compiles Stage 1 (Limceron). Stage 1 compiles itself, producing Stage 2. Stage 2 compiles itself, producing Stage 3. **Stages 2 and 3 produce identical output.** 
+
+**Rocks on!**
 
 ```
 Stage 0 (C99) --compiles--> Stage 1 (Limceron)
@@ -275,27 +277,27 @@ make stage0                 # requires only a C99 compiler (gcc or clang)
 Run an example:
 
 ```bash
-./build/limceron-stage0 run examples/language/01_hello_agent.lceron
+limceron run examples/language/01_hello_agent.lceron
 ```
 
 Build a standalone binary:
 
 ```bash
-./build/limceron-stage0 build examples/language/01_hello_agent.lceron -o my-agent
+limceron build examples/language/01_hello_agent.lceron -o my-agent
 ./my-agent
 ```
 
 Scaffold a new project:
 
 ```bash
-./build/limceron-stage0 init my-agent
+limceron init my-agent
 # Creates my-agent/main.lceron + my-agent/main.lceron.md
 ```
 
 Audit an agent before deploying it:
 
 ```bash
-./build/limceron-stage0 audit examples/language/20_medical_categorizer.lceron
+limceron audit examples/language/20_medical_categorizer.lceron
 # Agents: 1 | LLM calls: 1 | Guards: 1 | Entropy score: 1.50 (review recommended)
 ```
 

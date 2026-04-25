@@ -4,7 +4,7 @@
 // and demonstrates Limceron's agent features working together.
 //
 // Run:
-//   ./build/limceron-stage0 build examples/language/26_showcase_llm_live.lceron -o showcase
+//   limceron build examples/language/26_showcase_llm_live.lceron -o showcase
 //   ./showcase
 
 // ── Capabilities: the agent can ONLY call the LLM ───────────
