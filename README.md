@@ -204,56 +204,6 @@ When any condition is violated, `ask()` returns `Error("entropy budget exceeded:
 
 Other frameworks let you deploy a degrading model and hope someone notices. Limceron agents stop themselves.
 
-## Real Exit Case: Patana Medical Categorizer
-
-This is not a demo. This ran against production data.
-
-A Limceron agent categorized **thousands of radiology return records** from medical centers using a fine-tuned BERT model (Patana, 110M params). Results: **93.8% F1 score**, **~10ms per inference**, no GPU required.
-
-```limceron
-use driver("mysql") as db
-use model("bert-model.onnx") as bert
-
-capability filesystem {
-    allow path "/tmp/**" { mode: [read, write] }
-    allow path "/opt/models/**" { mode: [read] }
-    deny path "/etc/**"
-    default: deny
-}
-
-taint user_input
-
-fn main() -> Result {
-    let conn = db.connect(env("DB_HOST"), env("DB_USER"), env("DB_PASS"), env("DB_NAME"), 3306)
-    let rows = db.query(conn, "SELECT id, Comment FROM staging WHERE Category IS NULL LIMIT 500")
-
-    for i in 0..db.row_count(rows) {
-        let comment = db.get(rows, i, "Comment")
-        let prediction = bert.predict(comment)
-
-        if prediction.confidence >= 85 {
-            let safe_cat = sql_escape(prediction.label)
-            db.execute(conn, "UPDATE staging SET Category = '" + safe_cat + "' WHERE id = " + id)
-        }
-    }
-
-    db.free(rows)
-    db.close(conn)
-}
-```
-
-| Metric | LLM (Qwen3-8B) | Fine-tuned BERT |
-|---|---|---|
-| Accuracy vs human | 82.6% | **93.1%** |
-| Auto-commit accuracy (>95% conf) | N/A | **98.8%** |
-| Speed per record | 200ms (GPU) | **10ms (CPU)** |
-| Model size | 16 GB | **440 MB** |
-| Monthly cost | ~$730 (GPU 24/7) | **~$36 (CPU)** |
-
-The ONNX path gives you the most precise confidence scores: a softmax distribution over every possible category, not just the first token's logprobs. When BERT says 96% confidence, it means 96% of the probability mass is on one category.
-
-Full source: `examples/language/25_exit_case_patana.lceron`
-
 ## What's Inside
 
 Every feature exists to prevent something you fear.

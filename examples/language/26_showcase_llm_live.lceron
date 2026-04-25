@@ -1,0 +1,119 @@
+// 26 — Showcase: Live LLM Agent with Guardrails
+//
+// Connects to a REAL LLM (Qwen3-14B via vLLM on localhost:8000)
+// and demonstrates Limceron's agent features working together.
+//
+// Run:
+//   ./build/limceron-stage0 build examples/language/26_showcase_llm_live.lceron -o showcase
+//   ./showcase
+
+// ── Capabilities: the agent can ONLY call the LLM ───────────
+
+capability llm {
+    analyze
+}
+
+capability network {
+    allow endpoint "localhost:8000" {
+        method: [POST]
+        path: "/v1/chat/completions"
+    }
+    default: deny
+}
+
+// ── Taint: user input is marked ─────────────────────────────
+
+taint user_input
+
+// ── Guard: verbose output via env ────────────────────────────
+
+guard verbose_mode() {
+    let active = str_eq(env("VERBOSE"), "true")
+}
+
+// ── The Agent ────────────────────────────────────────────────
+
+agent Analyst {
+    capabilities: [llm.analyze]
+    use network
+    model: "Qwen/Qwen3-14B-AWQ"
+    endpoint: "http://localhost:8000"
+    budget: { max_tokens: 50000, max_cost: 0.10, max_duration: 300 }
+    entropy_budget: {
+        max_avg_entropy: 0.8
+        max_low_confidence: 0.30
+        max_drift: 0.20
+    }
+    guards: [verbose_mode]
+    prompt: `You are a text classifier. For each input, respond with EXACTLY this format:
+CATEGORY: <one of: POSITIVE, NEGATIVE, NEUTRAL, QUESTION, REQUEST, BUG_REPORT>
+SUMMARY: <one sentence>
+
+Nothing else. No explanation.`
+
+    fn analyze(text: string) -> Result {
+        let result = ask(text)
+        let response = "ERROR"
+        match result {
+            Ok(text) -> {
+                response = str_trim(text)
+            }
+            Error(msg) -> {
+                log_error("LLM: " + msg)
+                response = "ERROR: " + msg
+            }
+            _ -> {
+                response = "UNEXPECTED"
+            }
+        }
+        response
+    }
+}
+
+// ── Test Data ────────────────────────────────────────────────
+
+fn get_item(index: int) -> string {
+    if index == 0 { return "Your product saved us 200 hours last month. The team loves it." }
+    if index == 1 { return "The API keeps returning 500 errors when batch size exceeds 100." }
+    if index == 2 { return "Can you add support for PostgreSQL? We're migrating from MySQL." }
+    if index == 3 { return "I'm not sure if this is the right tool for our use case." }
+    if index == 4 { return "Cancel my subscription immediately. Worst experience ever." }
+    if index == 5 { return "How do I configure the webhook endpoint for real-time events?" }
+    if index == 6 { return "Great documentation! The getting-started guide was clear." }
+    if index == 7 { return "Memory leak in the dashboard after 48 hours of continuous use." }
+    if index == 8 { return "Would it be possible to get an on-premise deployment option?" }
+    if index == 9 { return "The new update broke our integration. Rolling back to v2.3." }
+    return "done"
+}
+
+// ── Entry ────────────────────────────────────────────────────
+
+fn main() -> Result {
+    println("=== Limceron Showcase: Live LLM ===")
+    println("")
+    println("Features:")
+    println("  capability   — restricted to localhost:8000 only")
+    println("  budget       — max 50K tokens, $0.10, 5 min")
+    println("  entropy      — stops if >30% uncertain")
+    println("  taint        — user input marked")
+    println("")
+
+    let agent = Analyst
+    let total = 10
+    let processed = 0
+
+    for i in 0..total {
+        let text = get_item(i)
+
+        println("[" + to_string(i + 1) + "/" + to_string(total) + "] " + text)
+
+        let response = unwrap(agent.analyze(text))
+
+        println("  => " + response)
+        println("")
+
+        processed = processed + 1
+    }
+
+    println("=== Done: " + to_string(processed) + " analyzed ===")
+}
