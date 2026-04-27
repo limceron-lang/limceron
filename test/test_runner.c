@@ -6661,6 +6661,613 @@ TEST(codegen_progress_file) {
     free(c);
 }
 
+/* ============================================================
+ * MARKDOWN PARSER TESTS
+ * ============================================================ */
+
+/* Helper: parse a Markdown string through parse_lceron_md, return reporter */
+static AstNode *parse_md_source_reporter(const char *source, ErrorReporter *out_reporter) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+
+    size_t len = strlen(source);
+    *out_reporter = reporter_new("<test.lceron.md>", source, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+
+    return parse_lceron_md("<test.lceron.md>", source, len,
+                           &test_arena, &intern, out_reporter);
+}
+
+/* Helper: parse markdown source, return had_error flag */
+static AstNode *parse_md_source(const char *source, bool *had_error) {
+    ErrorReporter reporter;
+    AstNode *result = parse_md_source_reporter(source, &reporter);
+    *had_error = has_errors(&reporter);
+    return result;
+}
+
+/* Find a guard node by name in the agent's members (guards field -> block -> list) */
+static AstNode *find_guard_in_ast(AstNode *program, const char *guard_name) {
+    if (!program || program->kind != AST_PROGRAM) return NULL;
+    AstNode *agent = program->params;
+    if (!agent || agent->kind != AST_AGENT) return NULL;
+
+    /* Walk members looking for guards field */
+    AstNode *member = agent->params;
+    while (member) {
+        if (member->kind == AST_FIELD && member->name &&
+            strcmp(member->name, "guards") == 0 && member->right) {
+            /* member->right is AST_BLOCK with guards as params */
+            AstNode *guard = member->right->params;
+            while (guard) {
+                if (guard->kind == AST_GUARD && guard->name &&
+                    strcmp(guard->name, guard_name) == 0) {
+                    return guard;
+                }
+                guard = guard->next;
+            }
+        }
+        member = member->next;
+    }
+    return NULL;
+}
+
+/* Phase 1: Core Safety Tests */
+
+TEST(md_parse_capability_declaration) {
+    bool had_error = false;
+    AstNode *prog = parse_md_source(
+        "# agent TestBot\n"
+        "\n"
+        "## capability llm\n"
+        "- complete\n"
+        "- classify requires complete\n"
+        "- embed\n",
+        &had_error);
+    ASSERT_NOT_NULL(prog);
+    ASSERT_FALSE(had_error);
+    ASSERT_EQ(prog->kind, AST_PROGRAM);
+
+    /* Agent should be in program->params */
+    AstNode *agent = prog->params;
+    ASSERT_NOT_NULL(agent);
+    ASSERT_EQ(agent->kind, AST_AGENT);
+    ASSERT_STR_EQ(agent->name, "TestBot");
+
+    /* The capability decl should be in agent->params */
+    AstNode *cap = agent->params;
+    ASSERT_NOT_NULL(cap);
+    ASSERT_EQ(cap->kind, AST_CAPABILITY);
+    ASSERT_STR_EQ(cap->name, "llm");
+
+    /* Should have 3 items */
+    AstNode *item1 = cap->params;
+    ASSERT_NOT_NULL(item1);
+    ASSERT_EQ(item1->kind, AST_CAPABILITY_ITEM);
+    ASSERT_STR_EQ(item1->name, "complete");
+    ASSERT_NULL(item1->params); /* no requires */
+
+    AstNode *item2 = item1->next;
+    ASSERT_NOT_NULL(item2);
+    ASSERT_EQ(item2->kind, AST_CAPABILITY_ITEM);
+    ASSERT_STR_EQ(item2->name, "classify");
+    ASSERT_NOT_NULL(item2->params); /* has requires */
+    ASSERT_EQ(item2->params->kind, AST_IDENT);
+    ASSERT_STR_EQ(item2->params->name, "complete");
+
+    AstNode *item3 = item2->next;
+    ASSERT_NOT_NULL(item3);
+    ASSERT_EQ(item3->kind, AST_CAPABILITY_ITEM);
+    ASSERT_STR_EQ(item3->name, "embed");
+    ASSERT_NULL(item3->next); /* no more items */
+}
+
+TEST(md_parse_capability_with_access_rules) {
+    bool had_error = false;
+    AstNode *prog = parse_md_source(
+        "# agent NetBot\n"
+        "\n"
+        "## capability network\n"
+        "allow endpoint \"api.example.com:443\"\n"
+        "deny private_ranges\n"
+        "default: deny\n",
+        &had_error);
+    ASSERT_NOT_NULL(prog);
+    ASSERT_FALSE(had_error);
+
+    AstNode *agent = prog->params;
+    ASSERT_NOT_NULL(agent);
+    AstNode *cap = agent->params;
+    ASSERT_NOT_NULL(cap);
+    ASSERT_EQ(cap->kind, AST_CAPABILITY);
+    ASSERT_STR_EQ(cap->name, "network");
+
+    /* First rule: allow endpoint */
+    AstNode *r1 = cap->params;
+    ASSERT_NOT_NULL(r1);
+    ASSERT_EQ(r1->kind, AST_CAP_ENDPOINT_RULE);
+    ASSERT_TRUE(r1->is_mut); /* allow */
+    ASSERT_STR_EQ(r1->name, "api.example.com:443");
+
+    /* Second rule: deny private_ranges */
+    AstNode *r2 = r1->next;
+    ASSERT_NOT_NULL(r2);
+    ASSERT_EQ(r2->kind, AST_CAP_DENY_RANGE);
+    ASSERT_FALSE(r2->is_mut); /* deny */
+
+    /* Third rule: default deny */
+    AstNode *r3 = r2->next;
+    ASSERT_NOT_NULL(r3);
+    ASSERT_EQ(r3->kind, AST_CAP_DEFAULT);
+    ASSERT_FALSE(r3->is_mut); /* default: deny */
+}
+
+TEST(md_parse_taint) {
+    bool had_error = false;
+    AstNode *prog = parse_md_source(
+        "# agent SafeBot\n"
+        "\n"
+        "## taint\n"
+        "- user_input\n"
+        "- llm_output\n"
+        "- sanitized\n",
+        &had_error);
+    ASSERT_NOT_NULL(prog);
+    ASSERT_FALSE(had_error);
+
+    AstNode *agent = prog->params;
+    ASSERT_NOT_NULL(agent);
+    ASSERT_EQ(agent->kind, AST_AGENT);
+    ASSERT_STR_EQ(agent->name, "SafeBot");
+
+    /* Taints should be in agent->params as AST_TAINT nodes */
+    AstNode *t1 = agent->params;
+    ASSERT_NOT_NULL(t1);
+    ASSERT_EQ(t1->kind, AST_TAINT);
+    ASSERT_STR_EQ(t1->name, "user_input");
+
+    AstNode *t2 = t1->next;
+    ASSERT_NOT_NULL(t2);
+    ASSERT_EQ(t2->kind, AST_TAINT);
+    ASSERT_STR_EQ(t2->name, "llm_output");
+
+    AstNode *t3 = t2->next;
+    ASSERT_NOT_NULL(t3);
+    ASSERT_EQ(t3->kind, AST_TAINT);
+    ASSERT_STR_EQ(t3->name, "sanitized");
+
+    ASSERT_NULL(t3->next); /* no more items */
+}
+
+TEST(md_parse_access_control) {
+    bool had_error = false;
+    AstNode *prog = parse_md_source(
+        "# agent SecBot\n"
+        "\n"
+        "## access_control\n"
+        "### network\n"
+        "allow endpoint \"api.example.com:443\"\n"
+        "deny private_ranges\n"
+        "default: deny\n"
+        "### filesystem\n"
+        "allow path \"/tmp/**\"\n"
+        "deny path \"/etc/**\"\n"
+        "default: deny\n"
+        "### shell\n"
+        "allow binary \"/usr/bin/git\"\n"
+        "deny binary \"/bin/rm\"\n"
+        "default: deny\n",
+        &had_error);
+    ASSERT_NOT_NULL(prog);
+    ASSERT_FALSE(had_error);
+
+    AstNode *agent = prog->params;
+    ASSERT_NOT_NULL(agent);
+
+    /* Find the access_control field */
+    AstNode *ac_field = agent->params;
+    ASSERT_NOT_NULL(ac_field);
+    ASSERT_EQ(ac_field->kind, AST_FIELD);
+    ASSERT_STR_EQ(ac_field->name, "access_control");
+
+    /* Block should contain all rules */
+    AstNode *block = ac_field->right;
+    ASSERT_NOT_NULL(block);
+    ASSERT_EQ(block->kind, AST_BLOCK);
+
+    /* Count all rules: 3 (network) + 3 (filesystem) + 3 (shell) = 9 */
+    AstNode *rule = block->params;
+    int count = 0;
+    while (rule) {
+        count++;
+        rule = rule->next;
+    }
+    ASSERT_EQ(count, 9);
+
+    /* Verify first rule: allow endpoint */
+    rule = block->params;
+    ASSERT_EQ(rule->kind, AST_CAP_ENDPOINT_RULE);
+    ASSERT_TRUE(rule->is_mut);
+    ASSERT_STR_EQ(rule->name, "api.example.com:443");
+
+    /* Verify second rule: deny private_ranges */
+    rule = rule->next;
+    ASSERT_EQ(rule->kind, AST_CAP_DENY_RANGE);
+    ASSERT_FALSE(rule->is_mut);
+
+    /* Verify third rule: default deny */
+    rule = rule->next;
+    ASSERT_EQ(rule->kind, AST_CAP_DEFAULT);
+    ASSERT_FALSE(rule->is_mut);
+
+    /* Verify fourth rule: allow path /tmp/glob */
+    rule = rule->next;
+    ASSERT_EQ(rule->kind, AST_CAP_PATH_RULE);
+    ASSERT_TRUE(rule->is_mut);
+    ASSERT_STR_EQ(rule->name, "/tmp/**");
+
+    /* Verify fifth rule: deny path /etc/glob */
+    rule = rule->next;
+    ASSERT_EQ(rule->kind, AST_CAP_PATH_RULE);
+    ASSERT_FALSE(rule->is_mut);
+    ASSERT_STR_EQ(rule->name, "/etc/**");
+}
+
+TEST(md_parse_combined_safety) {
+    /* Test that capability, taint, and access_control can coexist */
+    bool had_error = false;
+    AstNode *prog = parse_md_source(
+        "# agent FullBot\n"
+        "> You are a safe agent.\n"
+        "\n"
+        "## capability llm\n"
+        "- complete\n"
+        "- embed\n"
+        "\n"
+        "## taint\n"
+        "- user_input\n"
+        "- sanitized\n"
+        "\n"
+        "## model\n"
+        "claude-haiku\n",
+        &had_error);
+    ASSERT_NOT_NULL(prog);
+    ASSERT_FALSE(had_error);
+
+    AstNode *agent = prog->params;
+    ASSERT_NOT_NULL(agent);
+    ASSERT_STR_EQ(agent->name, "FullBot");
+
+    /* Walk members: prompt, capability, taint, taint, model */
+    AstNode *m = agent->params;
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(m->kind, AST_FIELD);
+    ASSERT_STR_EQ(m->name, "prompt");
+
+    m = m->next;
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(m->kind, AST_CAPABILITY);
+    ASSERT_STR_EQ(m->name, "llm");
+
+    /* Two taint nodes */
+    m = m->next;
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(m->kind, AST_TAINT);
+    ASSERT_STR_EQ(m->name, "user_input");
+
+    m = m->next;
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(m->kind, AST_TAINT);
+    ASSERT_STR_EQ(m->name, "sanitized");
+
+    /* Model field */
+    m = m->next;
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(m->kind, AST_FIELD);
+    ASSERT_STR_EQ(m->name, "model");
+}
+
+/* Phase 2: K8s + Runtime Tests */
+
+TEST(md_parse_health) {
+    bool err;
+    AstNode *prog = parse_md_source(
+        "# agent TestAgent\n"
+        "> A test agent.\n"
+        "\n"
+        "## health\n"
+        "- ready: true\n"
+        "- live: true\n"
+        "- port: 9090\n",
+        &err
+    );
+    ASSERT_FALSE(err);
+    ASSERT_NOT_NULL(prog);
+    ASSERT_EQ(prog->kind, AST_PROGRAM);
+
+    /* Agent is the first child */
+    AstNode *agent = prog->params;
+    ASSERT_NOT_NULL(agent);
+    ASSERT_EQ(agent->kind, AST_AGENT);
+    ASSERT_STR_EQ(agent->name, "TestAgent");
+
+    /* Health node is a top-level sibling of the agent */
+    AstNode *h = agent->next;
+    ASSERT_NOT_NULL(h);
+    ASSERT_EQ(h->kind, AST_HEALTH);
+
+    /* Port stored in val.int_val */
+    ASSERT_EQ(h->val.int_val, 9090);
+
+    /* ready expression */
+    ASSERT_NOT_NULL(h->left);
+    ASSERT_EQ(h->left->kind, AST_BOOL_LIT);
+    ASSERT_TRUE(h->left->val.bool_val);
+
+    /* live expression */
+    ASSERT_NOT_NULL(h->right);
+    ASSERT_EQ(h->right->kind, AST_BOOL_LIT);
+    ASSERT_TRUE(h->right->val.bool_val);
+
+    /* fields list */
+    ASSERT_EQ(ast_list_len(h->params), 3);
+}
+
+TEST(md_parse_metrics) {
+    bool err;
+    AstNode *prog = parse_md_source(
+        "# agent MetricsAgent\n"
+        "> Metrics test.\n"
+        "\n"
+        "## metrics\n"
+        "- counter processed_total \"Records processed\"\n"
+        "- histogram confidence \"Confidence distribution\"\n"
+        "- gauge pending \"Records pending\"\n"
+        "- port: 9091\n",
+        &err
+    );
+    ASSERT_FALSE(err);
+    ASSERT_NOT_NULL(prog);
+
+    AstNode *agent = prog->params;
+    ASSERT_NOT_NULL(agent);
+    ASSERT_EQ(agent->kind, AST_AGENT);
+
+    /* Metrics node is a top-level sibling */
+    AstNode *m = agent->next;
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(m->kind, AST_METRICS);
+
+    /* Port */
+    ASSERT_EQ(m->val.int_val, 9091);
+
+    /* Count metrics fields */
+    int count = 0;
+    AstNode *f = m->params;
+    while (f) {
+        if (f->kind == AST_METRICS_FIELD) count++;
+        f = f->next;
+    }
+    ASSERT_EQ(count, 3);
+
+    /* First field: counter processed_total */
+    f = m->params;
+    ASSERT_STR_EQ(f->name, "processed_total");
+    ASSERT_FALSE(f->is_mut);   /* counter */
+    ASSERT_FALSE(f->is_pub);
+
+    /* Second: histogram confidence */
+    f = f->next;
+    ASSERT_STR_EQ(f->name, "confidence");
+    ASSERT_TRUE(f->is_pub);    /* histogram */
+
+    /* Third: gauge pending */
+    f = f->next;
+    ASSERT_STR_EQ(f->name, "pending");
+    ASSERT_TRUE(f->is_mut);    /* gauge */
+}
+
+TEST(md_parse_progress) {
+    bool err;
+    AstNode *prog = parse_md_source(
+        "# agent ProgressAgent\n"
+        "> Progress test.\n"
+        "\n"
+        "## progress\n"
+        "- total: count\n"
+        "- current: processed\n",
+        &err
+    );
+    ASSERT_FALSE(err);
+    ASSERT_NOT_NULL(prog);
+
+    AstNode *agent = prog->params;
+    ASSERT_NOT_NULL(agent);
+    ASSERT_EQ(agent->kind, AST_AGENT);
+
+    /* Progress node is a top-level sibling */
+    AstNode *p = agent->next;
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(p->kind, AST_PROGRESS);
+
+    /* left = total expression (identifier "count") */
+    ASSERT_NOT_NULL(p->left);
+    ASSERT_EQ(p->left->kind, AST_IDENT);
+    ASSERT_STR_EQ(p->left->name, "count");
+
+    /* right = current expression (identifier "processed") */
+    ASSERT_NOT_NULL(p->right);
+    ASSERT_EQ(p->right->kind, AST_IDENT);
+    ASSERT_STR_EQ(p->right->name, "processed");
+}
+
+TEST(md_parse_supervisor) {
+    bool err;
+    AstNode *prog = parse_md_source(
+        "# agent SupervisorAgent\n"
+        "> Supervisor test.\n"
+        "\n"
+        "## supervisor PipelineManager\n"
+        "- strategy: one_for_one\n"
+        "- max_restarts: 3\n"
+        "- window: 60\n"
+        "- children: [AgentA, AgentB]\n",
+        &err
+    );
+    ASSERT_FALSE(err);
+    ASSERT_NOT_NULL(prog);
+
+    AstNode *agent = prog->params;
+    ASSERT_NOT_NULL(agent);
+    ASSERT_EQ(agent->kind, AST_AGENT);
+
+    /* Supervisor node is a top-level sibling */
+    AstNode *sup = agent->next;
+    ASSERT_NOT_NULL(sup);
+    ASSERT_EQ(sup->kind, AST_SUPERVISOR);
+    ASSERT_STR_EQ(sup->name, "PipelineManager");
+
+    /* Check fields */
+    AstNode *f = sup->params;
+    int found = 0;
+    while (f) {
+        if (f->name && strcmp(f->name, "strategy") == 0) {
+            ASSERT_NOT_NULL(f->right);
+            ASSERT_EQ(f->right->kind, AST_IDENT);
+            ASSERT_STR_EQ(f->right->name, "one_for_one");
+            found++;
+        }
+        if (f->name && strcmp(f->name, "max_restarts") == 0) {
+            ASSERT_NOT_NULL(f->right);
+            ASSERT_EQ(f->right->kind, AST_INT_LIT);
+            ASSERT_EQ(f->right->val.int_val, 3);
+            found++;
+        }
+        if (f->name && strcmp(f->name, "window") == 0) {
+            ASSERT_NOT_NULL(f->right);
+            ASSERT_EQ(f->right->kind, AST_INT_LIT);
+            ASSERT_EQ(f->right->val.int_val, 60);
+            found++;
+        }
+        if (f->name && strcmp(f->name, "children") == 0) {
+            ASSERT_NOT_NULL(f->right);
+            ASSERT_EQ(f->right->kind, AST_ARRAY);
+            ASSERT_EQ(ast_list_len(f->right->params), 2);
+            ASSERT_STR_EQ(f->right->params->name, "AgentA");
+            ASSERT_STR_EQ(f->right->params->next->name, "AgentB");
+            found++;
+        }
+        f = f->next;
+    }
+    ASSERT_EQ(found, 4);
+}
+
+/* Phase 3: Guards + Errors Tests */
+
+TEST(md_guard_text_only) {
+    const char *src =
+        "# agent TestBot\n"
+        "> A test agent.\n"
+        "## guards\n"
+        "### rate_limit\n"
+        "Max 50 actions per hour.\n";
+
+    ErrorReporter reporter;
+    AstNode *program = parse_md_source_reporter(src, &reporter);
+
+    ASSERT_NOT_NULL(program);
+    ASSERT_EQ(program->kind, AST_PROGRAM);
+
+    AstNode *guard = find_guard_in_ast(program, "rate_limit");
+    ASSERT_NOT_NULL(guard);
+    ASSERT_STR_EQ(guard->name, "rate_limit");
+
+    /* Guard body should be AST_BLOCK with a description field */
+    ASSERT_NOT_NULL(guard->left);
+    ASSERT_EQ(guard->left->kind, AST_BLOCK);
+    ASSERT_NOT_NULL(guard->left->params);
+    ASSERT_EQ(guard->left->params->kind, AST_FIELD);
+    ASSERT_STR_EQ(guard->left->params->name, "description");
+
+    /* The description field's value should be a string */
+    ASSERT_NOT_NULL(guard->left->params->right);
+    ASSERT_EQ(guard->left->params->right->kind, AST_STRING_LIT);
+}
+
+TEST(md_guard_with_code_block) {
+    const char *src =
+        "# agent TestBot\n"
+        "> A test agent.\n"
+        "## guards\n"
+        "### rate_limit\n"
+        "Max 50 actions per hour.\n"
+        "```limceron\n"
+        "let max_actions = 50\n"
+        "let window_seconds = 3600\n"
+        "```\n";
+
+    ErrorReporter reporter;
+    AstNode *program = parse_md_source_reporter(src, &reporter);
+
+    ASSERT_NOT_NULL(program);
+    ASSERT_EQ(program->kind, AST_PROGRAM);
+
+    AstNode *guard = find_guard_in_ast(program, "rate_limit");
+    ASSERT_NOT_NULL(guard);
+    ASSERT_STR_EQ(guard->name, "rate_limit");
+
+    /* Guard body should be AST_BLOCK with parsed let-bindings */
+    ASSERT_NOT_NULL(guard->left);
+    ASSERT_EQ(guard->left->kind, AST_BLOCK);
+
+    /* First statement should be a let binding for max_actions */
+    AstNode *stmt1 = guard->left->params;
+    ASSERT_NOT_NULL(stmt1);
+    ASSERT_EQ(stmt1->kind, AST_LET);
+    ASSERT_STR_EQ(stmt1->name, "max_actions");
+
+    /* Second statement should be a let binding for window_seconds */
+    AstNode *stmt2 = stmt1->next;
+    ASSERT_NOT_NULL(stmt2);
+    ASSERT_EQ(stmt2->kind, AST_LET);
+    ASSERT_STR_EQ(stmt2->name, "window_seconds");
+}
+
+TEST(md_unknown_section_warning) {
+    const char *src =
+        "# agent TestBot\n"
+        "> A test agent.\n"
+        "## distributed_tracing\n"
+        "Some content here.\n";
+
+    ErrorReporter reporter;
+    AstNode *program = parse_md_source_reporter(src, &reporter);
+
+    ASSERT_NOT_NULL(program);
+    ASSERT_EQ(program->kind, AST_PROGRAM);
+
+    /* Should have at least one diagnostic (the warning) */
+    ASSERT(reporter.count >= 1);
+
+    /* Find the warning about unrecognized section */
+    {
+        int found_warning = 0;
+        int i;
+        for (i = 0; i < reporter.count; i++) {
+            if (reporter.errors[i].is_warning &&
+                strstr(reporter.errors[i].message, "unrecognized section") != NULL &&
+                strstr(reporter.errors[i].message, "distributed_tracing") != NULL) {
+                found_warning = 1;
+                /* Check hint lists supported sections */
+                ASSERT_NOT_NULL(reporter.errors[i].hint);
+                ASSERT(strstr(reporter.errors[i].hint, "supported sections") != NULL);
+                break;
+            }
+        }
+        ASSERT(found_warning);
+    }
+}
+
 int main(void) {
     fprintf(stderr, "\n\033[1mLimceron Stage 0 — Test Suite\033[0m\n\n");
 
@@ -7169,6 +7776,24 @@ int main(void) {
     RUN_TEST(parse_progress_block);
     RUN_TEST(codegen_progress_update);
     RUN_TEST(codegen_progress_file);
+
+    fprintf(stderr, "\n── Markdown Parser Safety Tests ──\n");
+    RUN_TEST(md_parse_capability_declaration);
+    RUN_TEST(md_parse_capability_with_access_rules);
+    RUN_TEST(md_parse_taint);
+    RUN_TEST(md_parse_access_control);
+    RUN_TEST(md_parse_combined_safety);
+
+    fprintf(stderr, "\n── Markdown Parser K8s/Runtime Tests ──\n");
+    RUN_TEST(md_parse_health);
+    RUN_TEST(md_parse_metrics);
+    RUN_TEST(md_parse_progress);
+    RUN_TEST(md_parse_supervisor);
+
+    fprintf(stderr, "\n── Markdown Parser Guards/Errors Tests ──\n");
+    RUN_TEST(md_guard_text_only);
+    RUN_TEST(md_guard_with_code_block);
+    RUN_TEST(md_unknown_section_warning);
 
     teardown();
 

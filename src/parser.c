@@ -146,6 +146,8 @@ const char *ast_kind_name(AstKind kind) {
         [AST_PROGRESS]          = "Progress",
         /* Health probes */
         [AST_HEALTH]            = "Health",
+        /* Signal handler */
+        [AST_SIGNAL]            = "Signal",
     };
     if (kind >= 0 && kind < AST_COUNT && names[kind]) return names[kind];
     return "Unknown";

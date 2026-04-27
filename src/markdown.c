@@ -45,7 +45,14 @@ typedef enum {
     MD_SECTION_API_KEY,
     MD_SECTION_ENTROPY_BUDGET,
     MD_SECTION_ACCESS_CONTROL,
+    MD_SECTION_CAPABILITY_DECL,  /* ## capability <name> — declares a named capability */
     MD_SECTION_SKILLS,
+    MD_SECTION_TAINT,            /* ## taint — declares taint labels */
+    MD_SECTION_HEALTH,
+    MD_SECTION_METRICS,
+    MD_SECTION_SIGNAL,
+    MD_SECTION_PROGRESS,
+    MD_SECTION_SUPERVISOR,
     MD_SECTION_UNKNOWN
 } MdSection;
 
@@ -89,6 +96,13 @@ static AstNode *md_parse_tools(MdParser *mp, AstNode **fns_tail);
 static AstNode *md_parse_tool_decl(MdParser *mp, const char *header_line,
                                     AstNode **fns_tail);
 static AstNode *md_parse_code_block(MdParser *mp);
+static AstNode *md_parse_capability_decl(MdParser *mp, const char *cap_name);
+static AstNode *md_parse_taint(MdParser *mp);
+static AstNode *md_parse_health(MdParser *mp);
+static AstNode *md_parse_metrics(MdParser *mp);
+static AstNode *md_parse_signal(MdParser *mp);
+static AstNode *md_parse_progress(MdParser *mp);
+static AstNode *md_parse_supervisor(MdParser *mp, const char *section_name);
 
 /* ============================================================
  * Utility Functions
@@ -225,6 +239,14 @@ static MdSection md_classify_section(const char *name) {
     if (strcmp(name, "entropy_budget") == 0 || strcmp(name, "entropy-budget") == 0 || strcmp(name, "entropy") == 0) return MD_SECTION_ENTROPY_BUDGET;
     if (strcmp(name, "access_control") == 0 || strcmp(name, "access-control") == 0 || strcmp(name, "access") == 0) return MD_SECTION_ACCESS_CONTROL;
     if (strcmp(name, "skills") == 0) return MD_SECTION_SKILLS;
+    if (strcmp(name, "taint") == 0) return MD_SECTION_TAINT;
+    /* "capability <name>" — singular form with a name declares a capability */
+    if (strncmp(name, "capability ", 11) == 0 && strlen(name) > 11) return MD_SECTION_CAPABILITY_DECL;
+    if (strcmp(name, "health") == 0) return MD_SECTION_HEALTH;
+    if (strcmp(name, "metrics") == 0) return MD_SECTION_METRICS;
+    if (strcmp(name, "signal") == 0) return MD_SECTION_SIGNAL;
+    if (strcmp(name, "progress") == 0) return MD_SECTION_PROGRESS;
+    if (md_starts_with(name, "supervisor")) return MD_SECTION_SUPERVISOR;
     return MD_SECTION_UNKNOWN;
 }
 
@@ -427,10 +449,15 @@ static AstNode *md_parse_budget(MdParser *mp) {
  *   ## guards
  *   ### rate_limit
  *   Max 50 actions per hour.
+ *   ```limceron
+ *   let max_actions = 50
+ *   let window_seconds = 3600
+ *   ```
  *
- * Each ### becomes an AST_GUARD node with the description stored
- * as a prompt field. Returns a list of guard fields to append to
- * the agent's members.
+ * Each ### becomes an AST_GUARD node. If a code block is present,
+ * its contents are parsed through the Limceron parser to produce
+ * real AST nodes as the guard body. Otherwise the description text
+ * is stored as a simple guard with a description field.
  */
 static AstNode *md_parse_guards(MdParser *mp, AstNode **members_tail) {
     md_skip_blank_lines(mp);
@@ -453,36 +480,93 @@ static AstNode *md_parse_guards(MdParser *mp, AstNode **members_tail) {
             AstNode *guard = ast_new(mp->arena, AST_GUARD, gloc);
             guard->name = intern_get(mp->intern, guard_name, strlen(guard_name));
 
-            /* Collect description text until next ### or ## */
+            /* Collect description text and check for code blocks */
             md_skip_blank_lines(mp);
             size_t desc_start = mp->pos;
+            size_t desc_end = desc_start;
+            bool has_code_block = false;
+            AstNode *code_body = NULL;
+
             while (!md_at_end(mp) && !md_at_section_boundary(mp, 3)) {
+                /* Check for a code block */
+                md_skip_line_whitespace(mp);
+                if (md_starts_with(mp->source + mp->pos, "```limceron") ||
+                    md_starts_with(mp->source + mp->pos, "```lceron")) {
+                    /* Mark the end of description text before the code block */
+                    desc_end = mp->pos;
+                    /* Parse the code block through the Limceron parser */
+                    AstNode *code_result = md_parse_code_block(mp);
+                    if (code_result && code_result->params) {
+                        has_code_block = true;
+                        /* Build a block from the parsed statements */
+                        AstNode *body = ast_new(mp->arena, AST_BLOCK, gloc);
+                        body->params = code_result->params;
+                        code_body = body;
+                    }
+                    continue;
+                }
                 md_read_line(mp);
-            }
-            size_t desc_end = mp->pos;
-
-            /* Trim trailing whitespace from description */
-            while (desc_end > desc_start &&
-                   (mp->source[desc_end - 1] == '\n' ||
-                    mp->source[desc_end - 1] == '\r' ||
-                    mp->source[desc_end - 1] == ' ')) {
-                desc_end--;
+                if (!has_code_block) {
+                    desc_end = mp->pos;
+                }
             }
 
-            if (desc_end > desc_start) {
-                char *desc = arena_strndup(mp->arena, mp->source + desc_start,
-                                           desc_end - desc_start);
-                /* Store description as a prompt field on the guard's left child */
-                AstNode *desc_node = ast_new(mp->arena, AST_STRING_LIT, gloc);
-                desc_node->val.str_val = intern_get(mp->intern, desc, strlen(desc));
+            if (!has_code_block) {
+                desc_end = mp->pos;
+            }
 
-                /* Wrap in a block as the guard body */
-                AstNode *body = ast_new(mp->arena, AST_BLOCK, gloc);
-                AstNode *desc_field = ast_new(mp->arena, AST_FIELD, gloc);
-                desc_field->name = arena_strdup(mp->arena, "description");
-                desc_field->right = desc_node;
-                body->params = desc_field;
-                guard->left = body;
+            if (has_code_block && code_body) {
+                /* Use the parsed code as the guard body (same as .lceron) */
+                guard->left = code_body;
+
+                /* Also store description if present */
+                /* Trim trailing whitespace from description */
+                size_t d_end = desc_end;
+                while (d_end > desc_start &&
+                       (mp->source[d_end - 1] == '\n' ||
+                        mp->source[d_end - 1] == '\r' ||
+                        mp->source[d_end - 1] == ' ')) {
+                    d_end--;
+                }
+                if (d_end > desc_start) {
+                    char *desc = arena_strndup(mp->arena, mp->source + desc_start,
+                                               d_end - desc_start);
+                    desc = md_trim(mp->arena, desc);
+                    if (strlen(desc) > 0) {
+                        /* Store description as an attribute on the guard for docs */
+                        AstNode *desc_node = ast_new(mp->arena, AST_STRING_LIT, gloc);
+                        desc_node->val.str_val = intern_get(mp->intern, desc, strlen(desc));
+                        AstNode *desc_attr = ast_new(mp->arena, AST_FIELD, gloc);
+                        desc_attr->name = arena_strdup(mp->arena, "description");
+                        desc_attr->right = desc_node;
+                        guard->right = desc_attr;
+                    }
+                }
+            } else {
+                /* No code block — use description-only behavior */
+                /* Trim trailing whitespace from description */
+                while (desc_end > desc_start &&
+                       (mp->source[desc_end - 1] == '\n' ||
+                        mp->source[desc_end - 1] == '\r' ||
+                        mp->source[desc_end - 1] == ' ')) {
+                    desc_end--;
+                }
+
+                if (desc_end > desc_start) {
+                    char *desc = arena_strndup(mp->arena, mp->source + desc_start,
+                                               desc_end - desc_start);
+                    /* Store description as a prompt field on the guard's left child */
+                    AstNode *desc_node = ast_new(mp->arena, AST_STRING_LIT, gloc);
+                    desc_node->val.str_val = intern_get(mp->intern, desc, strlen(desc));
+
+                    /* Wrap in a block as the guard body */
+                    AstNode *body = ast_new(mp->arena, AST_BLOCK, gloc);
+                    AstNode *desc_field = ast_new(mp->arena, AST_FIELD, gloc);
+                    desc_field->name = arena_strdup(mp->arena, "description");
+                    desc_field->right = desc_node;
+                    body->params = desc_field;
+                    guard->left = body;
+                }
             }
 
             guard_list = ast_append(guard_list, guard);
@@ -896,6 +980,713 @@ static AstNode *md_parse_code_block(MdParser *mp) {
 }
 
 /* ============================================================
+ * Capability Declaration Parser (## capability <name>)
+ * ============================================================ */
+
+/*
+ * Parse a capability declaration section:
+ *   ## capability llm
+ *   - complete
+ *   - classify requires complete
+ *   - embed
+ *
+ *   ## capability network
+ *   allow endpoint "api.example.com:443" { method: [GET, POST] }
+ *   deny private_ranges
+ *   default: deny
+ *
+ * Returns: AST_CAPABILITY node with name and child items.
+ * Items may be AST_CAPABILITY_ITEM (abstract) or access control rule nodes.
+ */
+static AstNode *md_parse_capability_decl(MdParser *mp, const char *cap_name) {
+    SourceLoc loc = md_loc(mp);
+    AstNode *node = ast_new(mp->arena, AST_CAPABILITY, loc);
+    node->name = intern_get(mp->intern, cap_name, strlen(cap_name));
+
+    AstNode *items = NULL;
+
+    md_skip_blank_lines(mp);
+
+    while (!md_at_end(mp) && !md_at_section_boundary(mp, 2)) {
+        char *line = md_read_line(mp);
+        char *trimmed = md_trim(mp->arena, line);
+
+        if (strlen(trimmed) == 0) continue;
+
+        SourceLoc iloc = md_loc(mp);
+        iloc.line = mp->line > 0 ? mp->line - 1 : mp->line;
+
+        /* allow endpoint/binary/path rule */
+        if (md_starts_with(trimmed, "allow ")) {
+            const char *rest = trimmed + 6;
+            char *kind_end = (char *)rest;
+            while (*kind_end && *kind_end != ' ') kind_end++;
+            size_t kind_len = (size_t)(kind_end - rest);
+            char *kind = arena_strndup(mp->arena, rest, kind_len);
+
+            if (strcmp(kind, "endpoint") == 0) {
+                AstNode *rule = ast_new(mp->arena, AST_CAP_ENDPOINT_RULE, iloc);
+                rule->is_mut = true; /* allow */
+                /* Extract quoted value */
+                const char *q1 = strchr(kind_end, '"');
+                if (q1) {
+                    q1++;
+                    const char *q2 = strchr(q1, '"');
+                    if (q2) {
+                        char *val = arena_strndup(mp->arena, q1, (size_t)(q2 - q1));
+                        rule->name = intern_get(mp->intern, val, strlen(val));
+                    }
+                }
+                items = ast_append(items, rule);
+            } else if (strcmp(kind, "binary") == 0) {
+                AstNode *rule = ast_new(mp->arena, AST_CAP_BINARY_RULE, iloc);
+                rule->is_mut = true; /* allow */
+                const char *q1 = strchr(kind_end, '"');
+                if (q1) {
+                    q1++;
+                    const char *q2 = strchr(q1, '"');
+                    if (q2) {
+                        char *val = arena_strndup(mp->arena, q1, (size_t)(q2 - q1));
+                        rule->name = intern_get(mp->intern, val, strlen(val));
+                    }
+                }
+                items = ast_append(items, rule);
+            } else if (strcmp(kind, "path") == 0) {
+                AstNode *rule = ast_new(mp->arena, AST_CAP_PATH_RULE, iloc);
+                rule->is_mut = true; /* allow */
+                const char *q1 = strchr(kind_end, '"');
+                if (q1) {
+                    q1++;
+                    const char *q2 = strchr(q1, '"');
+                    if (q2) {
+                        char *val = arena_strndup(mp->arena, q1, (size_t)(q2 - q1));
+                        rule->name = intern_get(mp->intern, val, strlen(val));
+                    }
+                }
+                items = ast_append(items, rule);
+            } else {
+                md_error_fmt(mp, "unknown allow rule kind: %s", kind);
+            }
+            continue;
+        }
+
+        /* deny endpoint/binary/path/private_ranges rule */
+        if (md_starts_with(trimmed, "deny ")) {
+            const char *rest = trimmed + 5;
+            char *kind_end = (char *)rest;
+            while (*kind_end && *kind_end != ' ') kind_end++;
+            size_t kind_len = (size_t)(kind_end - rest);
+            char *kind = arena_strndup(mp->arena, rest, kind_len);
+
+            if (strcmp(kind, "private_ranges") == 0) {
+                AstNode *rule = ast_new(mp->arena, AST_CAP_DENY_RANGE, iloc);
+                rule->is_mut = false; /* deny */
+                rule->name = intern_get(mp->intern, "private_ranges", 14);
+                items = ast_append(items, rule);
+            } else if (strcmp(kind, "endpoint") == 0) {
+                AstNode *rule = ast_new(mp->arena, AST_CAP_ENDPOINT_RULE, iloc);
+                rule->is_mut = false; /* deny */
+                const char *q1 = strchr(kind_end, '"');
+                if (q1) {
+                    q1++;
+                    const char *q2 = strchr(q1, '"');
+                    if (q2) {
+                        char *val = arena_strndup(mp->arena, q1, (size_t)(q2 - q1));
+                        rule->name = intern_get(mp->intern, val, strlen(val));
+                    }
+                }
+                items = ast_append(items, rule);
+            } else if (strcmp(kind, "binary") == 0) {
+                AstNode *rule = ast_new(mp->arena, AST_CAP_BINARY_RULE, iloc);
+                rule->is_mut = false; /* deny */
+                const char *q1 = strchr(kind_end, '"');
+                if (q1) {
+                    q1++;
+                    const char *q2 = strchr(q1, '"');
+                    if (q2) {
+                        char *val = arena_strndup(mp->arena, q1, (size_t)(q2 - q1));
+                        rule->name = intern_get(mp->intern, val, strlen(val));
+                    }
+                }
+                items = ast_append(items, rule);
+            } else if (strcmp(kind, "path") == 0) {
+                AstNode *rule = ast_new(mp->arena, AST_CAP_PATH_RULE, iloc);
+                rule->is_mut = false; /* deny */
+                const char *q1 = strchr(kind_end, '"');
+                if (q1) {
+                    q1++;
+                    const char *q2 = strchr(q1, '"');
+                    if (q2) {
+                        char *val = arena_strndup(mp->arena, q1, (size_t)(q2 - q1));
+                        rule->name = intern_get(mp->intern, val, strlen(val));
+                    }
+                }
+                items = ast_append(items, rule);
+            } else {
+                md_error_fmt(mp, "unknown deny rule kind: %s", kind);
+            }
+            continue;
+        }
+
+        /* default: allow | default: deny */
+        if (md_starts_with(trimmed, "default:")) {
+            const char *val_str = trimmed + 8;
+            char *dval = md_trim(mp->arena, val_str);
+            AstNode *def = ast_new(mp->arena, AST_CAP_DEFAULT, iloc);
+            if (strcmp(dval, "allow") == 0) {
+                def->is_mut = true;  /* default allow */
+            } else {
+                def->is_mut = false; /* default deny */
+            }
+            items = ast_append(items, def);
+            continue;
+        }
+
+        /* List item: "- name" or "- name requires dep1, dep2" */
+        if (md_starts_with(trimmed, "- ")) {
+            const char *item_text = md_trim(mp->arena, trimmed + 2);
+            if (strlen(item_text) == 0) continue;
+
+            AstNode *item = ast_new(mp->arena, AST_CAPABILITY_ITEM, iloc);
+
+            /* Check for "requires" clause */
+            const char *req = strstr(item_text, " requires ");
+            if (req) {
+                /* Name is everything before " requires " */
+                size_t name_len = (size_t)(req - item_text);
+                char *iname = arena_strndup(mp->arena, item_text, name_len);
+                iname = md_trim(mp->arena, iname);
+                item->name = intern_get(mp->intern, iname, strlen(iname));
+
+                /* Dependencies after "requires " */
+                const char *deps_str = req + 10; /* skip " requires " */
+                AstNode *deps = NULL;
+                /* Split by comma */
+                while (*deps_str != '\0') {
+                    const char *comma = strchr(deps_str, ',');
+                    size_t dep_len;
+                    if (comma) {
+                        dep_len = (size_t)(comma - deps_str);
+                    } else {
+                        dep_len = strlen(deps_str);
+                    }
+                    char *dep_name = arena_strndup(mp->arena, deps_str, dep_len);
+                    dep_name = md_trim(mp->arena, dep_name);
+                    if (strlen(dep_name) > 0) {
+                        AstNode *dep = ast_new(mp->arena, AST_IDENT, iloc);
+                        dep->name = intern_get(mp->intern, dep_name, strlen(dep_name));
+                        deps = ast_append(deps, dep);
+                    }
+                    if (comma) {
+                        deps_str = comma + 1;
+                    } else {
+                        break;
+                    }
+                }
+                item->params = deps;
+            } else {
+                item->name = intern_get(mp->intern, item_text, strlen(item_text));
+            }
+
+            items = ast_append(items, item);
+            continue;
+        }
+
+        /* Unknown line — skip with warning */
+        md_error_fmt(mp, "unexpected line in capability declaration: %s", trimmed);
+    }
+
+    node->params = items;
+    return node;
+}
+
+/*
+ * Parse taint section:
+ *   ## taint
+ *   - user_input
+ *   - llm_output
+ *   - sanitized
+ *
+ * Returns: A list of AST_TAINT nodes (one per taint label).
+ * Caller should append each to program->params as top-level declarations.
+ */
+static AstNode *md_parse_taint(MdParser *mp) {
+    AstNode *taint_list = NULL;
+
+    md_skip_blank_lines(mp);
+
+    while (!md_at_end(mp) && !md_at_section_boundary(mp, 2)) {
+        char *line = md_read_line(mp);
+        char *trimmed = md_trim(mp->arena, line);
+
+        if (strlen(trimmed) == 0) continue;
+
+        /* Must start with '- ' */
+        if (!md_starts_with(trimmed, "- ")) {
+            md_error_fmt(mp, "expected '- taint_name' in taint section, got: %s",
+                         trimmed);
+            continue;
+        }
+
+        const char *taint_name = md_trim(mp->arena, trimmed + 2);
+        if (strlen(taint_name) == 0) continue;
+
+        SourceLoc tloc = md_loc(mp);
+        tloc.line = mp->line > 0 ? mp->line - 1 : mp->line;
+        AstNode *taint = ast_new(mp->arena, AST_TAINT, tloc);
+        taint->name = intern_get(mp->intern, taint_name, strlen(taint_name));
+
+        taint_list = ast_append(taint_list, taint);
+    }
+
+    return taint_list;
+}
+
+/* ============================================================
+ * Health Probe Parser (## health)
+ * ============================================================ */
+
+/*
+ * Parse health section:
+ *   ## health
+ *   - ready: true
+ *   - live: true
+ *   - port: 9090
+ *
+ * Returns: AST_HEALTH node
+ *   left  = ready expression (AST_BOOL_LIT or AST_IDENT)
+ *   right = live expression  (AST_BOOL_LIT or AST_IDENT)
+ *   val.int_val = port number (default 9090)
+ *   params = raw field list
+ */
+static AstNode *md_parse_health(MdParser *mp) {
+    SourceLoc loc = md_loc(mp);
+    AstNode *node = ast_new(mp->arena, AST_HEALTH, loc);
+    node->val.int_val = 9090;  /* default port */
+
+    AstNode *fields = NULL;
+
+    md_skip_blank_lines(mp);
+
+    while (!md_at_end(mp) && !md_at_section_boundary(mp, 2)) {
+        char *line = md_read_line(mp);
+        char *trimmed = md_trim(mp->arena, line);
+
+        if (strlen(trimmed) == 0) continue;
+
+        /* Must start with '- ' */
+        if (!md_starts_with(trimmed, "- ")) continue;
+
+        /* Parse "key: value" after the "- " */
+        const char *kv = trimmed + 2;
+        const char *colon = strchr(kv, ':');
+        if (!colon) continue;
+
+        size_t key_len = (size_t)(colon - kv);
+        char *key = arena_strndup(mp->arena, kv, key_len);
+        key = md_trim(mp->arena, key);
+
+        const char *val_str = colon + 1;
+        char *value = md_trim(mp->arena, val_str);
+
+        SourceLoc floc = loc;
+        floc.line = mp->line - 1;
+
+        AstNode *field = ast_new(mp->arena, AST_FIELD, floc);
+        field->name = intern_get(mp->intern, key, strlen(key));
+
+        /* Parse value: boolean, integer, or identifier */
+        if (strcmp(value, "true") == 0) {
+            AstNode *val_node = ast_new(mp->arena, AST_BOOL_LIT, floc);
+            val_node->val.bool_val = true;
+            field->right = val_node;
+        } else if (strcmp(value, "false") == 0) {
+            AstNode *val_node = ast_new(mp->arena, AST_BOOL_LIT, floc);
+            val_node->val.bool_val = false;
+            field->right = val_node;
+        } else {
+            char *endptr = NULL;
+            double dval = strtod(value, &endptr);
+            if (endptr && endptr != value && *endptr == '\0') {
+                AstNode *int_node = ast_new(mp->arena, AST_INT_LIT, floc);
+                int_node->val.int_val = (int64_t)dval;
+                field->right = int_node;
+            } else {
+                AstNode *id_node = ast_new(mp->arena, AST_IDENT, floc);
+                id_node->name = intern_get(mp->intern, value, strlen(value));
+                field->right = id_node;
+            }
+        }
+
+        /* Set node-level fields based on key */
+        if (strcmp(key, "ready") == 0) {
+            node->left = field->right;
+        } else if (strcmp(key, "live") == 0) {
+            node->right = field->right;
+        } else if (strcmp(key, "port") == 0) {
+            if (field->right && field->right->kind == AST_INT_LIT) {
+                node->val.int_val = field->right->val.int_val;
+            }
+        }
+
+        fields = ast_append(fields, field);
+    }
+
+    node->params = fields;
+    return node;
+}
+
+/* ============================================================
+ * Metrics Parser (## metrics)
+ * ============================================================ */
+
+/*
+ * Parse metrics section:
+ *   ## metrics
+ *   - counter processed_total "Records processed"
+ *   - histogram confidence "Confidence distribution"
+ *   - gauge pending "Records pending"
+ *   - port: 9091
+ *
+ * Returns: AST_METRICS node
+ *   params = linked list of AST_METRICS_FIELD nodes
+ *   val.int_val = port number (default 9091)
+ *
+ * AST_METRICS_FIELD:
+ *   name = metric name
+ *   val.str_val = description string
+ *   is_mut = true for gauge
+ *   is_pub = true for histogram
+ */
+static AstNode *md_parse_metrics(MdParser *mp) {
+    SourceLoc loc = md_loc(mp);
+    AstNode *node = ast_new(mp->arena, AST_METRICS, loc);
+    node->val.int_val = 9091;  /* default port */
+
+    AstNode *fields = NULL;
+
+    md_skip_blank_lines(mp);
+
+    while (!md_at_end(mp) && !md_at_section_boundary(mp, 2)) {
+        char *line = md_read_line(mp);
+        char *trimmed = md_trim(mp->arena, line);
+
+        if (strlen(trimmed) == 0) continue;
+
+        /* Must start with '- ' */
+        if (!md_starts_with(trimmed, "- ")) continue;
+
+        const char *content = trimmed + 2;
+
+        SourceLoc floc = loc;
+        floc.line = mp->line - 1;
+
+        /* Check for "port: N" */
+        if (md_starts_with(content, "port:")) {
+            const char *port_val = content + 5;
+            char *pv = md_trim(mp->arena, port_val);
+            char *endptr = NULL;
+            long port = strtol(pv, &endptr, 10);
+            if (endptr && endptr != pv && *endptr == '\0') {
+                node->val.int_val = (int64_t)port;
+            }
+            continue;
+        }
+
+        /* Parse "type name \"description\"" */
+        /* Find first space to get type */
+        const char *sp1 = strchr(content, ' ');
+        if (!sp1) continue;
+
+        size_t type_len = (size_t)(sp1 - content);
+        char *type_str = arena_strndup(mp->arena, content, type_len);
+
+        const char *rest = sp1 + 1;
+        while (*rest == ' ') rest++;
+
+        /* Find the metric name (next token before quote or space) */
+        const char *sp2 = strchr(rest, ' ');
+        const char *quote = strchr(rest, '"');
+        const char *name_end = sp2;
+        if (!name_end || (quote && quote < name_end)) name_end = quote;
+        if (!name_end) name_end = rest + strlen(rest);
+
+        size_t name_len = (size_t)(name_end - rest);
+        char *metric_name = arena_strndup(mp->arena, rest, name_len);
+        metric_name = md_trim(mp->arena, metric_name);
+
+        if (strlen(metric_name) == 0) continue;
+
+        AstNode *mf = ast_new(mp->arena, AST_METRICS_FIELD, floc);
+        mf->name = intern_get(mp->intern, metric_name, strlen(metric_name));
+
+        if (strcmp(type_str, "gauge") == 0)     mf->is_mut = true;
+        if (strcmp(type_str, "histogram") == 0) mf->is_pub = true;
+
+        /* Extract description from quotes */
+        if (quote) {
+            const char *desc_start = quote + 1;
+            const char *desc_end = strchr(desc_start, '"');
+            if (desc_end) {
+                size_t desc_len = (size_t)(desc_end - desc_start);
+                char *desc = arena_strndup(mp->arena, desc_start, desc_len);
+                mf->val.str_val = intern_get(mp->intern, desc, strlen(desc));
+            }
+        }
+
+        fields = ast_append(fields, mf);
+    }
+
+    node->params = fields;
+    return node;
+}
+
+/* ============================================================
+ * Signal Parser (## signal)
+ * ============================================================ */
+
+/*
+ * Parse signal section:
+ *   ## signal
+ *   SIGTERM
+ *
+ * Optionally followed by a code block for the handler body.
+ *
+ * Returns: AST_SIGNAL node
+ *   name = signal name (e.g. "SIGTERM", "SIGINT")
+ *   left = handler body (if code block present)
+ */
+static AstNode *md_parse_signal(MdParser *mp) {
+    SourceLoc loc = md_loc(mp);
+    AstNode *node = ast_new(mp->arena, AST_SIGNAL, loc);
+
+    md_skip_blank_lines(mp);
+
+    /* Read the signal name */
+    char *sig_name = NULL;
+    while (!md_at_end(mp) && !md_at_section_boundary(mp, 2)) {
+        md_skip_line_whitespace(mp);
+
+        /* Check for code block */
+        if (md_starts_with(mp->source + mp->pos, "```limceron") ||
+            md_starts_with(mp->source + mp->pos, "```lceron")) {
+            AstNode *code_result = md_parse_code_block(mp);
+            if (code_result) {
+                node->left = code_result;
+            }
+            continue;
+        }
+
+        char *line = md_read_line(mp);
+        char *trimmed = md_trim(mp->arena, line);
+
+        if (strlen(trimmed) == 0) continue;
+
+        if (!sig_name) {
+            sig_name = trimmed;
+        }
+    }
+
+    if (sig_name) {
+        node->name = intern_get(mp->intern, sig_name, strlen(sig_name));
+    } else {
+        node->name = intern_get(mp->intern, "SIGTERM", 7);
+    }
+
+    return node;
+}
+
+/* ============================================================
+ * Progress Parser (## progress)
+ * ============================================================ */
+
+/*
+ * Parse progress section:
+ *   ## progress
+ *   - total: count
+ *   - current: processed
+ *
+ * Returns: AST_PROGRESS node
+ *   left  = total expression (AST_IDENT)
+ *   right = current expression (AST_IDENT)
+ */
+static AstNode *md_parse_progress(MdParser *mp) {
+    SourceLoc loc = md_loc(mp);
+    AstNode *node = ast_new(mp->arena, AST_PROGRESS, loc);
+
+    md_skip_blank_lines(mp);
+
+    while (!md_at_end(mp) && !md_at_section_boundary(mp, 2)) {
+        char *line = md_read_line(mp);
+        char *trimmed = md_trim(mp->arena, line);
+
+        if (strlen(trimmed) == 0) continue;
+
+        /* Must start with '- ' */
+        if (!md_starts_with(trimmed, "- ")) continue;
+
+        /* Parse "key: value" */
+        const char *kv = trimmed + 2;
+        const char *colon = strchr(kv, ':');
+        if (!colon) continue;
+
+        size_t key_len = (size_t)(colon - kv);
+        char *key = arena_strndup(mp->arena, kv, key_len);
+        key = md_trim(mp->arena, key);
+
+        const char *val_str = colon + 1;
+        char *value = md_trim(mp->arena, val_str);
+
+        SourceLoc floc = loc;
+        floc.line = mp->line - 1;
+
+        AstNode *val_node = ast_new(mp->arena, AST_IDENT, floc);
+        val_node->name = intern_get(mp->intern, value, strlen(value));
+
+        if (strcmp(key, "total") == 0) {
+            node->left = val_node;
+        } else if (strcmp(key, "current") == 0) {
+            node->right = val_node;
+        }
+    }
+
+    return node;
+}
+
+/* ============================================================
+ * Supervisor Parser (## supervisor <Name>)
+ * ============================================================ */
+
+/*
+ * Parse supervisor section:
+ *   ## supervisor PipelineManager
+ *   - strategy: one_for_one
+ *   - max_restarts: 3
+ *   - window: 60
+ *   - children: [AgentA, AgentB]
+ *
+ * Returns: AST_SUPERVISOR node
+ *   name = supervisor name
+ *   params = linked list of AST_FIELD nodes
+ *     For children: right = AST_ARRAY of AST_IDENT
+ *     For others: right = AST_INT_LIT, AST_IDENT, or AST_STRING_LIT
+ */
+static AstNode *md_parse_supervisor(MdParser *mp, const char *section_name) {
+    SourceLoc loc = md_loc(mp);
+    AstNode *node = ast_new(mp->arena, AST_SUPERVISOR, loc);
+
+    /* Extract supervisor name from section heading (after "supervisor ") */
+    const char *name_start = section_name + 10;  /* skip "supervisor" */
+    while (*name_start == ' ') name_start++;
+    if (strlen(name_start) > 0) {
+        char *name = md_trim(mp->arena, name_start);
+        node->name = intern_get(mp->intern, name, strlen(name));
+    } else {
+        node->name = intern_get(mp->intern, "Unnamed", 7);
+    }
+
+    AstNode *fields = NULL;
+
+    md_skip_blank_lines(mp);
+
+    while (!md_at_end(mp) && !md_at_section_boundary(mp, 2)) {
+        char *line = md_read_line(mp);
+        char *trimmed = md_trim(mp->arena, line);
+
+        if (strlen(trimmed) == 0) continue;
+
+        /* Must start with '- ' */
+        if (!md_starts_with(trimmed, "- ")) continue;
+
+        /* Parse "key: value" */
+        const char *kv = trimmed + 2;
+        const char *colon = strchr(kv, ':');
+        if (!colon) continue;
+
+        size_t key_len = (size_t)(colon - kv);
+        char *key = arena_strndup(mp->arena, kv, key_len);
+        key = md_trim(mp->arena, key);
+
+        const char *val_str = colon + 1;
+        char *value = md_trim(mp->arena, val_str);
+
+        SourceLoc floc = loc;
+        floc.line = mp->line - 1;
+
+        AstNode *sub_field = ast_new(mp->arena, AST_FIELD, floc);
+        sub_field->name = intern_get(mp->intern, key, strlen(key));
+
+        /* Handle children: [AgentA, AgentB] */
+        if (strcmp(key, "children") == 0 && value[0] == '[') {
+            AstNode *arr = ast_new(mp->arena, AST_ARRAY, floc);
+            AstNode *elems = NULL;
+
+            /* Find closing bracket */
+            const char *bracket_start = value + 1;
+            const char *bracket_end = strchr(bracket_start, ']');
+            if (!bracket_end) bracket_end = bracket_start + strlen(bracket_start);
+
+            size_t list_len = (size_t)(bracket_end - bracket_start);
+            char *list_str = arena_strndup(mp->arena, bracket_start, list_len);
+
+            /* Split by comma */
+            char *tok_ptr = list_str;
+            while (*tok_ptr != '\0') {
+                char *comma = strchr(tok_ptr, ',');
+                size_t tok_len;
+                if (comma) {
+                    tok_len = (size_t)(comma - tok_ptr);
+                } else {
+                    tok_len = strlen(tok_ptr);
+                }
+
+                char *child_name = arena_strndup(mp->arena, tok_ptr, tok_len);
+                child_name = md_trim(mp->arena, child_name);
+                if (strlen(child_name) > 0) {
+                    AstNode *child = ast_new(mp->arena, AST_IDENT, floc);
+                    child->name = intern_get(mp->intern, child_name, strlen(child_name));
+                    elems = ast_append(elems, child);
+                }
+
+                if (comma) {
+                    tok_ptr = comma + 1;
+                } else {
+                    break;
+                }
+            }
+
+            arr->params = elems;
+            sub_field->right = arr;
+        } else {
+            /* Try to parse value as number */
+            char *endptr = NULL;
+            double dval = strtod(value, &endptr);
+            if (endptr && endptr != value && *endptr == '\0') {
+                if (strchr(value, '.') == NULL) {
+                    AstNode *int_node = ast_new(mp->arena, AST_INT_LIT, floc);
+                    int_node->val.int_val = (int64_t)dval;
+                    sub_field->right = int_node;
+                } else {
+                    AstNode *float_node = ast_new(mp->arena, AST_FLOAT_LIT, floc);
+                    float_node->val.float_val = dval;
+                    sub_field->right = float_node;
+                }
+            } else {
+                /* Store as identifier (for strategy: one_for_one, etc.) */
+                AstNode *id_node = ast_new(mp->arena, AST_IDENT, floc);
+                id_node->name = intern_get(mp->intern, value, strlen(value));
+                sub_field->right = id_node;
+            }
+        }
+
+        fields = ast_append(fields, sub_field);
+    }
+
+    node->params = fields;
+    return node;
+}
+
+/* ============================================================
  * System Prompt Parser
  * ============================================================ */
 
@@ -1056,6 +1847,7 @@ AstNode *parse_lceron_md(const char *filename, const char *source, size_t source
 
     AstNode *members = NULL;
     AstNode *fns = NULL;
+    AstNode *top_level = NULL;  /* health, metrics, signal, progress, supervisor */
 
     /* Parse remaining sections */
     while (!md_at_end(&mp)) {
@@ -1077,7 +1869,8 @@ AstNode *parse_lceron_md(const char *filename, const char *source, size_t source
             const char *text = heading;
             while (*text == '#') text++;
             while (*text == ' ') text++;
-            char *section_name = md_trim(mp.arena, text);
+            char *section_name_orig = md_trim(mp.arena, text);
+            char *section_name = arena_strdup(mp.arena, section_name_orig);
 
             /* Convert to lowercase for matching */
             {
@@ -1319,11 +2112,191 @@ AstNode *parse_lceron_md(const char *filename, const char *source, size_t source
                 break;
             }
             case MD_SECTION_ACCESS_CONTROL: {
-                /* ## access_control — too complex for markdown, skip with comment */
+                /* ## access_control — parse subsections for network, filesystem, shell */
+                SourceLoc acloc = md_loc(&mp);
+                AstNode *ac_list = NULL;
+                const char *current_subsection = NULL;
+
+                md_skip_blank_lines(&mp);
+
                 while (!md_at_end(&mp) && !md_at_section_boundary(&mp, 2)) {
-                    md_read_line(&mp);
+                    /* Check for ### subsection heading */
+                    if (md_is_heading_at_level(&mp, 3)) {
+                        char *acline = md_read_line(&mp);
+                        const char *sub_text = acline;
+                        while (*sub_text == '#') sub_text++;
+                        while (*sub_text == ' ') sub_text++;
+                        current_subsection = md_trim(mp.arena, sub_text);
+                        /* Lowercase the subsection name */
+                        {
+                            char *pp = (char *)current_subsection;
+                            while (*pp) {
+                                if (*pp >= 'A' && *pp <= 'Z') {
+                                    *pp = (char)(*pp + ('a' - 'A'));
+                                }
+                                pp++;
+                            }
+                        }
+                        md_skip_blank_lines(&mp);
+                        continue;
+                    }
+
+                    char *acline = md_read_line(&mp);
+                    char *actrimmed = md_trim(mp.arena, acline);
+                    if (strlen(actrimmed) == 0) continue;
+
+                    if (!current_subsection) {
+                        md_error_fmt(&mp,
+                            "access_control rules must be under a ### subsection "
+                            "(network, filesystem, shell), got: %s", actrimmed);
+                        continue;
+                    }
+
+                    SourceLoc rloc = acloc;
+                    rloc.line = mp.line > 0 ? mp.line - 1 : mp.line;
+
+                    /* Parse: allow|deny <kind> <value> or default: allow|deny */
+                    if (md_starts_with(actrimmed, "allow ")) {
+                        const char *rest = actrimmed + 6;
+                        char *kend = (char *)rest;
+                        while (*kend && *kend != ' ') kend++;
+                        size_t klen = (size_t)(kend - rest);
+                        char *kind = arena_strndup(mp.arena, rest, klen);
+
+                        if (strcmp(kind, "endpoint") == 0) {
+                            AstNode *rule = ast_new(mp.arena, AST_CAP_ENDPOINT_RULE, rloc);
+                            rule->is_mut = true;
+                            const char *q1 = strchr(kend, '"');
+                            if (q1) { q1++;
+                                const char *q2 = strchr(q1, '"');
+                                if (q2) {
+                                    char *val = arena_strndup(mp.arena, q1, (size_t)(q2 - q1));
+                                    rule->name = intern_get(mp.intern, val, strlen(val));
+                                }
+                            }
+                            ac_list = ast_append(ac_list, rule);
+                        } else if (strcmp(kind, "path") == 0) {
+                            AstNode *rule = ast_new(mp.arena, AST_CAP_PATH_RULE, rloc);
+                            rule->is_mut = true;
+                            const char *q1 = strchr(kend, '"');
+                            if (q1) { q1++;
+                                const char *q2 = strchr(q1, '"');
+                                if (q2) {
+                                    char *val = arena_strndup(mp.arena, q1, (size_t)(q2 - q1));
+                                    rule->name = intern_get(mp.intern, val, strlen(val));
+                                }
+                            }
+                            ac_list = ast_append(ac_list, rule);
+                        } else if (strcmp(kind, "binary") == 0) {
+                            AstNode *rule = ast_new(mp.arena, AST_CAP_BINARY_RULE, rloc);
+                            rule->is_mut = true;
+                            const char *q1 = strchr(kend, '"');
+                            if (q1) { q1++;
+                                const char *q2 = strchr(q1, '"');
+                                if (q2) {
+                                    char *val = arena_strndup(mp.arena, q1, (size_t)(q2 - q1));
+                                    rule->name = intern_get(mp.intern, val, strlen(val));
+                                }
+                            }
+                            ac_list = ast_append(ac_list, rule);
+                        } else {
+                            md_error_fmt(&mp, "unknown allow rule kind in access_control: %s", kind);
+                        }
+                    } else if (md_starts_with(actrimmed, "deny ")) {
+                        const char *rest = actrimmed + 5;
+                        char *kend = (char *)rest;
+                        while (*kend && *kend != ' ') kend++;
+                        size_t klen = (size_t)(kend - rest);
+                        char *kind = arena_strndup(mp.arena, rest, klen);
+
+                        if (strcmp(kind, "private_ranges") == 0) {
+                            AstNode *rule = ast_new(mp.arena, AST_CAP_DENY_RANGE, rloc);
+                            rule->is_mut = false;
+                            rule->name = intern_get(mp.intern, "private_ranges", 14);
+                            ac_list = ast_append(ac_list, rule);
+                        } else if (strcmp(kind, "endpoint") == 0) {
+                            AstNode *rule = ast_new(mp.arena, AST_CAP_ENDPOINT_RULE, rloc);
+                            rule->is_mut = false;
+                            const char *q1 = strchr(kend, '"');
+                            if (q1) { q1++;
+                                const char *q2 = strchr(q1, '"');
+                                if (q2) {
+                                    char *val = arena_strndup(mp.arena, q1, (size_t)(q2 - q1));
+                                    rule->name = intern_get(mp.intern, val, strlen(val));
+                                }
+                            }
+                            ac_list = ast_append(ac_list, rule);
+                        } else if (strcmp(kind, "path") == 0) {
+                            AstNode *rule = ast_new(mp.arena, AST_CAP_PATH_RULE, rloc);
+                            rule->is_mut = false;
+                            const char *q1 = strchr(kend, '"');
+                            if (q1) { q1++;
+                                const char *q2 = strchr(q1, '"');
+                                if (q2) {
+                                    char *val = arena_strndup(mp.arena, q1, (size_t)(q2 - q1));
+                                    rule->name = intern_get(mp.intern, val, strlen(val));
+                                }
+                            }
+                            ac_list = ast_append(ac_list, rule);
+                        } else if (strcmp(kind, "binary") == 0) {
+                            AstNode *rule = ast_new(mp.arena, AST_CAP_BINARY_RULE, rloc);
+                            rule->is_mut = false;
+                            const char *q1 = strchr(kend, '"');
+                            if (q1) { q1++;
+                                const char *q2 = strchr(q1, '"');
+                                if (q2) {
+                                    char *val = arena_strndup(mp.arena, q1, (size_t)(q2 - q1));
+                                    rule->name = intern_get(mp.intern, val, strlen(val));
+                                }
+                            }
+                            ac_list = ast_append(ac_list, rule);
+                        } else {
+                            md_error_fmt(&mp, "unknown deny rule kind in access_control: %s", kind);
+                        }
+                    } else if (md_starts_with(actrimmed, "default:")) {
+                        const char *dv = md_trim(mp.arena, actrimmed + 8);
+                        AstNode *def = ast_new(mp.arena, AST_CAP_DEFAULT, rloc);
+                        def->is_mut = (strcmp(dv, "allow") == 0);
+                        ac_list = ast_append(ac_list, def);
+                    } else {
+                        md_error_fmt(&mp,
+                            "expected 'allow', 'deny', or 'default:' in access_control, got: %s",
+                            actrimmed);
+                    }
                 }
-                /* TODO: access_control parsing not yet implemented for markdown */
+
+                /* Wrap all access control rules into capability nodes per subsection */
+                if (ac_list) {
+                    /* Store as a single access_control field containing all rules */
+                    AstNode *ac_field = ast_new(mp.arena, AST_FIELD, acloc);
+                    ac_field->name = arena_strdup(mp.arena, "access_control");
+                    AstNode *ac_block = ast_new(mp.arena, AST_BLOCK, acloc);
+                    ac_block->params = ac_list;
+                    ac_field->right = ac_block;
+                    members = ast_append(members, ac_field);
+                }
+                break;
+            }
+            case MD_SECTION_CAPABILITY_DECL: {
+                /* Extract capability name from "capability <name>" */
+                const char *cap_decl_name = section_name + 11; /* skip "capability " */
+                AstNode *cap_decl = md_parse_capability_decl(&mp, cap_decl_name);
+                if (cap_decl) {
+                    /* Add as top-level declaration on program, not inside agent */
+                    /* We store in a temporary list and attach later */
+                    members = ast_append(members, cap_decl);
+                }
+                break;
+            }
+            case MD_SECTION_TAINT: {
+                AstNode *taint_list = md_parse_taint(&mp);
+                /* Add each taint as a member of the agent (like capabilities) */
+                while (taint_list) {
+                    AstNode *next = taint_list->next;
+                    taint_list->next = NULL;
+                    members = ast_append(members, taint_list);
+                    taint_list = next;
+                }
                 break;
             }
             case MD_SECTION_SKILLS: {
@@ -1360,14 +2333,61 @@ AstNode *parse_lceron_md(const char *filename, const char *source, size_t source
                 sk_arr->params = sk_elems;
                 sk_field->right = sk_arr;
                 members = ast_append(members, sk_field);
+
+                /* Emit a note for each listed skill — they must be defined externally */
+                if (sk_elems) {
+                    AstNode *sk_elem = sk_elems;
+                    while (sk_elem) {
+                        SourceLoc snloc = sk_elem->loc;
+                        report_warning(mp.reporter, snloc,
+                            "skill listed in markdown must be defined in a "
+                            ".lceron file or package",
+                            "verify that this skill is defined and importable");
+                        sk_elem = sk_elem->next;
+                    }
+                }
                 break;
             }
-            case MD_SECTION_UNKNOWN:
-                /* Unknown section — skip until next ## */
+            case MD_SECTION_HEALTH: {
+                AstNode *health = md_parse_health(&mp);
+                if (health) top_level = ast_append(top_level, health);
+                break;
+            }
+            case MD_SECTION_METRICS: {
+                AstNode *metrics = md_parse_metrics(&mp);
+                if (metrics) top_level = ast_append(top_level, metrics);
+                break;
+            }
+            case MD_SECTION_SIGNAL: {
+                AstNode *sig = md_parse_signal(&mp);
+                if (sig) top_level = ast_append(top_level, sig);
+                break;
+            }
+            case MD_SECTION_PROGRESS: {
+                AstNode *prog_node = md_parse_progress(&mp);
+                if (prog_node) top_level = ast_append(top_level, prog_node);
+                break;
+            }
+            case MD_SECTION_SUPERVISOR: {
+                AstNode *sup = md_parse_supervisor(&mp, section_name_orig);
+                if (sup) top_level = ast_append(top_level, sup);
+                break;
+            }
+            case MD_SECTION_UNKNOWN: {
+                /* Unknown section — warn and skip until next ## */
+                SourceLoc wloc = md_loc(&mp);
+                wloc.line = mp.line > 0 ? mp.line - 1 : mp.line;
+                report_warning_fmt(mp.reporter, wloc,
+                    "supported sections: capabilities, model, budget, guards, tools, "
+                    "memory, knowledge, endpoint, api_key, entropy_budget, "
+                    "access_control, skills",
+                    "unrecognized section '## %s' -- section will be ignored",
+                    section_name);
                 while (!md_at_end(&mp) && !md_at_section_boundary(&mp, 2)) {
                     md_read_line(&mp);
                 }
                 break;
+            }
             case MD_SECTION_NONE:
                 break;
             }
@@ -1400,6 +2420,9 @@ AstNode *parse_lceron_md(const char *filename, const char *source, size_t source
 
     agent->params = members;
     agent->left = fns;
+
+    /* Chain: agent first, then top-level declarations (health, metrics, etc.) */
+    agent->next = top_level;
 
     program->params = agent;
     return program;

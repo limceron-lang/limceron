@@ -467,6 +467,9 @@ typedef enum {
     /* Health probe declaration */
     AST_HEALTH,              /* health { ready: expr, live: expr, port: N } */
 
+    /* Signal handler declaration */
+    AST_SIGNAL,              /* signal SIGTERM { handler_body } */
+
     AST_COUNT
 } AstKind;
 
