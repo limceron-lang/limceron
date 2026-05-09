@@ -688,21 +688,24 @@ typedef enum {
     LCN_ARCH_UNKNOWN = 0,
     LCN_ARCH_X86_64,
     LCN_ARCH_AARCH64,
-    LCN_ARCH_ARM
+    LCN_ARCH_ARM,
+    LCN_ARCH_WASM32   /* WebAssembly 32-bit (multi-tenant SaaS target) */
 } LcnArch;
 
 typedef enum {
     LCN_OS_UNKNOWN = 0,
     LCN_OS_LINUX,
     LCN_OS_DARWIN,
-    LCN_OS_WINDOWS
+    LCN_OS_WINDOWS,
+    LCN_OS_WASI       /* WebAssembly System Interface (preview2 / wasip2) */
 } LcnOS;
 
 typedef enum {
     LCN_ABI_NONE = 0,
     LCN_ABI_GNU,
     LCN_ABI_MUSL,
-    LCN_ABI_MSVC
+    LCN_ABI_MSVC,
+    LCN_ABI_PREVIEW2  /* WASI preview 2 with Component Model */
 } LcnABI;
 
 typedef struct {

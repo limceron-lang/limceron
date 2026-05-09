@@ -18,6 +18,7 @@ const char *lcn_arch_str(LcnArch arch) {
     case LCN_ARCH_X86_64:  return "x86_64";
     case LCN_ARCH_AARCH64: return "aarch64";
     case LCN_ARCH_ARM:     return "arm";
+    case LCN_ARCH_WASM32:  return "wasm32";
     default:               return "unknown";
     }
 }
@@ -27,16 +28,18 @@ const char *lcn_os_str(LcnOS os) {
     case LCN_OS_LINUX:   return "linux";
     case LCN_OS_DARWIN:  return "darwin";
     case LCN_OS_WINDOWS: return "windows";
+    case LCN_OS_WASI:    return "wasi";
     default:             return "unknown";
     }
 }
 
 const char *lcn_abi_str(LcnABI abi) {
     switch (abi) {
-    case LCN_ABI_GNU:  return "gnu";
-    case LCN_ABI_MUSL: return "musl";
-    case LCN_ABI_MSVC: return "msvc";
-    default:           return "";
+    case LCN_ABI_GNU:      return "gnu";
+    case LCN_ABI_MUSL:     return "musl";
+    case LCN_ABI_MSVC:     return "msvc";
+    case LCN_ABI_PREVIEW2: return "preview2";
+    default:               return "";
     }
 }
 
@@ -57,6 +60,8 @@ static LcnArch parse_arch(const char *s, size_t len) {
         return LCN_ARCH_AARCH64;
     if (len == 3 && strncmp(s, "arm", 3) == 0)
         return LCN_ARCH_ARM;
+    if (len == 6 && strncmp(s, "wasm32", 6) == 0)
+        return LCN_ARCH_WASM32;
     return LCN_ARCH_UNKNOWN;
 }
 
@@ -66,6 +71,9 @@ static LcnOS parse_os(const char *s, size_t len) {
     if (len == 5 && strncmp(s, "macos", 5) == 0) return LCN_OS_DARWIN;
     if (len == 7 && strncmp(s, "windows", 7) == 0) return LCN_OS_WINDOWS;
     if (len == 5 && strncmp(s, "win32", 5) == 0) return LCN_OS_WINDOWS;
+    /* WASI variants: bare "wasi" plus the preview labels we accept on the OS slot. */
+    if (len == 4 && strncmp(s, "wasi", 4) == 0) return LCN_OS_WASI;
+    if (len == 7 && strncmp(s, "wasip2", 6) == 0) return LCN_OS_WASI; /* tolerate "wasip2" in OS slot */
     return LCN_OS_UNKNOWN;
 }
 
@@ -73,6 +81,7 @@ static LcnABI parse_abi(const char *s, size_t len) {
     if (len == 3 && strncmp(s, "gnu", 3) == 0) return LCN_ABI_GNU;
     if (len == 4 && strncmp(s, "musl", 4) == 0) return LCN_ABI_MUSL;
     if (len == 4 && strncmp(s, "msvc", 4) == 0) return LCN_ABI_MSVC;
+    if (len == 8 && strncmp(s, "preview2", 8) == 0) return LCN_ABI_PREVIEW2;
     return LCN_ABI_NONE;
 }
 
@@ -114,6 +123,7 @@ LcnTarget lcn_parse_target(const char *triple) {
     if (t.abi == LCN_ABI_NONE) {
         if (t.os == LCN_OS_LINUX)   t.abi = LCN_ABI_GNU;
         if (t.os == LCN_OS_WINDOWS) t.abi = LCN_ABI_MSVC;
+        if (t.os == LCN_OS_WASI)    t.abi = LCN_ABI_PREVIEW2;
     }
 
     /* Rebuild canonical triple string */
@@ -142,6 +152,11 @@ LcnTarget lcn_parse_target(const char *triple) {
         break;
     case LCN_OS_WINDOWS:
         snprintf(t.ldflags, sizeof(t.ldflags), "-lws2_32");
+        break;
+    case LCN_OS_WASI:
+        /* WASM emit pipeline doesn't use C compiler/linker — handled by ir_emit_wasm.c */
+        t.cflags[0] = '\0';
+        t.ldflags[0] = '\0';
         break;
     default:
         break;
@@ -216,6 +231,17 @@ static bool command_exists(const char *cmd) {
 bool lcn_find_cross_cc(LcnTarget *target) {
     if (!target || target->arch == LCN_ARCH_UNKNOWN || target->os == LCN_OS_UNKNOWN)
         return false;
+
+    /* WASM target uses wat2wasm pipeline, not a C cross-compiler. The build
+     * driver handles WASM specially via emit_wasm() — return true with a
+     * sentinel cc string so the driver knows the target is reachable. */
+    if (target->arch == LCN_ARCH_WASM32 && target->os == LCN_OS_WASI) {
+        if (command_exists("wat2wasm")) {
+            snprintf(target->cc, sizeof(target->cc), "wat2wasm");
+            return true;
+        }
+        return false;
+    }
 
     /* Check if native — just use "cc" */
     LcnTarget native = lcn_native_target();

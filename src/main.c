@@ -704,6 +704,21 @@ static int cmd_build(const char *input, const char *output, const char *argv0,
         fprintf(stderr, "  Type check: OK\n");
     }
 
+    /* 4a. WASM branch — fork before C codegen. The wasm flow:
+     *     program (AST) -> ir_emit_wasm.c writes .wat -> wat2wasm produces .wasm
+     *     We also emit a sibling .wit when capabilities are declared.
+     *     ir_emit_wasm.c stub returns -1 today; agent A fills it in. */
+    if (target && target->arch == LCN_ARCH_WASM32 && target->os == LCN_OS_WASI) {
+        extern int lcn_emit_wasm(AstNode *program, const char *input,
+                                 const char *output, Arena *arena,
+                                 const LcnTarget *target);
+        int rc = lcn_emit_wasm(program, input, output, &ast_arena, target);
+        arena_free(&source_arena);
+        arena_free(&intern_arena);
+        arena_free(&ast_arena);
+        return rc;
+    }
+
     /* 4. Generate C (build mode — uses #include "lcn_runtime.h") */
     char *c_code;
     if (serve_mode)

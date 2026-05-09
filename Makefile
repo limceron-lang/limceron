@@ -80,6 +80,7 @@ endif
 S0_SRCS    := $(S0_SRC)/arena.c $(S0_SRC)/lexer.c $(S0_SRC)/parser.c \
               $(S0_SRC)/markdown.c $(S0_SRC)/typecheck.c $(S0_SRC)/codegen.c \
               $(S0_SRC)/ir_gen.c $(S0_SRC)/ir_emit_arm64.c $(S0_SRC)/ir_emit_x86.c \
+              $(S0_SRC)/ir_emit_wasm.c \
               $(S0_SRC)/lsp.c $(S0_SRC)/package.c \
               $(S0_SRC)/target.c $(S0_SRC)/security.c $(S0_SRC)/main.c
 S0_OBJS    := $(patsubst $(S0_SRC)/%.c,build/stage0/%.o,$(S0_SRCS))
