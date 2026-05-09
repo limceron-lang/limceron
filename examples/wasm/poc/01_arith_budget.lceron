@@ -1,0 +1,23 @@
+// 01_arith_budget.lceron — WASM PoC sample: pure arithmetic
+//
+// Exercises arithmetic + comparisons + return.
+// No I/O, no LLM, no DB.
+// Expected to return 42.
+
+agent ArithBudget {
+    capabilities: [data.read]
+    budget: { max_tokens: 100, max_cost: 0.01 }
+
+    fn within_budget(used: int, cap: int) -> bool {
+        used <= cap
+    }
+
+    fn double(x: int) -> int {
+        x * 2
+    }
+
+    fn main() -> int {
+        let a = double(21)
+        if within_budget(a, 100) { a } else { 0 }
+    }
+}

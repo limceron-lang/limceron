@@ -80,7 +80,7 @@ endif
 S0_SRCS    := $(S0_SRC)/arena.c $(S0_SRC)/lexer.c $(S0_SRC)/parser.c \
               $(S0_SRC)/markdown.c $(S0_SRC)/typecheck.c $(S0_SRC)/codegen.c \
               $(S0_SRC)/ir_gen.c $(S0_SRC)/ir_emit_arm64.c $(S0_SRC)/ir_emit_x86.c \
-              $(S0_SRC)/ir_emit_wasm.c \
+              $(S0_SRC)/ir_emit_wasm.c $(S0_SRC)/wit_emit.c \
               $(S0_SRC)/lsp.c $(S0_SRC)/package.c \
               $(S0_SRC)/target.c $(S0_SRC)/security.c $(S0_SRC)/main.c
 S0_OBJS    := $(patsubst $(S0_SRC)/%.c,build/stage0/%.o,$(S0_SRCS))
@@ -110,7 +110,8 @@ BUILD_DIR  := build
 # ============================================================
 
 .PHONY: all bootstrap stage0 stage1 stage1-build stage2 stage2-build verify clean install test test-stage0 \
-        test-ir test-stage1 test-parity test-multifile test-bootstrap lex parse emit build-lceron run runtime dashboard
+        test-ir test-stage1 test-parity test-multifile test-bootstrap lex parse emit build-lceron run runtime dashboard \
+        poc-wasm
 
 all: stage0
 
@@ -310,3 +311,77 @@ build/stage0:
 
 build/runtime:
 	mkdir -p build/runtime
+
+# ============================================================
+# WASM PoC: build samples in examples/wasm/poc/ to shared handoff dir
+# ============================================================
+
+POC_HANDOFF      := /Users/mikelcarozzi/Documents/poc-handoff
+POC_ARTIFACTS    := $(POC_HANDOFF)/artifacts
+POC_SAMPLES_DIR  := examples/wasm/poc
+POC_TARGET       := wasm32-wasi-preview2
+
+# ANSI color codes
+POC_C_RESET := \033[0m
+POC_C_GREEN := \033[32m
+POC_C_RED   := \033[31m
+POC_C_YEL   := \033[33m
+POC_C_CYAN  := \033[36m
+POC_C_BOLD  := \033[1m
+
+poc-wasm: $(S0_BIN)
+	@mkdir -p "$(POC_ARTIFACTS)"
+	@samples="$$(ls $(POC_SAMPLES_DIR)/*.lceron 2>/dev/null || true)"; \
+	if [ -z "$$samples" ]; then \
+		printf "$(POC_C_YEL)[poc-wasm]$(POC_C_RESET) no samples found in $(POC_SAMPLES_DIR) — waiting on agent C\n"; \
+		exit 0; \
+	fi; \
+	printf "$(POC_C_BOLD)$(POC_C_CYAN)=== Limceron WASM PoC build ===$(POC_C_RESET)\n"; \
+	printf "  target:      %s\n" "$(POC_TARGET)"; \
+	printf "  out:         %s\n" "$(POC_ARTIFACTS)"; \
+	printf "  samples dir: %s\n\n" "$(POC_SAMPLES_DIR)"; \
+	ts="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+	manifest="$(POC_ARTIFACTS)/manifest.json"; \
+	printf '{\n  "build_timestamp": "%s",\n  "target": "%s",\n  "artifacts": [\n' "$$ts" "$(POC_TARGET)" > "$$manifest"; \
+	first=1; ok=0; fail=0; \
+	for src in $$samples; do \
+		base="$$(basename "$$src" .lceron)"; \
+		out="$(POC_ARTIFACTS)/$$base.wasm"; \
+		printf "  [%s] compiling…\n" "$$base"; \
+		if ./$(S0_BIN) build "$$src" -o "$$out" --target $(POC_TARGET) > /tmp/poc-wasm-$$base.log 2>&1; then \
+			if [ -f "$$out" ]; then \
+				size="$$(wc -c < "$$out" | tr -d ' ')"; \
+				if command -v wasm-validate >/dev/null 2>&1; then \
+					if wasm-validate "$$out" > /tmp/poc-wasm-$$base.validate 2>&1; then \
+						vstatus="valid"; \
+						printf "    $(POC_C_GREEN)OK$(POC_C_RESET)        %s  (%s bytes)\n" "$$out" "$$size"; \
+						ok=$$((ok + 1)); \
+					else \
+						vstatus="invalid"; \
+						printf "    $(POC_C_RED)INVALID$(POC_C_RESET)   %s  (%s bytes)\n" "$$out" "$$size"; \
+						printf "    %s\n" "$$(head -1 /tmp/poc-wasm-$$base.validate)"; \
+						fail=$$((fail + 1)); \
+					fi; \
+				else \
+					vstatus="unchecked"; \
+					printf "    $(POC_C_YEL)BUILT$(POC_C_RESET)     %s  (%s bytes, wasm-validate not installed)\n" "$$out" "$$size"; \
+					ok=$$((ok + 1)); \
+				fi; \
+				sha="$$(shasum -a 256 "$$out" | awk '{print $$1}')"; \
+				if [ $$first -eq 1 ]; then first=0; else printf ',\n' >> "$$manifest"; fi; \
+				printf '    {\n      "filename": "%s.wasm",\n      "size": %s,\n      "sha256": "%s",\n      "source": "%s",\n      "validation": "%s",\n      "build_timestamp": "%s"\n    }' "$$base" "$$size" "$$sha" "$$src" "$$vstatus" "$$ts" >> "$$manifest"; \
+			else \
+				printf "    $(POC_C_RED)NO OUTPUT$(POC_C_RESET) %s — compiler did not produce file\n" "$$src"; \
+				printf "    %s\n" "$$(tail -1 /tmp/poc-wasm-$$base.log 2>/dev/null)"; \
+				fail=$$((fail + 1)); \
+			fi; \
+		else \
+			printf "    $(POC_C_RED)FAIL$(POC_C_RESET)      %s\n" "$$src"; \
+			printf "    %s\n" "$$(tail -1 /tmp/poc-wasm-$$base.log 2>/dev/null)"; \
+			fail=$$((fail + 1)); \
+		fi; \
+	done; \
+	printf '\n  ]\n}\n' >> "$$manifest"; \
+	printf "\n$(POC_C_BOLD)Summary:$(POC_C_RESET) "; \
+	printf "$(POC_C_GREEN)%d ok$(POC_C_RESET), $(POC_C_RED)%d failed$(POC_C_RESET)\n" "$$ok" "$$fail"; \
+	printf "  manifest: %s\n" "$$manifest"
