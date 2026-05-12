@@ -49,6 +49,7 @@ const char *ast_kind_name(AstKind kind) {
         [AST_BINARY]        = "Binary",
         [AST_UNARY]         = "Unary",
         [AST_CALL]          = "Call",
+        [AST_HOST_CALL]     = "HostCall",
         [AST_FIELD_ACCESS]  = "FieldAccess",
         [AST_INDEX]         = "Index",
         [AST_METHOD_CALL]   = "MethodCall",
@@ -746,9 +747,36 @@ static AstNode *parse_expr(Parser *p, Precedence min_prec) {
 
             /* Method call: expr.method(args) */
             if (parser_match(p, TOK_LPAREN)) {
-                AstNode *node = ast_new(p->arena, AST_METHOD_CALL, loc);
+                /* Host-call detection: when the left-hand side is a bare
+                 * identifier matching a capability namespace (llm, http, kb,
+                 * data, mcp), lower to AST_HOST_CALL so the IR backend can
+                 * emit a `(import "vdag:<ns>" "<fn>" ...)` declaration and
+                 * marshal arguments through the buffer-protocol ABI defined
+                 * by Visual-DAG's host imports (see imports.go). */
+                bool is_host_ns = false;
+                if (left && left->kind == AST_IDENT && left->name) {
+                    const char *ns = left->name;
+                    is_host_ns = (strcmp(ns, "llm")  == 0 ||
+                                  strcmp(ns, "http") == 0 ||
+                                  strcmp(ns, "kb")   == 0 ||
+                                  strcmp(ns, "data") == 0 ||
+                                  strcmp(ns, "mcp")  == 0);
+                }
+                AstNode *node = ast_new(p->arena,
+                                         is_host_ns ? AST_HOST_CALL : AST_METHOD_CALL,
+                                         loc);
                 node->left = left;
-                node->name = field;
+                if (is_host_ns) {
+                    /* For host calls store the qualified name "ns.fn" in
+                     * ->name so downstream passes have a single string key
+                     * matching CapXxx identifiers in imports.go. */
+                    size_t nlen = strlen(left->name) + 1 + strlen(field) + 1;
+                    char *qn = (char *)arena_alloc(p->arena, nlen);
+                    snprintf(qn, nlen, "%s.%s", left->name, field);
+                    node->name = qn;
+                } else {
+                    node->name = field;
+                }
                 AstNode *args = NULL;
                 while (!parser_check(p, TOK_RPAREN) && !parser_check(p, TOK_EOF)) {
                     AstNode *arg = parse_expr(p, PREC_NONE);

@@ -73,11 +73,44 @@
 #define WASM_MAX_LOCALS       4096
 #define WASM_BUMP_PTR_GLOBAL  "$bump_ptr"
 
+/* Host-call scratch region.
+ *
+ * Host imports follow a buffer-protocol ABI (see imports.go): the caller
+ * passes input ptr/len pairs and an output buffer ptr+max. We carve a
+ * per-call-site slab out of linear memory at a fixed offset above the
+ * static-data area so each call has stable scratch addresses we can
+ * embed as i32 literals.
+ *
+ * Layout per host-call site (1 KiB total):
+ *   [base + 0    .. base + 1024):  primary out-buffer (label, body, etc.)
+ *   [base + 1024 .. base + 1032):  confidence f64 (only used by llm.classify)
+ *   [base + 1032 .. base + 1040):  status i32 / reserved
+ *
+ * We round per-site stride to 1088 bytes so successive sites stay 64-byte
+ * aligned. The base of the scratch region is HOST_SCRATCH_BASE; the
+ * string data segment is positioned below (it grows up from
+ * WASM_DATA_BASE and is bounded by HOST_SCRATCH_BASE). */
+#define WASM_HOST_SCRATCH_BASE   8192
+#define WASM_HOST_SCRATCH_STRIDE 1088
+#define WASM_HOST_OUTBUF_MAX     1024
+#define WASM_MAX_HOST_CALLS      64
+
 typedef struct {
     const char *value;       /* pointer into IR (arena-owned), key for dedup */
     int         offset;      /* byte offset in linear memory */
     int         length;      /* UTF-8 byte length */
 } WasmString;
+
+/* One entry per IR_HOST_CALL site. Each is a tuple of the qualified
+ * capability name plus the linear-memory scratch slot we allocated. The
+ * scratch slot is shared by all call sites with the same qualified
+ * name (they cannot interleave in stage0's sequential model). */
+typedef struct {
+    const char *qualified;   /* e.g. "llm.classify"                  */
+    const char *ns;          /* e.g. "llm" (arena-owned)             */
+    const char *fn;          /* e.g. "classify" (arena-owned)        */
+    int         scratch_off; /* offset of this site's 1 KiB out-buf  */
+} HostCallSite;
 
 typedef struct {
     FILE         *out;
@@ -98,6 +131,10 @@ typedef struct {
 
     /* Total bytes reserved for static data. */
     int           data_total;
+
+    /* Host-call sites (deduped by qualified name). */
+    HostCallSite  host_calls[WASM_MAX_HOST_CALLS];
+    int           host_call_count;
 } EmitCtx;
 
 /* Per-function emission state. */
@@ -190,6 +227,126 @@ static int intern_string(EmitCtx *ctx, const char *s, int *out_len) {
 
     if (out_len) *out_len = slen;
     return bytes_off;
+}
+
+/* ============================================================
+ * Host-call site registration
+ *
+ * Each unique IR_HOST_CALL qualified name (e.g. "llm.classify") gets
+ * one entry. The entry owns a slab of linear memory used as the
+ * out-buffer + confidence/status scratch for every invocation of that
+ * capability. Different capabilities never share a slab so the host
+ * cannot accidentally clobber one call's payload with another's. */
+
+static int host_call_register(EmitCtx *ctx, const char *qualified) {
+    if (!qualified) return -1;
+    int i;
+    for (i = 0; i < ctx->host_call_count; i++) {
+        if (strcmp(ctx->host_calls[i].qualified, qualified) == 0) {
+            return i;
+        }
+    }
+    if (ctx->host_call_count >= WASM_MAX_HOST_CALLS) {
+        fprintf(stderr,
+                "  WASM emit: too many distinct host-call sites (max %d)\n",
+                WASM_MAX_HOST_CALLS);
+        return -1;
+    }
+    /* Split "ns.fn" into ns + fn. We own arena-style copies through the
+     * IR module's arena. */
+    const char *dot = strchr(qualified, '.');
+    if (!dot) return -1;
+    int idx = ctx->host_call_count++;
+    HostCallSite *site = &ctx->host_calls[idx];
+    site->qualified = arena_strdup(ctx->arena, qualified);
+    /* Build ns and fn copies. */
+    size_t ns_len = (size_t)(dot - qualified);
+    char *ns_buf = (char *)arena_alloc(ctx->arena, ns_len + 1);
+    memcpy(ns_buf, qualified, ns_len);
+    ns_buf[ns_len] = '\0';
+    site->ns = ns_buf;
+    site->fn = arena_strdup(ctx->arena, dot + 1);
+    site->scratch_off = WASM_HOST_SCRATCH_BASE
+                        + idx * WASM_HOST_SCRATCH_STRIDE;
+    return idx;
+}
+
+/* Find the registered host-call site by qualified name. Returns NULL if
+ * the call was not pre-registered (which should never happen if the
+ * pre-pass ran). */
+static const HostCallSite *host_call_lookup(EmitCtx *ctx,
+                                             const char *qualified) {
+    int i;
+    if (!qualified) return NULL;
+    for (i = 0; i < ctx->host_call_count; i++) {
+        if (strcmp(ctx->host_calls[i].qualified, qualified) == 0) {
+            return &ctx->host_calls[i];
+        }
+    }
+    return NULL;
+}
+
+/* Pre-pass: walk every IR_HOST_CALL in the module and ensure each
+ * unique qualified name has a registered scratch slot. */
+static void preregister_host_calls(EmitCtx *ctx) {
+    IrFunction *fn;
+    for (fn = ctx->module->functions; fn; fn = fn->next) {
+        IrBasicBlock *bb;
+        for (bb = fn->entry; bb; bb = bb->next) {
+            IrInst *inst;
+            for (inst = bb->first; inst; inst = inst->next) {
+                if (inst->op == IR_HOST_CALL && inst->fn_name) {
+                    (void)host_call_register(ctx, inst->fn_name);
+                }
+            }
+        }
+    }
+}
+
+/* Emit the `(import "vdag:<ns>" "<fn>" (func ...))` declarations for
+ * every registered host call. Must run BEFORE any (func ...) body in
+ * the module — the WAT grammar requires imports first. */
+static void emit_host_imports(EmitCtx *ctx) {
+    int i;
+    if (ctx->host_call_count == 0) return;
+    fprintf(ctx->out, "  ;; --- host imports (%d) ---\n",
+            ctx->host_call_count);
+    for (i = 0; i < ctx->host_call_count; i++) {
+        const HostCallSite *s = &ctx->host_calls[i];
+        /* Per-capability signature — must match imports.go exactly.
+         * The Limceron compiler currently supports the llm.classify
+         * shape; other capabilities are emitted as their declared
+         * ABI but only llm.classify is exercised by 05_host_call. */
+        const char *param_list;
+        if (strcmp(s->qualified, "llm.classify") == 0) {
+            /* (text_ptr, text_len, label_buf, label_max, conf_out) */
+            param_list = "(param i32 i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "llm.chat") == 0) {
+            /* (prompt, prompt_len, system, system_len, out_buf, out_max) */
+            param_list = "(param i32 i32 i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "http.fetch") == 0) {
+            /* (url, url_len, method, method_len, body, body_len,
+             *  out_buf, out_max, status_out) */
+            param_list = "(param i32 i32 i32 i32 i32 i32 i32 i32 i32) "
+                         "(result i32)";
+        } else if (strcmp(s->qualified, "kb.search") == 0) {
+            /* (coll, coll_len, q, q_len, top_k, out_buf, out_max) */
+            param_list = "(param i32 i32 i32 i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "data.read") == 0) {
+            /* (query, query_len, params, params_len, out_buf, out_max) */
+            param_list = "(param i32 i32 i32 i32 i32 i32) (result i32)";
+        } else {
+            /* Unknown capability: emit a 4-arg/i32-result placeholder so
+             * the wasm at least validates. wazero will fail to link the
+             * unknown import, which is the correct failure mode. */
+            param_list = "(param i32 i32 i32 i32) (result i32)";
+        }
+        fprintf(ctx->out,
+                "  (import \"vdag:%s\" \"%s\""
+                " (func $hi_%s_%s %s))\n",
+                s->ns, s->fn, s->ns, s->fn, param_list);
+    }
+    fprintf(ctx->out, "\n");
 }
 
 /* ============================================================
@@ -606,6 +763,138 @@ static void emit_instruction(FnCtx *fctx, IrBasicBlock *bb, IrInst *inst) {
         break;
     }
 
+    case IR_HOST_CALL: {
+        /* Host-call lowering.
+         *
+         * The buffer-protocol ABI (see imports.go) is built around
+         * (ptr, len) input pairs and a (ptr, max) output pair, plus a
+         * scalar status slot for some capabilities (confidence f64 for
+         * llm.classify, status i32 for http.fetch). The pre-pass
+         * (preregister_host_calls) gave us a stable scratch base for
+         * this site; the per-capability marshalling below pushes the
+         * appropriate set of i32 operands and then calls the imported
+         * function.
+         *
+         * The host fn returns an i32: positive = bytes written into
+         * the out buffer, negative = HostErr* code. We sign-extend
+         * into the i64 SSA slot the IR allocated for us so the value
+         * composes with the rest of Limceron's integer math without
+         * an explicit cast.
+         */
+        const char *qname = inst->fn_name ? inst->fn_name : "?";
+        const HostCallSite *s = host_call_lookup(fctx->gctx, qname);
+        if (!s) {
+            /* Should never happen: pre-pass registers every site. */
+            fprintf(out,
+                    "      ;; UNRESOLVED host call %s -- emitting drop\n",
+                    qname);
+            fprintf(out, "      i64.const -1\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        }
+
+        int out_buf = s->scratch_off;
+        int conf_off = s->scratch_off + WASM_HOST_OUTBUF_MAX;
+        int status_off = conf_off + 8;
+        (void)status_off;
+
+        if (strcmp(qname, "llm.classify") == 0 &&
+            inst->call_arg_count >= 1) {
+            /* (text_ptr, text_len, label_buf, label_max, conf_out) */
+            int text_arg = inst->call_args[0];
+            emit_get_value(fctx, text_arg);             /* prompt ptr (i32) */
+            emit_get_value(fctx, text_arg);             /* dup for len load */
+            fprintf(out, "      i32.const 4\n");
+            fprintf(out, "      i32.sub\n");
+            fprintf(out, "      i32.load\n");           /* prompt len from prefix */
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      i32.const %d\n", conf_off);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+        } else if (strcmp(qname, "llm.chat") == 0 &&
+                   inst->call_arg_count >= 2) {
+            /* (prompt, prompt_len, system, system_len, out_buf, out_max) */
+            int p_arg = inst->call_args[0];
+            int sys_arg = inst->call_args[1];
+            emit_get_value(fctx, p_arg);
+            emit_get_value(fctx, p_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            emit_get_value(fctx, sys_arg);
+            emit_get_value(fctx, sys_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+        } else if (strcmp(qname, "kb.search") == 0 &&
+                   inst->call_arg_count >= 3) {
+            /* (coll, coll_len, q, q_len, top_k, out_buf, out_max) */
+            int coll_arg = inst->call_args[0];
+            int q_arg = inst->call_args[1];
+            int k_arg = inst->call_args[2];
+            emit_get_value(fctx, coll_arg);
+            emit_get_value(fctx, coll_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            emit_get_value(fctx, q_arg);
+            emit_get_value(fctx, q_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            emit_get_value(fctx, k_arg);
+            /* top_k arrives as i64 in Limceron; truncate to i32. */
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+        } else if (strcmp(qname, "data.read") == 0 &&
+                   inst->call_arg_count >= 2) {
+            /* (query, query_len, params, params_len, out_buf, out_max) */
+            int q_arg = inst->call_args[0];
+            int p_arg = inst->call_args[1];
+            emit_get_value(fctx, q_arg);
+            emit_get_value(fctx, q_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            emit_get_value(fctx, p_arg);
+            emit_get_value(fctx, p_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+        } else if (strcmp(qname, "http.fetch") == 0 &&
+                   inst->call_arg_count >= 3) {
+            /* (url, url_len, method, method_len, body, body_len,
+             *  out_buf, out_max, status_out) */
+            int url_arg = inst->call_args[0];
+            int meth_arg = inst->call_args[1];
+            int body_arg = inst->call_args[2];
+            emit_get_value(fctx, url_arg);
+            emit_get_value(fctx, url_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            emit_get_value(fctx, meth_arg);
+            emit_get_value(fctx, meth_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            emit_get_value(fctx, body_arg);
+            emit_get_value(fctx, body_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      i32.const %d\n", conf_off);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+        } else {
+            /* Unknown / mismatched arity: emit best-effort (push each
+             * arg as-is and trust the import declaration). */
+            int i;
+            for (i = 0; i < inst->call_arg_count; i++) {
+                emit_get_value(fctx, inst->call_args[i]);
+            }
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+        }
+
+        /* Result is i32; the SSA slot is i64. Sign-extend so negative
+         * HostErr* codes propagate correctly through Limceron's
+         * integer comparisons. */
+        fprintf(out, "      i64.extend_i32_s\n");
+        emit_set_value(fctx, inst->id);
+        break;
+    }
+
     case IR_RET: {
         if (inst->operand_count > 0 && inst->operands[0] >= 0) {
             emit_get_value(fctx, inst->operands[0]);
@@ -984,14 +1273,26 @@ static void emit_module(FILE *out, IrModule *mod, EmitCtx *ctx) {
     fprintf(out, ";; Functions: %d\n", mod->fn_count);
     fprintf(out, "(module\n");
 
+    /* Host imports must appear before any other (func ...) declaration
+     * per the WAT grammar. The (import ...) entries map the Limceron
+     * "vdag:<ns>" / "<fn>" pairs to host fns provided by wazero (see
+     * imports.go for the matching wiring). */
+    emit_host_imports(ctx);
+
     /* Linear memory: one 64 KiB page, exported. */
     fprintf(out, "  (memory (export \"memory\") 1)\n");
 
     /* Bump-pointer global for ALLOCA, if any function uses it. We
      * declare it unconditionally -- it's a tiny overhead and keeps
      * the WAT shape stable across modules. The initial value points
-     * just past the static-data area we reserve. */
+     * just past the static-data area AND any host-call scratch
+     * region we reserved. */
     int bump_init = ctx->data_offset > 0 ? ctx->data_offset : WASM_DATA_BASE;
+    if (ctx->host_call_count > 0) {
+        int scratch_end = WASM_HOST_SCRATCH_BASE
+                          + ctx->host_call_count * WASM_HOST_SCRATCH_STRIDE;
+        if (scratch_end > bump_init) bump_init = scratch_end;
+    }
     /* Round up to 16-byte alignment for tidy heap base. */
     bump_init = (bump_init + 15) & ~15;
     fprintf(out, "  (global %s (mut i32) (i32.const %d))\n",
@@ -1020,6 +1321,7 @@ static void emit_module(FILE *out, IrModule *mod, EmitCtx *ctx) {
      * WASI host can run the module. We keep that wrapper minimal.
      */
     int has_main = 0;
+    int has_agent_main = 0;
     for (fn = mod->functions; fn; fn = fn->next) {
         if (!fn->name) continue;
         const char *uname = user_name_for(fn->name);
@@ -1030,6 +1332,17 @@ static void emit_module(FILE *out, IrModule *mod, EmitCtx *ctx) {
                     fn->name, fn->name);
         }
         if (strcmp(uname, "main") == 0) has_main = 1;
+        if (strcmp(uname, "agent_main") == 0) has_agent_main = 1;
+    }
+
+    /* Agent runtime ABI: Visual-DAG's TestReactLoopE2E invokes wazero
+     * with EntryPoint="agent_main", so for every agent-scoped `fn main`
+     * we also expose an `agent_main` export aliasing `lcn_main`. The
+     * Limceron trampoline (irgen_emit_main_trampoline) makes lcn_main
+     * the canonical entrypoint regardless of the original agent's name.
+     */
+    if (has_main && !has_agent_main) {
+        fprintf(out, "  (export \"agent_main\" (func $lcn_main))\n");
     }
 
     /* Optional WASI _start wrapper. We only emit it if `main` exists
@@ -1108,6 +1421,7 @@ int lcn_emit_wasm(AstNode *program, const char *input,
     /* Pre-passes. */
     scan_module_features(&ctx);
     preintern_strings(&ctx);
+    preregister_host_calls(&ctx);
     ctx.data_total = ctx.data_offset;
 
     /* 3. Open temp .wat file. */

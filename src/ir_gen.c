@@ -63,6 +63,7 @@ const char *ir_opcode_name(IrOpcode op) {
     case IR_LOAD:         return "load";
     case IR_STORE:        return "store";
     case IR_CALL:         return "call";
+    case IR_HOST_CALL:    return "host_call";
     case IR_RET:          return "ret";
     case IR_BR:           return "br";
     case IR_JMP:          return "jmp";
@@ -258,6 +259,29 @@ int ir_emit_call(IrFunction *fn, IrModule *mod, const char *callee,
                  IrType ret_type, int *args, int arg_count) {
     IrInst *inst = ir_inst_new(fn, mod, IR_CALL, ret_type);
     inst->fn_name = arena_strdup(mod->arena, callee);
+    int i;
+    for (i = 0; i < arg_count && i < 16; i++)
+        inst->call_args[i] = args[i];
+    inst->call_arg_count = arg_count;
+    return inst->id;
+}
+
+/* Emit a host-call instruction.
+ *
+ * `qualified_name` is the dotted capability identifier ("llm.classify",
+ * "http.fetch", ...). The IR backend (ir_emit_wasm.c) splits it on the
+ * '.' to derive both the import module name ("vdag:llm") and the
+ * function name ("classify"); see imports.go for the per-capability ABI.
+ *
+ * The return value of a host call is always int (the i32 status / byte
+ * count returned by the wazero host fn). We model it as IR_TYPE_I64
+ * so it composes with the rest of Limceron's integer arithmetic without
+ * extra casts. */
+int ir_emit_host_call(IrFunction *fn, IrModule *mod,
+                       const char *qualified_name,
+                       int *args, int arg_count) {
+    IrInst *inst = ir_inst_new(fn, mod, IR_HOST_CALL, IR_TYPE_I64);
+    inst->fn_name = arena_strdup(mod->arena, qualified_name);
     int i;
     for (i = 0; i < arg_count && i < 16; i++)
         inst->call_args[i] = args[i];
@@ -718,6 +742,25 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
 
     case AST_CALL:
         return irgen_call(ctx, expr);
+
+    case AST_HOST_CALL: {
+        /* Host-call lowering. The qualified name is stored in expr->name
+         * (set by the parser, e.g. "llm.classify"). Args are in
+         * expr->params. We lower each argument expression to an SSA
+         * value and emit IR_HOST_CALL; the WASM backend marshals each
+         * arg according to the per-capability ABI documented in
+         * imports.go. */
+        int args[16];
+        int arg_count = 0;
+        AstNode *arg_node;
+        for (arg_node = expr->params; arg_node && arg_count < 16;
+             arg_node = arg_node->next) {
+            args[arg_count++] = irgen_expr(ctx, arg_node);
+        }
+        const char *qname = expr->name ? expr->name : "unknown.unknown";
+        return ir_emit_host_call(ctx->current_fn, ctx->mod, qname,
+                                  args, arg_count);
+    }
 
     case AST_CAST: {
         int val = irgen_expr(ctx, expr->left);
@@ -1561,6 +1604,19 @@ static void ir_print_inst(IrInst *inst, IrFunction *fn, FILE *out) {
             fprintf(out, "call void @%s(",
                     inst->fn_name ? inst->fn_name : "???");
         }
+        int i;
+        for (i = 0; i < inst->call_arg_count; i++) {
+            if (i > 0) fprintf(out, ", ");
+            ir_print_value(inst->call_args[i], out);
+        }
+        fprintf(out, ")\n");
+        break;
+    }
+
+    case IR_HOST_CALL: {
+        fprintf(out, "%%%d = host_call %s @\"%s\"(",
+                inst->id, ir_type_name(inst->type),
+                inst->fn_name ? inst->fn_name : "???");
         int i;
         for (i = 0; i < inst->call_arg_count; i++) {
             if (i > 0) fprintf(out, ", ");

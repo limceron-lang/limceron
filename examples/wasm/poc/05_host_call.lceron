@@ -1,0 +1,75 @@
+// 05_host_call.lceron — WASM PoC sample: ReAct loop with a REAL host call
+//
+// Mirrors the structure of 04_react_loop.lceron, but the reason() stage
+// now invokes the runtime-provided capability `llm.classify` via the
+// dotted-namespace host-call syntax. The Limceron compiler lowers
+// `llm.classify(prompt)` to an `(import "vdag:llm" "classify" ...)`
+// declaration and the buffer-protocol ABI documented in
+// Visual-DAG/internal/nodes/code/imports.go.
+//
+// The host-call return value is an i32 whose magnitude is the byte
+// length of the label written into the call-site's scratch buffer
+// (and whose sign distinguishes success from a HostErr* code). We use
+// that integer as the "signal" the act/observe stages route on, which
+// keeps this sample faithful to the wider ReAct shape while staying
+// inside Limceron's current type system (strings flowing through the
+// language are still a stage-1 problem).
+//
+// Verdict mapping (returned by main / agent_main):
+//   2 = ESCALATE   (label length >= 8)
+//   1 = PROCEED    (label length in [3,7])
+//   0 = ABORT      (label length in [0,2])
+//  -1 = host error (HostErr* propagated as a negative signal)
+//
+// With Visual-DAG's MockClient queued to return "ESCALATE" (8 bytes),
+// reason() yields 8, act() collapses to 2, and observe() preserves it,
+// so agent_main returns 2.
+
+agent ReactLoop {
+    capabilities: [llm.classify]
+    budget: { max_tokens: 200, max_cost: 0.02 }
+
+    // Stage 1: "reason" — ask the LLM to classify a fixed prompt. The
+    // returned integer is the label byte count (positive) or a negative
+    // HostErr* code.
+    fn reason() -> int {
+        llm.classify("react-stage1-reason")
+    }
+
+    // Stage 2: "act" — bucket the reason signal into a coarse band.
+    // Negative signals propagate as -1 so observe() can short-circuit
+    // without inventing a verdict from an error.
+    fn act(signal: int) -> int {
+        if signal < 0 {
+            signal
+        } else {
+            if signal >= 8 {
+                2
+            } else {
+                if signal >= 3 {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    // Stage 3: "observe" — collapse the refined band into a terminal
+    // verdict, propagating host errors as -1.
+    fn observe(refined: int, signal: int) -> int {
+        if signal < 0 {
+            -1
+        } else {
+            refined
+        }
+    }
+
+    // main wires the three stages together — the agent_main export the
+    // Visual-DAG runtime invokes via wazero.
+    fn main() -> int {
+        let signal = reason()
+        let refined = act(signal)
+        observe(refined, signal)
+    }
+}

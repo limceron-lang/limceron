@@ -348,6 +348,7 @@ typedef enum {
     AST_BINARY,
     AST_UNARY,
     AST_CALL,
+    AST_HOST_CALL,        /* <namespace>.<fn>(args) — capability-gated host import */
     AST_FIELD_ACCESS,
     AST_INDEX,
     AST_METHOD_CALL,

@@ -577,6 +577,7 @@ static void find_tool_calls_in_expr(AstNode *expr, ToolCallCtx *ctx,
         break;
 
     case AST_METHOD_CALL:
+    case AST_HOST_CALL:
         find_tool_calls_in_expr(expr->left, ctx, on_call, user);
         {
             AstNode *arg = expr->params;
@@ -2260,6 +2261,22 @@ static void check_expr(SymbolTable *st, AstNode *expr,
             }
         }
         break;
+
+    case AST_HOST_CALL: {
+        /* host call: <namespace>.<fn>(args). We don't try to resolve the
+         * left-hand `llm`/`http`/... identifier against the symbol table
+         * (they are not declared as values) — the parser already gated
+         * the namespace prefix. Just walk the arguments. The IR backend
+         * does the final capability/declaration matching against the
+         * enclosing agent's capabilities list and the host module's
+         * import surface (imports.go). */
+        AstNode *arg = expr->params;
+        while (arg) {
+            check_expr(st, arg, reporter, arena);
+            arg = arg->next;
+        }
+        break;
+    }
 
     case AST_INDEX:
         if (!expr->left) {
@@ -3968,6 +3985,27 @@ static void own_check_expr(OwnershipCtx *ctx, AstNode *expr,
         /* Object is used but not moved for method calls */
         own_check_use(ctx, expr->left, reporter);
         /* Check arguments — by value = move */
+        {
+            AstNode *arg;
+            for (arg = expr->params; arg; arg = arg->next) {
+                if (arg->kind == AST_REF) {
+                    own_process_borrow(ctx, arg, reporter);
+                } else {
+                    const char *arg_name = own_expr_ident_name(arg);
+                    if (arg_name) {
+                        own_mark_move(ctx, arg_name, expr->name,
+                                      (int)arg->loc.line, reporter, arg->loc);
+                    }
+                }
+                own_check_expr(ctx, arg, reporter, arena);
+            }
+        }
+        break;
+
+    case AST_HOST_CALL:
+        /* Host calls: the "receiver" is a capability namespace token
+         * (not an owned value), so we don't move it. Args are checked
+         * for borrow/move just like a regular call. */
         {
             AstNode *arg;
             for (arg = expr->params; arg; arg = arg->next) {
