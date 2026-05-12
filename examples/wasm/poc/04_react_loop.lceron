@@ -1,0 +1,90 @@
+// 04_react_loop.lceron — WASM PoC sample: bounded ReAct-style decision pipeline
+//
+// Implements a 3-stage Reason -> Act -> Observe pipeline as an unrolled
+// "loop" (Limceron stage0 has no real loops yet, so each iteration is a
+// sequential `let`/`if` stage).
+//
+// The pipeline scores a candidate "observation" (an integer signal that
+// would, in a real run, come back as the length of an llm.classify out-
+// buffer) and decides between three terminal verdicts:
+//
+//   stage 1 (reason):   classify the raw signal as high / medium / low
+//   stage 2 (act):      based on the bucket, apply a domain-specific
+//                       follow-up question, deriving a refined score
+//   stage 3 (observe):  finalise — escalate / proceed / abort
+//
+// Returns one of {0, 1, 2}:
+//   0 = ABORT       (low-confidence terminal)
+//   1 = PROCEED     (mid-confidence terminal)
+//   2 = ESCALATE    (high-confidence terminal)
+//
+// This compiles and runs end-to-end under wazero. It does NOT call any
+// host import: Limceron stage0 does not yet emit `(import "vdag:llm" ...)`
+// declarations into the compiled WAT, even though the .wit advertises the
+// capability. See ../../../docs (future) for the language-frontend gap.
+//
+// Expected return: 2 (ESCALATE) for the default seed signal of 92.
+
+agent ReactLoop {
+    capabilities: [llm.classify]
+    budget: { max_tokens: 200, max_cost: 0.02 }
+
+    // Stage 1: "reason" — bucket the raw signal into a coarse band.
+    // Returns 0/1/2 for low/medium/high.
+    fn reason(signal: int) -> int {
+        if signal >= 80 {
+            2
+        } else {
+            if signal >= 50 {
+                1
+            } else {
+                0
+            }
+        }
+    }
+
+    // Stage 2: "act" — apply a domain-specific refinement based on the
+    // band identified in stage 1. The refinement function differs per
+    // band; in a real agent each branch would call a different host
+    // capability (e.g. llm.classify with a band-specific prompt).
+    fn act(band: int, signal: int) -> int {
+        if band >= 2 {
+            // High band: confirm with a stricter threshold.
+            if signal >= 90 { 2 } else { 1 }
+        } else {
+            if band >= 1 {
+                // Medium band: nudge up if signal is near the upper edge.
+                if signal >= 70 { 2 } else { 1 }
+            } else {
+                // Low band: most things abort; only very-near-medium
+                // signals are worth a second look.
+                if signal >= 40 { 1 } else { 0 }
+            }
+        }
+    }
+
+    // Stage 3: "observe" — collapse a refined band into a terminal verdict.
+    // For ReAct we treat the act-output as final but apply one last
+    // tie-break against the original signal to guard against flapping.
+    fn observe(refined: int, signal: int) -> int {
+        if refined >= 2 {
+            // Strong recommendation -> ESCALATE, unless signal collapsed.
+            if signal >= 80 { 2 } else { 1 }
+        } else {
+            if refined >= 1 {
+                1
+            } else {
+                0
+            }
+        }
+    }
+
+    // main wires the three stages together. The "loop" is unrolled here:
+    // 3 calls in sequence, each consuming the previous stage's output.
+    fn main() -> int {
+        let signal = 92
+        let band = reason(signal)
+        let refined = act(band, signal)
+        observe(refined, signal)
+    }
+}
