@@ -356,6 +356,11 @@ typedef struct {
     int         scope_depth;
 } IrGenScope;
 
+/* Maximum agent-local fn registry size per IR generation pass.
+ * Sized generously: agents typically have <10 methods, but we keep
+ * a flat array across all agents to simplify lookup. */
+#define IR_GEN_MAX_AGENT_FNS 256
+
 typedef struct {
     IrModule   *mod;
     IrFunction *current_fn;
@@ -367,6 +372,27 @@ typedef struct {
         IrType      ret_type;
     } fn_registry[256];
     int fn_reg_count;
+
+    /* Agent-local function registry: maps unqualified callee name to its
+     * mangled IR symbol when invoked from inside the *same* agent. Calls
+     * resolve through this table FIRST (only while lowering an agent body),
+     * then fall through to the global lcn_<name> resolution. */
+    struct {
+        const char *agent_kebab;  /* the agent this binding belongs to */
+        const char *fn_name;      /* unqualified Limceron name (e.g. "classify") */
+        const char *ir_symbol;    /* mangled IR symbol (e.g. "__lcn_branch_classify_classify") */
+        IrType      ret_type;
+    } agent_fn_registry[IR_GEN_MAX_AGENT_FNS];
+    int agent_fn_reg_count;
+
+    /* Currently-lowering agent kebab (NULL when not inside an agent body).
+     * Used by irgen_call to scope agent-local resolution. */
+    const char *current_agent_kebab;
+
+    /* True once we have emitted an unmangled `lcn_main` wrapper. The
+     * first agent declaring `fn main` wins; later agents emit only the
+     * mangled form and a stderr warning. */
+    bool        has_unmangled_main;
 } IrGenContext;
 
 static void irgen_scope_init(IrGenScope *s) {
@@ -579,6 +605,25 @@ static int irgen_unary(IrGenContext *ctx, AstNode *expr) {
 }
 
 /* Generate IR for a function call */
+/* Look up an unqualified callee inside the current agent's local fn
+ * registry. Returns the mangled IR symbol and writes its return type to
+ * *out_ret_type, or NULL if no binding exists. */
+static const char *irgen_lookup_agent_local(IrGenContext *ctx,
+                                            const char *callee,
+                                            IrType *out_ret_type) {
+    if (!ctx->current_agent_kebab || !callee) return NULL;
+    int i;
+    for (i = 0; i < ctx->agent_fn_reg_count; i++) {
+        if (strcmp(ctx->agent_fn_registry[i].agent_kebab,
+                   ctx->current_agent_kebab) == 0 &&
+            strcmp(ctx->agent_fn_registry[i].fn_name, callee) == 0) {
+            if (out_ret_type) *out_ret_type = ctx->agent_fn_registry[i].ret_type;
+            return ctx->agent_fn_registry[i].ir_symbol;
+        }
+    }
+    return NULL;
+}
+
 static int irgen_call(IrGenContext *ctx, AstNode *expr) {
     /* Get the callee name */
     const char *callee = NULL;
@@ -604,7 +649,16 @@ static int irgen_call(IrGenContext *ctx, AstNode *expr) {
         args[arg_count++] = irgen_expr(ctx, arg_node);
     }
 
-    /* Determine return type from registry */
+    /* If we're lowering an agent body, an unqualified callee that names a
+     * sibling fn in the SAME agent must resolve to the mangled IR symbol. */
+    IrType local_ret = IR_TYPE_VOID;
+    const char *local_sym = irgen_lookup_agent_local(ctx, callee, &local_ret);
+    if (local_sym) {
+        return ir_emit_call(ctx->current_fn, ctx->mod, local_sym,
+                            local_ret, args, arg_count);
+    }
+
+    /* Determine return type from global registry */
     IrType ret_type = irgen_lookup_fn_ret(ctx, callee);
 
     /* Build qualified name: lcn_<name> */
@@ -1009,6 +1063,59 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
  * Top-Level Declaration IR Generation
  * ============================================================ */
 
+/* Lower a fn body with tail-expression-as-return semantics.
+ *
+ * Limceron permits a function body whose last statement is a bare
+ * expression (e.g. `fn double(x) -> int { x * 2 }`); the value of that
+ * expression is the function's return value. ir_emit_wasm requires a
+ * concrete IR_RET with a value operand for non-void fns, so we lower
+ * the trailing expression as `irgen_expr` + `ir_emit_ret(val)` rather
+ * than dropping the value via the default AST_EXPR_STMT path.
+ *
+ * Falls back to `ir_emit_ret_void` when:
+ *   - ret_type is void (any tail expr's value is discarded), or
+ *   - the last stmt is not AST_EXPR_STMT (e.g. it already terminates
+ *     via explicit `return`, or it's an if-statement with returns
+ *     in every branch), and the basic block isn't terminated. */
+static void irgen_fn_body(IrGenContext *ctx, AstNode *body, IrType ret_type) {
+    IrFunction *fn = ctx->current_fn;
+    if (!fn) return;
+
+    AstNode *tail = NULL;
+    if (body && body->kind == AST_BLOCK && ret_type != IR_TYPE_VOID) {
+        for (AstNode *s = body->params; s; s = s->next) {
+            if (!s->next && s->kind == AST_EXPR_STMT && s->left) {
+                tail = s;
+            }
+        }
+    }
+
+    if (body) {
+        if (body->kind == AST_BLOCK) {
+            for (AstNode *s = body->params; s; s = s->next) {
+                if (s == tail) {
+                    int val = irgen_expr(ctx, s->left);
+                    if (val >= 0) {
+                        ir_emit_ret(ctx->current_fn, ctx->mod, val);
+                    }
+                } else {
+                    irgen_stmt(ctx, s);
+                }
+            }
+        } else {
+            irgen_stmt(ctx, body);
+        }
+    }
+
+    IrBasicBlock *last_bb = fn->current_bb;
+    if (last_bb) {
+        IrInst *last = last_bb->last;
+        if (!last || (last->op != IR_RET && last->op != IR_JMP && last->op != IR_BR)) {
+            ir_emit_ret_void(fn, ctx->mod);
+        }
+    }
+}
+
 static void irgen_function(IrGenContext *ctx, AstNode *fn_ast) {
     if (!fn_ast || fn_ast->kind != AST_FN) return;
 
@@ -1042,31 +1149,237 @@ static void irgen_function(IrGenContext *ctx, AstNode *fn_ast) {
     IrBasicBlock *entry = ir_bb_new(fn, ctx->mod, "entry");
     (void)entry;
 
-    /* Generate body */
-    AstNode *body = fn_ast->left;
-    if (body) {
-        if (body->kind == AST_BLOCK) {
-            AstNode *s;
-            for (s = body->params; s; s = s->next)
-                irgen_stmt(ctx, s);
-        } else {
-            irgen_stmt(ctx, body);
-        }
-    }
-
-    /* Add implicit return void if the last instruction isn't a terminator */
-    {
-        IrBasicBlock *last_bb = fn->current_bb;
-        if (last_bb) {
-            IrInst *last = last_bb->last;
-            if (!last || (last->op != IR_RET && last->op != IR_JMP && last->op != IR_BR)) {
-                ir_emit_ret_void(fn, ctx->mod);
-            }
-        }
-    }
+    /* Generate body (tail-expression-as-return aware) */
+    irgen_fn_body(ctx, fn_ast->left, ret_type);
 
     irgen_scope_pop(&ctx->scope);
     ctx->current_fn = NULL;
+}
+
+/* ============================================================
+ * Agent-Scoped Function Lowering
+ *
+ * Agents are syntactic containers for capability-scoped functions.
+ * For SSA IR purposes, each `fn` inside an `agent { ... }` block must
+ * be lowered to a top-level IrFunction so the WASM/x86/arm64 emitters
+ * can see them. We mangle the name with the agent identifier so two
+ * agents can declare overlapping fn names without collision.
+ *
+ * Mangling scheme — IR symbol name is `lcn___<agent_kebab>_<fn_name>`:
+ *
+ *   agent SmokeAgent { fn main() ... }   -> IR symbol  lcn___smoke_agent_main
+ *   agent BranchClassify { fn classify } -> IR symbol  lcn___branch_classify_classify
+ *
+ * The leading `lcn_` is shared with the top-level fn convention so the
+ * WASM emitter's call-site rewriter (which prefixes `lcn_` only when
+ * absent) and its export logic (`user_name_for` strips `lcn_`) both
+ * treat agent fns identically to free fns. The remaining `__<kebab>_`
+ * segment is the agent-scope tag that makes intra-program collisions
+ * unambiguous and keeps WASM exports human-readable
+ * (`__smoke_agent_main`, `__branch_classify_classify`).
+ *
+ * For the FIRST agent that declares `fn main`, we additionally emit a
+ * thin trampoline named `lcn_main` that simply calls the mangled symbol.
+ * This preserves the WASM emitter's ability to export `main` and synthesise
+ * the WASI `_start` wrapper, so existing tooling (`wasmtime --invoke main`)
+ * keeps working unchanged.
+ * ============================================================ */
+
+/* Convert a PascalCase or camelCase agent name to snake_case (kebab with
+ * underscores, since WASM symbol names cannot contain `-`).
+ *   "SmokeAgent"     -> "smoke_agent"
+ *   "BranchClassify" -> "branch_classify"
+ *   "URLFetcher"     -> "u_r_l_fetcher"   (acceptable: deterministic)
+ *   "lower_case"     -> "lower_case"
+ *
+ * Writes at most cap-1 chars + NUL into dst. dst must be non-NULL with
+ * cap >= 1. Returns dst. */
+static char *kebab_case(const char *src, char *dst, size_t cap) {
+    if (!dst || cap == 0) return dst;
+    if (!src) { dst[0] = '\0'; return dst; }
+
+    size_t out = 0;
+    bool prev_was_lower = false;
+    size_t i;
+    for (i = 0; src[i] != '\0' && out + 1 < cap; i++) {
+        char c = src[i];
+        bool is_upper = (c >= 'A' && c <= 'Z');
+        bool is_lower = (c >= 'a' && c <= 'z');
+        bool is_digit = (c >= '0' && c <= '9');
+
+        if (is_upper) {
+            /* Insert separator on lower->upper boundary so PascalCase
+             * components are properly delimited. */
+            if (prev_was_lower && out > 0 && out + 1 < cap) {
+                dst[out++] = '_';
+                if (out + 1 >= cap) break;
+            }
+            dst[out++] = (char)(c - 'A' + 'a');
+            prev_was_lower = false;
+        } else if (is_lower || is_digit) {
+            dst[out++] = c;
+            prev_was_lower = is_lower;
+        } else {
+            /* Non-alnum (e.g. '_') passes through verbatim. */
+            dst[out++] = c;
+            prev_was_lower = false;
+        }
+    }
+    dst[out] = '\0';
+    return dst;
+}
+
+/* Lower a single agent-scoped fn into a top-level IrFunction, given the
+ * pre-mangled IR symbol name. Mirrors irgen_function but uses the caller-
+ * provided name verbatim (no automatic `lcn_` prefix). */
+static void irgen_agent_function_named(IrGenContext *ctx, AstNode *fn_ast,
+                                        const char *ir_symbol) {
+    if (!fn_ast || fn_ast->kind != AST_FN || !ir_symbol) return;
+
+    IrType ret_type = ast_type_to_ir(fn_ast->type_expr);
+    IrFunction *fn = ir_function_new(ctx->mod, ir_symbol, ret_type);
+
+    /* Add parameters */
+    AstNode *param;
+    for (param = fn_ast->params; param; param = param->next) {
+        if (param->kind == AST_PARAM && param->name) {
+            IrType ptype = ast_type_to_ir(param->type_expr);
+            ir_function_add_param(fn, ctx->mod, param->name, ptype);
+        }
+    }
+
+    ctx->current_fn = fn;
+    irgen_scope_push(&ctx->scope);
+
+    IrBasicBlock *entry = ir_bb_new(fn, ctx->mod, "entry");
+    (void)entry;
+
+    /* Body (tail-expression-as-return aware). */
+    irgen_fn_body(ctx, fn_ast->left, ret_type);
+
+    irgen_scope_pop(&ctx->scope);
+    ctx->current_fn = NULL;
+}
+
+/* Emit a thin trampoline function `lcn_main` that forwards to the
+ * mangled mangled_symbol. Required so WASM emitters can detect `main`
+ * (via the `lcn_` prefix convention) and synthesise the `_start` export. */
+static void irgen_emit_main_trampoline(IrGenContext *ctx,
+                                        AstNode *fn_ast,
+                                        const char *mangled_symbol) {
+    if (!fn_ast || !mangled_symbol) return;
+
+    IrType ret_type = ast_type_to_ir(fn_ast->type_expr);
+    IrFunction *fn = ir_function_new(ctx->mod, "lcn_main", ret_type);
+
+    /* Forward all declared params verbatim so the trampoline matches the
+     * mangled fn signature. main() typically has zero params, but be safe. */
+    AstNode *param;
+    int forwarded[16];
+    int n_forward = 0;
+    for (param = fn_ast->params; param; param = param->next) {
+        if (param->kind == AST_PARAM && param->name && n_forward < 16) {
+            IrType ptype = ast_type_to_ir(param->type_expr);
+            int pid = ir_function_add_param(fn, ctx->mod, param->name, ptype);
+            forwarded[n_forward++] = pid;
+        }
+    }
+
+    ctx->current_fn = fn;
+    IrBasicBlock *entry = ir_bb_new(fn, ctx->mod, "entry");
+    (void)entry;
+
+    int call_id = ir_emit_call(fn, ctx->mod, mangled_symbol, ret_type,
+                               forwarded, n_forward);
+    if (ret_type == IR_TYPE_VOID) {
+        ir_emit_ret_void(fn, ctx->mod);
+    } else {
+        ir_emit_ret(fn, ctx->mod, call_id);
+    }
+
+    ctx->current_fn = NULL;
+}
+
+/* Walk an AST_AGENT node and lower each fn in agent->left to a top-level
+ * IrFunction with a mangled name. Non-fn agent members (capabilities,
+ * budget, model, prompt, etc.) are metadata handled elsewhere
+ * (typecheck / wit_emit) and are intentionally ignored here. */
+static void irgen_agent(IrGenContext *ctx, AstNode *agent) {
+    if (!agent || agent->kind != AST_AGENT || !agent->name) return;
+
+    /* Compute kebab form of the agent name once. */
+    char kebab[128];
+    kebab_case(agent->name, kebab, sizeof(kebab));
+    /* Stash a stable copy so per-call lookups can use pointer-stable storage. */
+    const char *agent_kebab = arena_strdup(ctx->mod->arena, kebab);
+
+    /* Pass A: pre-register every agent fn so siblings can call each other
+     * regardless of source order (forward references). */
+    AstNode *m;
+    for (m = agent->left; m; m = m->next) {
+        if (m->kind != AST_FN || !m->name) continue;
+        if (ctx->agent_fn_reg_count >= IR_GEN_MAX_AGENT_FNS) break;
+
+        char mangled[256];
+        snprintf(mangled, sizeof(mangled), "lcn___%s_%s", agent_kebab, m->name);
+
+        int idx = ctx->agent_fn_reg_count++;
+        ctx->agent_fn_registry[idx].agent_kebab = agent_kebab;
+        ctx->agent_fn_registry[idx].fn_name =
+            arena_strdup(ctx->mod->arena, m->name);
+        ctx->agent_fn_registry[idx].ir_symbol =
+            arena_strdup(ctx->mod->arena, mangled);
+        ctx->agent_fn_registry[idx].ret_type = ast_type_to_ir(m->type_expr);
+    }
+
+    /* Pass B: lower each fn body. Inside this loop, irgen_call resolves
+     * unqualified callees against the agent-local registry first. */
+    const char *prev_agent = ctx->current_agent_kebab;
+    ctx->current_agent_kebab = agent_kebab;
+
+    AstNode *main_fn = NULL;
+    const char *main_mangled = NULL;
+    for (m = agent->left; m; m = m->next) {
+        if (m->kind != AST_FN || !m->name) continue;
+
+        const char *ir_symbol = irgen_lookup_agent_local(ctx, m->name, NULL);
+        if (!ir_symbol) {
+            /* Registry overflow fallback: derive on the fly. */
+            char fallback[256];
+            snprintf(fallback, sizeof(fallback), "lcn___%s_%s",
+                     agent_kebab, m->name);
+            ir_symbol = arena_strdup(ctx->mod->arena, fallback);
+        }
+
+        irgen_agent_function_named(ctx, m, ir_symbol);
+
+        if (strcmp(m->name, "main") == 0 && !main_fn) {
+            main_fn = m;
+            main_mangled = ir_symbol;
+        }
+    }
+
+    ctx->current_agent_kebab = prev_agent;
+
+    /* Pass C: trampoline. The first agent declaring `fn main` claims the
+     * unmangled `lcn_main` slot; subsequent agents emit only the mangled
+     * form (with a stderr warning) so the WASM module still has exactly
+     * one well-known entrypoint. */
+    if (main_fn && main_mangled) {
+        if (!ctx->has_unmangled_main) {
+            irgen_emit_main_trampoline(ctx, main_fn, main_mangled);
+            ctx->has_unmangled_main = true;
+            /* Also publish in the global registry so any *top-level*
+             * caller writing main() resolves to the trampoline. */
+            irgen_register_fn(ctx, "main", ast_type_to_ir(main_fn->type_expr));
+        } else {
+            fprintf(stderr,
+                "warning: agent '%s' declares fn main but the unmangled "
+                "`main` export is already taken by an earlier agent; only "
+                "%s will be emitted.\n",
+                agent->name, main_mangled);
+        }
+    }
 }
 
 /* ============================================================
@@ -1099,7 +1412,15 @@ IrModule *ir_gen_program(AstNode *program, Arena *arena) {
             irgen_function(&ctx, decl);
             break;
 
-        /* Skip non-function declarations for now (structs, enums, agents, etc.).
+        case AST_AGENT:
+            /* Lower each fn inside the agent block to a top-level IR
+             * function with a mangled name. Non-fn agent members (fields,
+             * capabilities, budget, prompt, etc.) are metadata handled
+             * by typecheck/wit_emit and intentionally produce no IR. */
+            irgen_agent(&ctx, decl);
+            break;
+
+        /* Skip non-function declarations for now (structs, enums, etc.).
          * They don't produce IR directly in this foundation phase. */
         default:
             break;

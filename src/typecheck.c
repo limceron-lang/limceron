@@ -355,6 +355,23 @@ static void register_declarations(SymbolTable *st, AstNode *program,
             symtab_add(st, decl->name,
                        ast_kind_to_sym_kind(decl->kind),
                        decl, decl->loc, reporter);
+            if (decl->kind == AST_AGENT) {
+                /* Also register agent-scoped fns (decl->left chain) under
+                 * their plain name so sibling calls (e.g. `classify(85)`
+                 * inside `agent { fn main { classify(85) } }`) resolve.
+                 * IR layer mangles them to lcn___<kebab>_<fn>; here we
+                 * only need the typechecker to see the symbol. First
+                 * registration wins; later same-named fns in other
+                 * agents are silently ignored (symtab_add would report
+                 * duplicate). */
+                for (AstNode *afn = decl->left; afn; afn = afn->next) {
+                    if (afn->kind == AST_FN && afn->name &&
+                        !symtab_find(st, afn->name)) {
+                        symtab_add(st, afn->name, SYM_FN,
+                                   afn, afn->loc, reporter);
+                    }
+                }
+            }
             break;
 
         case AST_LET:
