@@ -726,53 +726,105 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
     }
 
     case AST_IF: {
-        /* if/else as expression: returns a value via phi node */
+        /* if/else as expression. Each branch is lowered so that its tail
+         * statement (if it's an AST_EXPR_STMT) produces an SSA value;
+         * those values are combined in a PHI at the merge block, and the
+         * PHI id is returned so callers like `let x = if c { a } else { b }`
+         * or tail-position returns work.
+         *
+         * Branches that terminate via explicit `return` (or any other
+         * terminator) do NOT contribute to the PHI; if both terminate the
+         * merge block is unreachable and we return -1.
+         */
         IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
         int cond = irgen_expr(ctx, expr->left);
 
-        IrBasicBlock *then_bb = ir_bb_new(ctx->current_fn, ctx->mod, "if.then");
-        IrBasicBlock *else_bb = ir_bb_new(ctx->current_fn, ctx->mod, "if.else");
+        IrBasicBlock *then_bb  = ir_bb_new(ctx->current_fn, ctx->mod, "if.then");
+        IrBasicBlock *else_bb  = ir_bb_new(ctx->current_fn, ctx->mod, "if.else");
         IrBasicBlock *merge_bb = ir_bb_new(ctx->current_fn, ctx->mod, "if.merge");
 
-        /* Emit branch in the block that evaluated the condition */
         ir_set_current_bb(ctx->current_fn, pre_bb);
         ir_emit_br(ctx->current_fn, ctx->mod, cond, then_bb->id, else_bb->id);
 
-        /* Generate then block */
+        /* Lower one branch body; returns the tail-expression value (or
+         * -1 if none / branch terminated early), and reports via
+         * *out_pred the BB that actually jumps to merge (or NULL if the
+         * branch terminated and no jmp is emitted). */
+        #define LOWER_BRANCH(BRANCH_BODY, OUT_VAL, OUT_PRED) do {              \
+            int _val = -1;                                                     \
+            IrBasicBlock *_pred = NULL;                                        \
+            AstNode *_body = (BRANCH_BODY);                                    \
+            irgen_scope_push(&ctx->scope);                                     \
+            if (_body) {                                                       \
+                AstNode *_tail = NULL;                                         \
+                if (_body->kind == AST_BLOCK) {                                \
+                    for (AstNode *_s = _body->params; _s; _s = _s->next) {     \
+                        if (!_s->next && _s->kind == AST_EXPR_STMT && _s->left)\
+                            _tail = _s;                                        \
+                    }                                                          \
+                    for (AstNode *_s = _body->params; _s; _s = _s->next) {     \
+                        if (_s == _tail) {                                     \
+                            _val = irgen_expr(ctx, _s->left);                  \
+                        } else {                                               \
+                            irgen_stmt(ctx, _s);                               \
+                        }                                                      \
+                    }                                                          \
+                } else if (_body->kind == AST_EXPR_STMT && _body->left) {      \
+                    _val = irgen_expr(ctx, _body->left);                       \
+                } else {                                                       \
+                    irgen_stmt(ctx, _body);                                    \
+                }                                                              \
+            }                                                                  \
+            /* Skip the jmp if the branch already terminated. */               \
+            IrBasicBlock *_cur = ctx->current_fn->current_bb;                  \
+            IrInst *_last = _cur ? _cur->last : NULL;                          \
+            if (!_last ||                                                      \
+                (_last->op != IR_RET && _last->op != IR_JMP &&                 \
+                 _last->op != IR_BR)) {                                        \
+                ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);          \
+                _pred = ctx->current_fn->current_bb;                           \
+            }                                                                  \
+            irgen_scope_pop(&ctx->scope);                                      \
+            (OUT_VAL)  = _val;                                                 \
+            (OUT_PRED) = _pred;                                                \
+        } while (0)
+
+        int then_val = -1, else_val = -1;
+        IrBasicBlock *then_pred = NULL, *else_pred = NULL;
+
         ir_set_current_bb(ctx->current_fn, then_bb);
-        irgen_scope_push(&ctx->scope);
-        if (expr->right) {
-            /* then body */
-            AstNode *stmt;
-            if (expr->right->kind == AST_BLOCK) {
-                for (stmt = expr->right->params; stmt; stmt = stmt->next)
-                    irgen_stmt(ctx, stmt);
-            } else {
-                irgen_stmt(ctx, expr->right);
-            }
-        }
-        ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
-        irgen_scope_pop(&ctx->scope);
+        LOWER_BRANCH(expr->right, then_val, then_pred);
 
-        /* Generate else block */
         ir_set_current_bb(ctx->current_fn, else_bb);
-        irgen_scope_push(&ctx->scope);
-        if (expr->params) {
-            /* else body (AST_IF: params=else_body) */
-            AstNode *stmt;
-            if (expr->params->kind == AST_BLOCK) {
-                for (stmt = expr->params->params; stmt; stmt = stmt->next)
-                    irgen_stmt(ctx, stmt);
-            } else {
-                irgen_stmt(ctx, expr->params);
-            }
-        }
-        ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
-        irgen_scope_pop(&ctx->scope);
+        LOWER_BRANCH(expr->params, else_val, else_pred);
 
-        /* Continue in merge block */
+        #undef LOWER_BRANCH
+
         ir_set_current_bb(ctx->current_fn, merge_bb);
-        return -1; /* If used as expression, would need phi */
+
+        /* Build PHI from incoming branches that produced a value. */
+        if ((then_val >= 0 && then_pred) || (else_val >= 0 && else_pred)) {
+            IrType phi_type = (then_val >= 0)
+                ? irgen_value_type(ctx, then_val)
+                : irgen_value_type(ctx, else_val);
+            int phi_id = ir_emit_phi(ctx->current_fn, ctx->mod, phi_type);
+            IrInst *phi_inst = NULL;
+            /* Locate the phi inst we just emitted (current_bb->last). */
+            if (merge_bb->last && merge_bb->last->op == IR_PHI &&
+                merge_bb->last->id == phi_id) {
+                phi_inst = merge_bb->last;
+            }
+            if (phi_inst) {
+                if (then_val >= 0 && then_pred) {
+                    ir_phi_add_incoming(phi_inst, then_val, then_pred->id);
+                }
+                if (else_val >= 0 && else_pred) {
+                    ir_phi_add_incoming(phi_inst, else_val, else_pred->id);
+                }
+            }
+            return phi_id;
+        }
+        return -1;
     }
 
     default:
