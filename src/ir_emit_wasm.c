@@ -335,6 +335,33 @@ static void emit_host_imports(EmitCtx *ctx) {
         } else if (strcmp(s->qualified, "data.read") == 0) {
             /* (query, query_len, params, params_len, out_buf, out_max) */
             param_list = "(param i32 i32 i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.parse") == 0) {
+            /* (bytes_ptr, bytes_len, out_ptr, out_cap) -> handle/HostErr */
+            param_list = "(param i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.field") == 0) {
+            /* (handle, key_ptr, key_len, out_ptr, out_cap) -> sub-handle */
+            param_list = "(param i32 i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.array_index") == 0) {
+            /* (handle, idx, out_ptr, out_cap) -> sub-handle */
+            param_list = "(param i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.length") == 0) {
+            /* (handle) -> length or HostErr */
+            param_list = "(param i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.string_value") == 0) {
+            /* (handle, out_ptr, out_cap) -> byte count */
+            param_list = "(param i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.int_value") == 0) {
+            /* (handle) -> i64 value (HostErr encoded negatively) */
+            param_list = "(param i32) (result i64)";
+        } else if (strcmp(s->qualified, "json.bool_value") == 0) {
+            /* (handle) -> 0/1 (HostErr negative) */
+            param_list = "(param i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.is_null") == 0) {
+            /* (handle) -> 1 if null, 0 otherwise */
+            param_list = "(param i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.stringify") == 0) {
+            /* (handle, out_ptr, out_cap) -> byte count */
+            param_list = "(param i32 i32 i32) (result i32)";
         } else {
             /* Unknown capability: emit a 4-arg/i32-result placeholder so
              * the wasm at least validates. wazero will fail to link the
@@ -877,6 +904,117 @@ static void emit_instruction(FnCtx *fctx, IrBasicBlock *bb, IrInst *inst) {
             fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
             fprintf(out, "      i32.const %d\n", conf_off);
             fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+        } else if (strcmp(qname, "json.parse") == 0 &&
+                   inst->call_arg_count >= 1) {
+            /* (bytes_ptr, bytes_len, out_ptr, out_cap) -> handle/HostErr.
+             * The bytes come from a Limceron string (ptr + len-prefix). */
+            int b_arg = inst->call_args[0];
+            emit_get_value(fctx, b_arg);
+            emit_get_value(fctx, b_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.field") == 0 &&
+                   inst->call_arg_count >= 2) {
+            /* (handle, key_ptr, key_len, out_ptr, out_cap) -> sub-handle.
+             * Handle arrives as i64 (Limceron int); truncate to i32. */
+            int h_arg = inst->call_args[0];
+            int k_arg = inst->call_args[1];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            emit_get_value(fctx, k_arg);
+            emit_get_value(fctx, k_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.array_index") == 0 &&
+                   inst->call_arg_count >= 2) {
+            /* (handle, idx, out_ptr, out_cap) -> sub-handle.
+             * Both handle and idx are i64 in Limceron; truncate. */
+            int h_arg = inst->call_args[0];
+            int i_arg = inst->call_args[1];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            emit_get_value(fctx, i_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.length") == 0 &&
+                   inst->call_arg_count >= 1) {
+            /* (handle) -> length or HostErr. */
+            int h_arg = inst->call_args[0];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.string_value") == 0 &&
+                   inst->call_arg_count >= 1) {
+            /* (handle, out_ptr, out_cap) -> byte count or HostErr. */
+            int h_arg = inst->call_args[0];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.int_value") == 0 &&
+                   inst->call_arg_count >= 1) {
+            /* (handle) -> i64 value directly (NO sign-extend). */
+            int h_arg = inst->call_args[0];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            /* Result is already i64 — drop into the SSA slot as-is. */
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.bool_value") == 0 &&
+                   inst->call_arg_count >= 1) {
+            /* (handle) -> 0/1 or negative HostErr. */
+            int h_arg = inst->call_args[0];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.is_null") == 0 &&
+                   inst->call_arg_count >= 1) {
+            /* (handle) -> 1 if null, 0 otherwise. */
+            int h_arg = inst->call_args[0];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.stringify") == 0 &&
+                   inst->call_arg_count >= 1) {
+            /* (handle, out_ptr, out_cap) -> byte count of serialised form. */
+            int h_arg = inst->call_args[0];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
         } else {
             /* Unknown / mismatched arity: emit best-effort (push each
              * arg as-is and trust the import declaration). */

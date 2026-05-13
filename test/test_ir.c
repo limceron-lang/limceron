@@ -768,6 +768,204 @@ TEST(ir_gen_print_statement) {
 }
 
 /* ============================================================
+ * JSON host-call lowering (L3)
+ *
+ * Verifies that the dotted-namespace form `json.<fn>(args)` lowers to
+ * IR_HOST_CALL with the qualified name "json.<fn>" and the right arg
+ * count. The WASM backend's per-capability marshalling consumes these
+ * sites and emits the matching `(import "vdag:json" ...)` declarations.
+ * ============================================================ */
+
+/* Helper: find an IR_HOST_CALL whose fn_name matches `qname`. */
+static IrInst *find_host_call(IrFunction *fn, const char *qname) {
+    IrBasicBlock *bb;
+    for (bb = fn->entry; bb; bb = bb->next) {
+        IrInst *inst;
+        for (inst = bb->first; inst; inst = inst->next) {
+            if (inst->op == IR_HOST_CALL && inst->fn_name &&
+                strcmp(inst->fn_name, qname) == 0) {
+                return inst;
+            }
+        }
+    }
+    return NULL;
+}
+
+TEST(ir_gen_json_parse_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    json.parse(\"{}\")\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *call = find_host_call(fn, "json.parse");
+    ASSERT_NOT_NULL(call);
+    ASSERT_EQ(call->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_field_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"{\\\"k\\\":1}\")\n"
+        "    json.field(h, \"k\")\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *field = find_host_call(fn, "json.field");
+    ASSERT_NOT_NULL(field);
+    ASSERT_EQ(field->call_arg_count, 2);
+}
+
+TEST(ir_gen_json_array_index_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"[1,2,3]\")\n"
+        "    json.array_index(h, 1)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *ai = find_host_call(fn, "json.array_index");
+    ASSERT_NOT_NULL(ai);
+    ASSERT_EQ(ai->call_arg_count, 2);
+}
+
+TEST(ir_gen_json_length_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"[1,2,3]\")\n"
+        "    json.length(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *len = find_host_call(fn, "json.length");
+    ASSERT_NOT_NULL(len);
+    ASSERT_EQ(len->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_string_value_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"\\\"hi\\\"\")\n"
+        "    json.string_value(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *sv = find_host_call(fn, "json.string_value");
+    ASSERT_NOT_NULL(sv);
+    ASSERT_EQ(sv->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_int_value_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"42\")\n"
+        "    json.int_value(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *iv = find_host_call(fn, "json.int_value");
+    ASSERT_NOT_NULL(iv);
+    ASSERT_EQ(iv->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_bool_value_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"true\")\n"
+        "    json.bool_value(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *bv = find_host_call(fn, "json.bool_value");
+    ASSERT_NOT_NULL(bv);
+    ASSERT_EQ(bv->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_is_null_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"null\")\n"
+        "    json.is_null(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *inull = find_host_call(fn, "json.is_null");
+    ASSERT_NOT_NULL(inull);
+    ASSERT_EQ(inull->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_stringify_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"{}\")\n"
+        "    json.stringify(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *s = find_host_call(fn, "json.stringify");
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(s->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_chained_pipeline) {
+    /* End-to-end shape: parse -> field -> string_value. Verifies that
+     * chained host calls all lower to distinct IR_HOST_CALL sites with
+     * the right qualified names, mirroring the 01 sample. */
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"{\\\"intent\\\":\\\"refund\\\"}\")\n"
+        "    let f = json.field(h, \"intent\")\n"
+        "    json.string_value(f)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    ASSERT(count_opcode(fn, IR_HOST_CALL) == 3);
+    ASSERT_NOT_NULL(find_host_call(fn, "json.parse"));
+    ASSERT_NOT_NULL(find_host_call(fn, "json.field"));
+    ASSERT_NOT_NULL(find_host_call(fn, "json.string_value"));
+}
+
+/* ============================================================
  * IR Optimization Tests
  * ============================================================ */
 
@@ -1690,6 +1888,18 @@ int main(void) {
     RUN_TEST(ir_gen_nested_binary);
     RUN_TEST(ir_gen_unary_neg);
     RUN_TEST(ir_gen_print_statement);
+
+    fprintf(stderr, "\n-- JSON Host-Call Lowering --\n");
+    RUN_TEST(ir_gen_json_parse_host_call);
+    RUN_TEST(ir_gen_json_field_host_call);
+    RUN_TEST(ir_gen_json_array_index_host_call);
+    RUN_TEST(ir_gen_json_length_host_call);
+    RUN_TEST(ir_gen_json_string_value_host_call);
+    RUN_TEST(ir_gen_json_int_value_host_call);
+    RUN_TEST(ir_gen_json_bool_value_host_call);
+    RUN_TEST(ir_gen_json_is_null_host_call);
+    RUN_TEST(ir_gen_json_stringify_host_call);
+    RUN_TEST(ir_gen_json_chained_pipeline);
 
     fprintf(stderr, "\n-- IR Optimization --\n");
     RUN_TEST(ir_opt_constant_fold);

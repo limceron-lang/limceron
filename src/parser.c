@@ -760,7 +760,8 @@ static AstNode *parse_expr(Parser *p, Precedence min_prec) {
                                   strcmp(ns, "http") == 0 ||
                                   strcmp(ns, "kb")   == 0 ||
                                   strcmp(ns, "data") == 0 ||
-                                  strcmp(ns, "mcp")  == 0);
+                                  strcmp(ns, "mcp")  == 0 ||
+                                  strcmp(ns, "json") == 0);
                 }
                 AstNode *node = ast_new(p->arena,
                                          is_host_ns ? AST_HOST_CALL : AST_METHOD_CALL,

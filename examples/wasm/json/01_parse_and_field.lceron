@@ -1,0 +1,34 @@
+// 01_parse_and_field.lceron — WASM PoC sample: JSON parse + field + extract
+//
+// Demonstrates the L3 JSON-primitives capability surface. The Limceron
+// compiler lowers each `json.<fn>(...)` call to an
+// `(import "vdag:json" "<fn>" ...)` declaration and the buffer-protocol
+// ABI sketched in the L3 design doc (mirroring Visual-DAG's host module
+// shape from internal/nodes/code/imports.go).
+//
+// Pipeline:
+//   1. `handle = json.parse("{\"intent\":\"refund\"}")` — host returns
+//      an integer handle (positive on success, negative HostErr* code).
+//   2. `intent = json.field(handle, "intent")` — sub-handle pointing
+//      at the string value of the "intent" key.
+//   3. `n = json.string_value(intent)` — copies the UTF-8 bytes into the
+//      call-site's scratch out-buffer and returns the byte count.
+//
+// With the input "{\"intent\":\"refund\"}", the string at .intent is
+// "refund" (6 bytes), so agent_main returns 6.
+//
+// Until Visual-DAG ships the `vdag:json` host module (tracked as F36),
+// the produced .wasm will fail at wazero linking — the contract on the
+// Limceron side is correct; the runtime side is a follow-up.
+
+agent JsonParseAndField {
+    capabilities: [json.parse, json.field, json.string_value]
+    budget: { max_tokens: 0, max_cost: 0.0 }
+
+    // Returns the byte count of the "intent" string value.
+    fn main() -> int {
+        let handle = json.parse("{\"intent\":\"refund\"}")
+        let intent = json.field(handle, "intent")
+        json.string_value(intent)
+    }
+}
