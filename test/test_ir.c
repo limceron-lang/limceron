@@ -433,6 +433,241 @@ TEST(ir_gen_while_loop) {
     ASSERT(count_opcode(fn, IR_BR) >= 1);
 }
 
+/* ============================================================
+ * Looping Constructs (F1-A6 follow-up): while / for-in / loop
+ * with break + continue.
+ *
+ * These tests pin the IR shape we promise the WASM emitter:
+ *   - while:   pre + cond + body + exit BBs; one CMP_LT, one BR,
+ *              one back-edge JMP from body to cond.
+ *   - for-in:  pre + cond + body + inc + exit (5 BBs); the desugar
+ *              materializes exactly ONE init (store start->loopvar),
+ *              ONE cond (load + cmp_lt + br), ONE inc (load + add + store).
+ *   - break:   inside nested loops, must target the INNERMOST exit BB.
+ *
+ * If any of these fail you have likely broken the contract with
+ * ir_emit_wasm.c's dispatch-loop emitter; review the back-edge
+ * handling before changing the assertions.
+ * ============================================================ */
+
+/* Helper: count IR_JMP instructions whose target is `target_bb_id`. */
+static int count_jmp_to(IrFunction *fn, int target_bb_id) {
+    int count = 0;
+    IrBasicBlock *bb;
+    for (bb = fn->entry; bb; bb = bb->next) {
+        IrInst *inst;
+        for (inst = bb->first; inst; inst = inst->next) {
+            if (inst->op == IR_JMP && inst->target_bb == target_bb_id) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+/* Helper: find a basic block by label substring. */
+static IrBasicBlock *find_bb_by_label(IrFunction *fn, const char *needle) {
+    IrBasicBlock *bb;
+    for (bb = fn->entry; bb; bb = bb->next) {
+        if (bb->label && strstr(bb->label, needle)) return bb;
+    }
+    return NULL;
+}
+
+TEST(ir_gen_while_bb_count_and_back_edge) {
+    /* Verifies the CFG shape of a while-loop:
+     *   bb_pre   -> jmp -> bb_cond
+     *   bb_cond  -> br  -> bb_body / bb_exit
+     *   bb_body  -> jmp -> bb_cond   (this is the loop back-edge)
+     *
+     * We assert by counting BBs and confirming there are at least two
+     * IR_JMPs targeting the while.cond block (one from pre, one from
+     * the body back-edge).  */
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let mut sum = 0\n"
+        "    let mut i = 0\n"
+        "    while i < 10 {\n"
+        "        sum = sum + i\n"
+        "        i = i + 1\n"
+        "    }\n"
+        "    return sum\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    /* entry + while.cond + while.body + while.exit = 4 BBs minimum. */
+    ASSERT(fn->bb_count >= 4);
+
+    IrBasicBlock *cond_bb = find_bb_by_label(fn, "while.cond");
+    IrBasicBlock *body_bb = find_bb_by_label(fn, "while.body");
+    IrBasicBlock *exit_bb = find_bb_by_label(fn, "while.exit");
+    ASSERT_NOT_NULL(cond_bb);
+    ASSERT_NOT_NULL(body_bb);
+    ASSERT_NOT_NULL(exit_bb);
+
+    /* Two JMPs target the cond BB: one from the pre-block and one
+     * from the body back-edge. */
+    ASSERT(count_jmp_to(fn, cond_bb->id) >= 2);
+
+    /* The cond BB ends in a conditional branch. */
+    ASSERT_NOT_NULL(cond_bb->last);
+    ASSERT_EQ(cond_bb->last->op, IR_BR);
+    /* The cond branch picks body (true) or exit (false). */
+    ASSERT_EQ(cond_bb->last->target_bb, body_bb->id);
+    ASSERT_EQ(cond_bb->last->false_bb, exit_bb->id);
+}
+
+TEST(ir_gen_for_in_desugar_shape) {
+    /* The for-in `for i in 0..n` desugar must emit:
+     *   - exactly 1 store of `start` into the loop variable (init);
+     *   - exactly 1 CMP_LT in the cond BB;
+     *   - exactly 1 increment ADD in the inc BB.
+     * Anything else means the desugar drifted away from the
+     * `let i = start; while i < end { body; i = i + 1 }` shape. */
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let mut total = 0\n"
+        "    for i in 0..5 {\n"
+        "        total = total + i\n"
+        "    }\n"
+        "    return total\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    /* 5 BBs at minimum: entry + for.cond + for.body + for.inc + for.exit. */
+    ASSERT(fn->bb_count >= 5);
+
+    IrBasicBlock *cond_bb = find_bb_by_label(fn, "for.cond");
+    IrBasicBlock *body_bb = find_bb_by_label(fn, "for.body");
+    IrBasicBlock *inc_bb  = find_bb_by_label(fn, "for.inc");
+    IrBasicBlock *exit_bb = find_bb_by_label(fn, "for.exit");
+    ASSERT_NOT_NULL(cond_bb);
+    ASSERT_NOT_NULL(body_bb);
+    ASSERT_NOT_NULL(inc_bb);
+    ASSERT_NOT_NULL(exit_bb);
+
+    /* Exactly one CMP_LT in the cond BB (the i < end check). */
+    int cmp_in_cond = 0;
+    {
+        IrInst *inst;
+        for (inst = cond_bb->first; inst; inst = inst->next) {
+            if (inst->op == IR_CMP_LT) cmp_in_cond++;
+        }
+    }
+    ASSERT_EQ(cmp_in_cond, 1);
+
+    /* Cond BB ends in BR to body / exit. */
+    ASSERT_NOT_NULL(cond_bb->last);
+    ASSERT_EQ(cond_bb->last->op, IR_BR);
+    ASSERT_EQ(cond_bb->last->target_bb, body_bb->id);
+    ASSERT_EQ(cond_bb->last->false_bb, exit_bb->id);
+
+    /* Exactly one ADD in the inc BB (the i = i + 1). */
+    int add_in_inc = 0;
+    {
+        IrInst *inst;
+        for (inst = inc_bb->first; inst; inst = inst->next) {
+            if (inst->op == IR_ADD) add_in_inc++;
+        }
+    }
+    ASSERT_EQ(add_in_inc, 1);
+
+    /* Inc BB jumps back to the cond BB. */
+    ASSERT_NOT_NULL(inc_bb->last);
+    ASSERT_EQ(inc_bb->last->op, IR_JMP);
+    ASSERT_EQ(inc_bb->last->target_bb, cond_bb->id);
+
+    /* Init: there must be a store of the start constant into the loop
+     * var BEFORE the cond BB. Equivalently, the entry BB ends in a
+     * jmp to the cond BB. */
+    IrBasicBlock *entry = fn->entry;
+    ASSERT_NOT_NULL(entry);
+    ASSERT_NOT_NULL(entry->last);
+    ASSERT_EQ(entry->last->op, IR_JMP);
+    ASSERT_EQ(entry->last->target_bb, cond_bb->id);
+
+    /* The entry block stores `0` (start of `0..5`) into the loop var.
+     * IR_STORE is opcode-distinct, but we don't have count_opcode_in_bb;
+     * fold by hand. */
+    int store_in_entry = 0;
+    {
+        IrInst *inst;
+        for (inst = entry->first; inst; inst = inst->next) {
+            if (inst->op == IR_STORE) store_in_entry++;
+        }
+    }
+    /* let mut total = 0 stores into total; the for-init stores 0 into i.
+     * Two stores in entry. */
+    ASSERT(store_in_entry >= 2);
+}
+
+TEST(ir_gen_nested_break_targets_innermost_exit) {
+    /* Nested while loops; the `break` is inside the INNER loop and must
+     * target the INNER loop's exit, not the outer one. We pin this by
+     * locating each loop's exit BB by label (the irgen names them
+     * "while.exit" in declaration order — the FIRST occurrence is the
+     * outer loop's exit since the outer loop's exit BB is created
+     * before the inner loop is lowered).
+     *
+     * Actually no: irgen creates outer.cond/body/exit first, then steps
+     * into the body and creates inner.cond/body/exit. So the basic-block
+     * declaration order is:
+     *
+     *   bb_entry, outer.cond, outer.body, outer.exit,
+     *              inner.cond, inner.body, inner.exit, ...
+     *
+     * The break jmp inside the inner body must target inner.exit. */
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let mut sum = 0\n"
+        "    let mut i = 0\n"
+        "    while i < 3 {\n"
+        "        let mut j = 0\n"
+        "        while j < 10 {\n"
+        "            if j >= 2 {\n"
+        "                break\n"
+        "            }\n"
+        "            sum = sum + 1\n"
+        "            j = j + 1\n"
+        "        }\n"
+        "        i = i + 1\n"
+        "    }\n"
+        "    return sum\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    /* Find both while.exit blocks in declaration order. */
+    IrBasicBlock *outer_exit = NULL;
+    IrBasicBlock *inner_exit = NULL;
+    {
+        IrBasicBlock *bb;
+        for (bb = fn->entry; bb; bb = bb->next) {
+            if (bb->label && strstr(bb->label, "while.exit")) {
+                if (!outer_exit) outer_exit = bb;
+                else if (!inner_exit) inner_exit = bb;
+            }
+        }
+    }
+    ASSERT_NOT_NULL(outer_exit);
+    ASSERT_NOT_NULL(inner_exit);
+    ASSERT(outer_exit->id != inner_exit->id);
+
+    /* There must be EXACTLY ONE jmp to the INNER exit (the break) and
+     * ZERO jmps to the OUTER exit. (The outer exit is reached via the
+     * outer cond's BR-false, not via a JMP.) */
+    ASSERT_EQ(count_jmp_to(fn, inner_exit->id), 1);
+    ASSERT_EQ(count_jmp_to(fn, outer_exit->id), 0);
+}
+
 TEST(ir_gen_string_concat) {
     IrModule *mod = ir_from_source(
         "fn test() {\n"
@@ -1446,6 +1681,9 @@ int main(void) {
     RUN_TEST(ir_gen_if_no_else);
     RUN_TEST(ir_gen_for_loop);
     RUN_TEST(ir_gen_while_loop);
+    RUN_TEST(ir_gen_while_bb_count_and_back_edge);
+    RUN_TEST(ir_gen_for_in_desugar_shape);
+    RUN_TEST(ir_gen_nested_break_targets_innermost_exit);
     RUN_TEST(ir_gen_string_concat);
     RUN_TEST(ir_gen_multiple_functions);
     RUN_TEST(ir_gen_return_void);

@@ -385,10 +385,28 @@ typedef struct {
  * a flat array across all agents to simplify lookup. */
 #define IR_GEN_MAX_AGENT_FNS 256
 
+/* Maximum nested loop depth per function. Each `while`, `for-in`, or `loop`
+ * pushes one entry; `break` / `continue` consult the top. 16 is generous —
+ * deeper nesting almost certainly indicates a bug. */
+#define IR_GEN_MAX_LOOP_DEPTH 16
+
+typedef struct {
+    int  continue_bb;   /* `continue` target (loop header / cond / inc) */
+    int  break_bb;      /* `break`    target (post-loop / exit)         */
+    bool saw_break;     /* set true on any AST_BREAK inside this loop;
+                         * used to warn about provably-infinite loops    */
+} IrGenLoopCtx;
+
 typedef struct {
     IrModule   *mod;
     IrFunction *current_fn;
     IrGenScope  scope;
+
+    /* Per-fn break/continue target stack. Pushed on entering a loop body,
+     * popped on exit. AST_BREAK/AST_CONTINUE jump to the TOP entry, which
+     * naturally gives innermost-loop semantics under nesting. */
+    IrGenLoopCtx loop_stack[IR_GEN_MAX_LOOP_DEPTH];
+    int          loop_depth;
 
     /* Function name registry for call target resolution */
     struct {
@@ -455,6 +473,36 @@ static IrGenVar *irgen_scope_lookup(IrGenScope *s, const char *name) {
             return &s->vars[i];
     }
     return NULL;
+}
+
+/* ============================================================
+ * Loop Break/Continue Stack
+ *
+ * Each `while`/`for`/`loop` body pushes a (continue_bb, break_bb) frame
+ * before lowering its body and pops it after. `break` / `continue` target
+ * the TOP-OF-STACK frame, so under nested loops the inner break exits
+ * the inner loop only, never the outer one.
+ * ============================================================ */
+
+static void irgen_loop_push(IrGenContext *ctx, int continue_bb, int break_bb) {
+    if (ctx->loop_depth < IR_GEN_MAX_LOOP_DEPTH) {
+        ctx->loop_stack[ctx->loop_depth].continue_bb = continue_bb;
+        ctx->loop_stack[ctx->loop_depth].break_bb    = break_bb;
+        ctx->loop_stack[ctx->loop_depth].saw_break   = false;
+        ctx->loop_depth++;
+    }
+}
+
+static IrGenLoopCtx *irgen_loop_top(IrGenContext *ctx) {
+    if (ctx->loop_depth <= 0) return NULL;
+    return &ctx->loop_stack[ctx->loop_depth - 1];
+}
+
+/* Returns the top frame's saw_break flag, then pops the frame. */
+static bool irgen_loop_pop(IrGenContext *ctx) {
+    if (ctx->loop_depth <= 0) return false;
+    ctx->loop_depth--;
+    return ctx->loop_stack[ctx->loop_depth].saw_break;
 }
 
 /* Register a function in the context for call-site type inference */
@@ -1015,30 +1063,26 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
          * For loop: for <pattern> in <iterator> { body }
          * AST_FOR: left=pattern, right=body, params=iterator
          *
-         * IR layout:
-         *   bb_init:  evaluate iterator, init loop var
-         *   bb_cond:  check condition, br to body or exit
-         *   bb_body:  loop body
-         *   bb_inc:   increment, jmp to cond
-         *   bb_exit:  continue
+         * stage0 only supports half-open integer ranges `start..end`.
+         * The CFG matches the classic counted-loop shape:
          *
-         * For range-based loops (e.g. for i in 0..10):
-         *   We check if the iterator is an AST_RANGE and generate
-         *   a classic counted loop.
+         *   bb_init:  store start in the loop var, jmp cond
+         *   bb_cond:  load i; if i < end -> body else exit
+         *   bb_body:  user body  (continue jumps to bb_inc, not bb_cond,
+         *                         so the increment still happens)
+         *   bb_inc:   i = i + 1; jmp cond     (continue target)
+         *   bb_exit:  post-loop                (break target)
          */
         AstNode *pattern = stmt->left;
         AstNode *body = stmt->right;
         AstNode *iterator = stmt->params;
 
-        /* Check for range-based loop */
         bool is_range = iterator && iterator->kind == AST_RANGE;
 
         if (is_range) {
-            /* Range loop: for i in start..end */
             int start_val = irgen_expr(ctx, iterator->left);
-            int end_val = irgen_expr(ctx, iterator->right);
+            int end_val   = irgen_expr(ctx, iterator->right);
 
-            /* Allocate loop variable */
             int loop_var = ir_emit_alloca(ctx->current_fn, ctx->mod, IR_TYPE_I64);
             ir_emit_store(ctx->current_fn, ctx->mod, start_val, loop_var);
 
@@ -1050,10 +1094,9 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
             IrBasicBlock *init_bb = ctx->current_fn->current_bb;
             IrBasicBlock *cond_bb = ir_bb_new(ctx->current_fn, ctx->mod, "for.cond");
             IrBasicBlock *body_bb = ir_bb_new(ctx->current_fn, ctx->mod, "for.body");
-            IrBasicBlock *inc_bb = ir_bb_new(ctx->current_fn, ctx->mod, "for.inc");
+            IrBasicBlock *inc_bb  = ir_bb_new(ctx->current_fn, ctx->mod, "for.inc");
             IrBasicBlock *exit_bb = ir_bb_new(ctx->current_fn, ctx->mod, "for.exit");
 
-            /* Jump from init to cond */
             ir_set_current_bb(ctx->current_fn, init_bb);
             ir_emit_jmp(ctx->current_fn, ctx->mod, cond_bb->id);
 
@@ -1064,8 +1107,12 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
                                     cur_val, end_val);
             ir_emit_br(ctx->current_fn, ctx->mod, cmp, body_bb->id, exit_bb->id);
 
-            /* Body block */
+            /* Body block.
+             * `continue` targets the INCREMENT block (not cond) so the
+             * loop variable advances even when the iteration is short-
+             * circuited. `break` targets the post-loop exit block. */
             ir_set_current_bb(ctx->current_fn, body_bb);
+            irgen_loop_push(ctx, inc_bb->id, exit_bb->id);
             if (body) {
                 if (body->kind == AST_BLOCK) {
                     AstNode *s;
@@ -1075,9 +1122,21 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
                     irgen_stmt(ctx, body);
                 }
             }
-            ir_emit_jmp(ctx->current_fn, ctx->mod, inc_bb->id);
+            irgen_loop_pop(ctx);
 
-            /* Increment block: i = i + 1 */
+            /* If the body didn't already terminate (e.g. via break), jump
+             * to the increment block. */
+            {
+                IrBasicBlock *cur = ctx->current_fn->current_bb;
+                IrInst *last = cur ? cur->last : NULL;
+                if (!last ||
+                    (last->op != IR_RET && last->op != IR_JMP &&
+                     last->op != IR_BR)) {
+                    ir_emit_jmp(ctx->current_fn, ctx->mod, inc_bb->id);
+                }
+            }
+
+            /* Increment block: i = i + 1; jmp cond */
             ir_set_current_bb(ctx->current_fn, inc_bb);
             int cur_val2 = ir_emit_load(ctx->current_fn, ctx->mod, IR_TYPE_I64, loop_var);
             int one = ir_emit_const_int(ctx->current_fn, ctx->mod, 1);
@@ -1086,15 +1145,14 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
             ir_emit_store(ctx->current_fn, ctx->mod, next_val, loop_var);
             ir_emit_jmp(ctx->current_fn, ctx->mod, cond_bb->id);
 
-            /* Exit block */
             ir_set_current_bb(ctx->current_fn, exit_bb);
 
             if (pattern && pattern->name) {
                 irgen_scope_pop(&ctx->scope);
             }
         } else {
-            /* Generic for-in loop: emit as iterator call (simplified).
-             * For now, just generate the body once as a placeholder. */
+            /* Non-range for-in (e.g. iterating an array) is not supported
+             * in stage0; emit the body once as a placeholder. */
             if (body) {
                 irgen_scope_push(&ctx->scope);
                 if (body->kind == AST_BLOCK) {
@@ -1112,24 +1170,28 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
 
     case AST_WHILE: {
         /* While loop: while <cond> { body }
-         * AST_WHILE: left=condition, right=body */
-        IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
+         * AST_WHILE: left=condition, right=body
+         *
+         * CFG:
+         *   pre  -> cond
+         *   cond -> body (true) | exit (false)
+         *   body -> cond  (and break -> exit, continue -> cond)
+         */
+        IrBasicBlock *pre_bb  = ctx->current_fn->current_bb;
         IrBasicBlock *cond_bb = ir_bb_new(ctx->current_fn, ctx->mod, "while.cond");
         IrBasicBlock *body_bb = ir_bb_new(ctx->current_fn, ctx->mod, "while.body");
         IrBasicBlock *exit_bb = ir_bb_new(ctx->current_fn, ctx->mod, "while.exit");
 
-        /* Jump from current block to cond */
         ir_set_current_bb(ctx->current_fn, pre_bb);
         ir_emit_jmp(ctx->current_fn, ctx->mod, cond_bb->id);
 
-        /* Condition */
         ir_set_current_bb(ctx->current_fn, cond_bb);
         int cond = irgen_expr(ctx, stmt->left);
         ir_emit_br(ctx->current_fn, ctx->mod, cond, body_bb->id, exit_bb->id);
 
-        /* Body */
         ir_set_current_bb(ctx->current_fn, body_bb);
         irgen_scope_push(&ctx->scope);
+        irgen_loop_push(ctx, cond_bb->id, exit_bb->id);
         if (stmt->right) {
             if (stmt->right->kind == AST_BLOCK) {
                 AstNode *s;
@@ -1139,11 +1201,122 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
                 irgen_stmt(ctx, stmt->right);
             }
         }
-        ir_emit_jmp(ctx->current_fn, ctx->mod, cond_bb->id);
+        irgen_loop_pop(ctx);
+
+        /* If body didn't terminate (return / break / explicit jmp), close
+         * the back-edge to the cond block. */
+        {
+            IrBasicBlock *cur = ctx->current_fn->current_bb;
+            IrInst *last = cur ? cur->last : NULL;
+            if (!last ||
+                (last->op != IR_RET && last->op != IR_JMP &&
+                 last->op != IR_BR)) {
+                ir_emit_jmp(ctx->current_fn, ctx->mod, cond_bb->id);
+            }
+        }
         irgen_scope_pop(&ctx->scope);
 
-        /* Exit */
         ir_set_current_bb(ctx->current_fn, exit_bb);
+        break;
+    }
+
+    case AST_LOOP: {
+        /* Unconditional loop: loop { body }. Terminates only via `break`
+         * (or a `return` inside the body).
+         *
+         * AST_LOOP: left=body
+         *
+         * CFG:
+         *   pre  -> header (unconditional)
+         *   header -> body (unconditional jmp; we keep them as separate BBs
+         *                   so `continue` always has a well-defined target)
+         *   body -> header (back-edge); break -> exit
+         */
+        IrBasicBlock *pre_bb  = ctx->current_fn->current_bb;
+        IrBasicBlock *head_bb = ir_bb_new(ctx->current_fn, ctx->mod, "loop.header");
+        IrBasicBlock *body_bb = ir_bb_new(ctx->current_fn, ctx->mod, "loop.body");
+        IrBasicBlock *exit_bb = ir_bb_new(ctx->current_fn, ctx->mod, "loop.exit");
+
+        ir_set_current_bb(ctx->current_fn, pre_bb);
+        ir_emit_jmp(ctx->current_fn, ctx->mod, head_bb->id);
+
+        ir_set_current_bb(ctx->current_fn, head_bb);
+        ir_emit_jmp(ctx->current_fn, ctx->mod, body_bb->id);
+
+        ir_set_current_bb(ctx->current_fn, body_bb);
+        irgen_scope_push(&ctx->scope);
+        irgen_loop_push(ctx, head_bb->id, exit_bb->id);
+        AstNode *body = stmt->left;
+        if (body) {
+            if (body->kind == AST_BLOCK) {
+                AstNode *s;
+                for (s = body->params; s; s = s->next)
+                    irgen_stmt(ctx, s);
+            } else {
+                irgen_stmt(ctx, body);
+            }
+        }
+        bool saw_break = irgen_loop_pop(ctx);
+
+        {
+            IrBasicBlock *cur = ctx->current_fn->current_bb;
+            IrInst *last = cur ? cur->last : NULL;
+            if (!last ||
+                (last->op != IR_RET && last->op != IR_JMP &&
+                 last->op != IR_BR)) {
+                ir_emit_jmp(ctx->current_fn, ctx->mod, head_bb->id);
+            }
+        }
+        irgen_scope_pop(&ctx->scope);
+
+        /* Stage0 defensive warning: an unconditional `loop { }` with no
+         * `break` in its lexical body is provably non-terminating. The
+         * dispatch-loop emitter will still produce a valid module, but
+         * the WASM runtime will spin forever. */
+        if (!saw_break) {
+            fprintf(stderr,
+                "warning: %s:%u: `loop { ... }` body has no `break`; "
+                "the loop will never terminate.\n",
+                stmt->loc.filename ? stmt->loc.filename : "<unknown>",
+                stmt->loc.line);
+        }
+
+        ir_set_current_bb(ctx->current_fn, exit_bb);
+        break;
+    }
+
+    case AST_BREAK: {
+        /* `break` jumps to the innermost enclosing loop's exit block.
+         * Outside any loop we silently NOP — the type-checker should have
+         * caught that case earlier; emitting a dangling jmp here would
+         * desync the dispatch table.
+         *
+         * After emitting the jmp we open a fresh "dead" basic block. Any
+         * subsequent statements in this lexical sequence will be lowered
+         * into a block that is unreachable in the dispatch table, which
+         * the WASM emitter handles safely (it just emits an unused bb
+         * body that falls through). */
+        IrGenLoopCtx *top = irgen_loop_top(ctx);
+        if (top) {
+            top->saw_break = true;
+            ir_emit_jmp(ctx->current_fn, ctx->mod, top->break_bb);
+            IrBasicBlock *dead = ir_bb_new(ctx->current_fn, ctx->mod, "after.break");
+            ir_set_current_bb(ctx->current_fn, dead);
+        }
+        break;
+    }
+
+    case AST_CONTINUE: {
+        /* `continue` jumps to the innermost loop's CONTINUE target —
+         * for `while`/`loop` that's the header (the cond check); for
+         * `for-in` that's the increment block so the loop var still
+         * advances. Same dead-block trick as AST_BREAK. */
+        IrGenLoopCtx *top = irgen_loop_top(ctx);
+        if (top) {
+            ir_emit_jmp(ctx->current_fn, ctx->mod, top->continue_bb);
+            IrBasicBlock *dead = ir_bb_new(ctx->current_fn, ctx->mod, "after.continue");
+            ir_set_current_bb(ctx->current_fn, dead);
+        }
         break;
     }
 
