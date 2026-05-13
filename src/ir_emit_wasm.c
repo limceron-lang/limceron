@@ -117,6 +117,38 @@
 #define WASM_HOST_ERR_ENTROPY_EXC    (-9)
 #define WASM_ENTROPY_UNBOUNDED       2147483647
 
+/* Budget runtime fence (L13).
+ *
+ * Each agent may declare a `budget: { max_tokens: <int>, max_cost: <float> }`
+ * block. When present, the compiler emits two wasm globals --
+ * `$tokens_remaining` (mut i32, init = declared max_tokens) and
+ * `$cost_micro_usd_remaining` (mut i64, init = declared max_cost * 1e6) --
+ * and decrements both at every host call site that consumes tokens or
+ * cost. A breach (either counter would go negative) short-circuits the
+ * enclosing function with `HostError.BudgetExceeded = -10`.
+ *
+ * The token/cost cost tables are per qualified host-call name and are
+ * hardcoded for stage0. Costs are intentionally conservative per-call
+ * estimates -- the authoritative reconciliation happens in Visual-DAG's
+ * `cost.Guard`. The wasm fence is the inner hard cap that lets a single
+ * Limceron program refuse to dispatch a call that would obviously
+ * overshoot the declared envelope.
+ *
+ * If the agent does NOT declare a budget block (or declares it without
+ * one of the recognised fields), the corresponding global is initialised
+ * to INT*_MAX so the fence is effectively a no-op. Chain order at each
+ * call site mirrors the natural failure precedence:
+ *   1. entropy fence  (L11)  -> HostError.EntropyExceeded  = -9
+ *   2. token  fence  (L13)  -> HostError.BudgetExceeded   = -10
+ *   3. cost   fence  (L13)  -> HostError.BudgetExceeded   = -10
+ * The first to trip wins. */
+#define WASM_TOKENS_GLOBAL              "$tokens_remaining"
+#define WASM_COST_GLOBAL                "$cost_micro_usd_remaining"
+#define WASM_HOST_ERR_BUDGET_EXC        (-10)
+#define WASM_TOKENS_UNBOUNDED           2147483647
+/* i64 MAX (= 9223372036854775807). Stay inside i64 literal range. */
+#define WASM_COST_UNBOUNDED             9223372036854775807LL
+
 typedef struct {
     const char *value;       /* pointer into IR (arena-owned), key for dedup */
     int         offset;      /* byte offset in linear memory */
@@ -166,6 +198,17 @@ typedef struct {
      * the emitted WAT. */
     int           entropy_budget_bits;
     int           entropy_budget_declared;
+
+    /* Token / cost budget (L13). `tokens_budget` is the declared
+     * `budget: { max_tokens: ... }` or WASM_TOKENS_UNBOUNDED if not
+     * declared. `cost_micro_usd_budget` is the declared `max_cost`
+     * converted to micro-USD (cost * 1_000_000, rounded to nearest)
+     * or WASM_COST_UNBOUNDED if not declared. `*_declared` flags
+     * drive only the diagnostic preamble comment. */
+    int           tokens_budget;
+    int           tokens_budget_declared;
+    int64_t       cost_micro_usd_budget;
+    int           cost_budget_declared;
 } EmitCtx;
 
 /* Per-function emission state. */
@@ -470,6 +513,244 @@ static void emit_entropy_fence(EmitCtx *ctx, int cost, IrType ret_type) {
         "      i32.sub\n"
         "      global.set %s\n",
         WASM_ENTROPY_GLOBAL, cost, WASM_ENTROPY_GLOBAL);
+}
+
+/* ============================================================
+ * Budget fence (L13)
+ *
+ * Maps each qualified host-call name to a per-call token estimate and a
+ * per-call cost estimate in micro-USD. Both tables are stage0-hardcoded
+ * and intentionally conservative:
+ *
+ *   llm.classify -> 100 tokens, 500   micro-USD (~$0.0005)
+ *   llm.chat     -> 1000 tokens, 30000 micro-USD (~$0.03)
+ *   others       -> 0 tokens, 0 micro-USD       (no fence overhead)
+ *
+ * Actual reconciliation lives in Visual-DAG's cost.Guard; the wasm
+ * fence is the inner hard cap so a runaway loop refuses to dispatch
+ * once the declared envelope is exhausted.
+ * ============================================================ */
+
+static int token_cost_for(const char *qname) {
+    if (!qname) return 0;
+    if (strcmp(qname, "llm.classify") == 0) return 100;
+    if (strcmp(qname, "llm.chat")     == 0) return 1000;
+    return 0;
+}
+
+static int64_t cost_micro_usd_for(const char *qname) {
+    if (!qname) return 0;
+    if (strcmp(qname, "llm.classify") == 0) return 500;
+    if (strcmp(qname, "llm.chat")     == 0) return 30000;
+    return 0;
+}
+
+/* Extract a scalar numeric value from a `budget` block field. Accepts
+ * both AST_INT_LIT (e.g. `max_tokens: 5000`) and AST_FLOAT_LIT (e.g.
+ * `max_cost: 0.05`) and returns the value as a double. Returns 0 on
+ * any unsupported shape; callers check `*found` to distinguish
+ * "declared as 0" from "not declared". */
+static double budget_field_value(AstNode *field, int *found) {
+    *found = 0;
+    if (!field || !field->right) return 0.0;
+    if (field->right->kind == AST_INT_LIT) {
+        *found = 1;
+        return (double)field->right->val.int_val;
+    }
+    if (field->right->kind == AST_FLOAT_LIT) {
+        *found = 1;
+        return field->right->val.float_val;
+    }
+    return 0.0;
+}
+
+/* Walk an AST_AGENT looking for a `budget: { max_tokens: ..., max_cost:
+ * ... }` field. Populates the four out parameters describing what was
+ * found. The legacy form `budget: BudgetName` (identifier reference)
+ * is treated as "no inline declaration" -- a follow-up could resolve
+ * the named budget but stage0 keeps the fence scoped to the inline
+ * block form. */
+static void agent_token_cost_budget(AstNode *agent,
+                                    int *tokens, int *tokens_found,
+                                    int64_t *cost_micro, int *cost_found) {
+    *tokens = 0;
+    *tokens_found = 0;
+    *cost_micro = 0;
+    *cost_found = 0;
+    if (!agent || agent->kind != AST_AGENT) return;
+
+    AstNode *f;
+    for (f = agent->params; f; f = f->next) {
+        if (f->kind != AST_FIELD || !f->name) continue;
+        if (strcmp(f->name, "budget") != 0) continue;
+        if (!f->right || f->right->kind != AST_BLOCK) return;
+
+        AstNode *bf;
+        for (bf = f->right->params; bf; bf = bf->next) {
+            if (bf->kind != AST_FIELD || !bf->name) continue;
+            int got = 0;
+            double v = budget_field_value(bf, &got);
+            if (!got) continue;
+            if (strcmp(bf->name, "max_tokens") == 0) {
+                if (v < 0) v = 0;
+                if (v > (double)WASM_TOKENS_UNBOUNDED) v = WASM_TOKENS_UNBOUNDED;
+                *tokens = (int)v;
+                *tokens_found = 1;
+            } else if (strcmp(bf->name, "max_cost") == 0) {
+                /* max_cost is in whole USD (e.g. 0.05 = 5 cents). Convert
+                 * to micro-USD for cheap i64 arithmetic at runtime. */
+                double micro = v * 1000000.0;
+                if (micro < 0) micro = 0;
+                if (micro > (double)WASM_COST_UNBOUNDED)
+                    micro = (double)WASM_COST_UNBOUNDED;
+                *cost_micro = (int64_t)(micro + 0.5);
+                *cost_found = 1;
+            }
+        }
+        return; /* Only the first `budget:` field is honoured. */
+    }
+}
+
+/* Program-level scan: take the first agent's budget block as the module
+ * budget. Stage0 supports a single agent per module for the WASM emit
+ * path. If no agent declares a budget, both globals init to MAX so the
+ * fence is a no-op. */
+static void scan_budget(EmitCtx *ctx, AstNode *program) {
+    ctx->tokens_budget          = WASM_TOKENS_UNBOUNDED;
+    ctx->tokens_budget_declared = 0;
+    ctx->cost_micro_usd_budget  = WASM_COST_UNBOUNDED;
+    ctx->cost_budget_declared   = 0;
+    if (!program || program->kind != AST_PROGRAM) return;
+
+    AstNode *decl;
+    for (decl = program->params; decl; decl = decl->next) {
+        if (decl->kind != AST_AGENT) continue;
+        int tokens = 0, tokens_found = 0;
+        int64_t cost_micro = 0;
+        int cost_found = 0;
+        agent_token_cost_budget(decl, &tokens, &tokens_found,
+                                &cost_micro, &cost_found);
+        if (tokens_found) {
+            ctx->tokens_budget          = tokens;
+            ctx->tokens_budget_declared = 1;
+        }
+        if (cost_found) {
+            ctx->cost_micro_usd_budget  = cost_micro;
+            ctx->cost_budget_declared   = 1;
+        }
+        if (tokens_found || cost_found) return;
+    }
+}
+
+/* Emit the per-call-site token fence: load $tokens_remaining, compare
+ * against the per-call cost, return BudgetExceeded if it would underflow,
+ * otherwise subtract and proceed. Mirrors `emit_entropy_fence` shape. */
+static void emit_token_fence(EmitCtx *ctx, int cost, IrType ret_type) {
+    FILE *out = ctx->out;
+    if (cost <= 0) return;
+
+    const char *sentinel_push;
+    char buf[80];
+    switch (ret_type) {
+    case IR_TYPE_F64:
+        snprintf(buf, sizeof(buf),
+                 "        f64.const %d  ;; HostError.BudgetExceeded",
+                 WASM_HOST_ERR_BUDGET_EXC);
+        sentinel_push = buf;
+        break;
+    case IR_TYPE_BOOL:
+    case IR_TYPE_PTR:
+    case IR_TYPE_STRING:
+    case IR_TYPE_STRUCT:
+        snprintf(buf, sizeof(buf),
+                 "        i32.const %d  ;; HostError.BudgetExceeded",
+                 WASM_HOST_ERR_BUDGET_EXC);
+        sentinel_push = buf;
+        break;
+    case IR_TYPE_VOID:
+        sentinel_push = NULL;
+        break;
+    case IR_TYPE_I64:
+    default:
+        snprintf(buf, sizeof(buf),
+                 "        i64.const %d  ;; HostError.BudgetExceeded",
+                 WASM_HOST_ERR_BUDGET_EXC);
+        sentinel_push = buf;
+        break;
+    }
+    fprintf(out,
+        "      ;; --- token fence: cost=%d ---\n"
+        "      global.get %s\n"
+        "      i32.const %d\n"
+        "      i32.lt_s\n"
+        "      if\n",
+        cost, WASM_TOKENS_GLOBAL, cost);
+    if (sentinel_push) {
+        fprintf(out, "%s\n", sentinel_push);
+    }
+    fprintf(out,
+        "        return\n"
+        "      end\n"
+        "      global.get %s\n"
+        "      i32.const %d\n"
+        "      i32.sub\n"
+        "      global.set %s\n",
+        WASM_TOKENS_GLOBAL, cost, WASM_TOKENS_GLOBAL);
+}
+
+/* Emit the per-call-site cost fence: same shape as the token fence but
+ * the counter is i64 (micro-USD) so we use i64.lt_s / i64.sub. */
+static void emit_cost_fence(EmitCtx *ctx, int64_t cost, IrType ret_type) {
+    FILE *out = ctx->out;
+    if (cost <= 0) return;
+
+    const char *sentinel_push;
+    char buf[80];
+    switch (ret_type) {
+    case IR_TYPE_F64:
+        snprintf(buf, sizeof(buf),
+                 "        f64.const %d  ;; HostError.BudgetExceeded",
+                 WASM_HOST_ERR_BUDGET_EXC);
+        sentinel_push = buf;
+        break;
+    case IR_TYPE_BOOL:
+    case IR_TYPE_PTR:
+    case IR_TYPE_STRING:
+    case IR_TYPE_STRUCT:
+        snprintf(buf, sizeof(buf),
+                 "        i32.const %d  ;; HostError.BudgetExceeded",
+                 WASM_HOST_ERR_BUDGET_EXC);
+        sentinel_push = buf;
+        break;
+    case IR_TYPE_VOID:
+        sentinel_push = NULL;
+        break;
+    case IR_TYPE_I64:
+    default:
+        snprintf(buf, sizeof(buf),
+                 "        i64.const %d  ;; HostError.BudgetExceeded",
+                 WASM_HOST_ERR_BUDGET_EXC);
+        sentinel_push = buf;
+        break;
+    }
+    fprintf(out,
+        "      ;; --- cost fence: cost_micro_usd=%lld ---\n"
+        "      global.get %s\n"
+        "      i64.const %lld\n"
+        "      i64.lt_s\n"
+        "      if\n",
+        (long long)cost, WASM_COST_GLOBAL, (long long)cost);
+    if (sentinel_push) {
+        fprintf(out, "%s\n", sentinel_push);
+    }
+    fprintf(out,
+        "        return\n"
+        "      end\n"
+        "      global.get %s\n"
+        "      i64.const %lld\n"
+        "      i64.sub\n"
+        "      global.set %s\n",
+        WASM_COST_GLOBAL, (long long)cost, WASM_COST_GLOBAL);
 }
 
 /* Emit the `(import "vdag:<ns>" "<fn>" (func ...))` declarations for
@@ -1001,6 +1282,17 @@ static void emit_instruction(FnCtx *fctx, IrBasicBlock *bb, IrInst *inst) {
         emit_entropy_fence(fctx->gctx,
                            entropy_cost_for(qname),
                            fctx->fn->return_type);
+
+        /* L13: token + cost fences. Order matters: entropy first,
+         * then tokens, then cost. The first counter to underflow
+         * short-circuits the function so callers see a consistent
+         * failure-mode ordering across replays. */
+        emit_token_fence(fctx->gctx,
+                         token_cost_for(qname),
+                         fctx->fn->return_type);
+        emit_cost_fence(fctx->gctx,
+                        cost_micro_usd_for(qname),
+                        fctx->fn->return_type);
 
         int out_buf = s->scratch_off;
         int conf_off = s->scratch_off + WASM_HOST_OUTBUF_MAX;
@@ -1632,6 +1924,32 @@ static void emit_module(FILE *out, IrModule *mod, EmitCtx *ctx) {
     fprintf(out, "  (global %s (mut i32) (i32.const %d))\n",
             WASM_ENTROPY_GLOBAL, ctx->entropy_budget_bits);
 
+    /* L13: token + cost budget globals. Same no-op-on-undeclared shape
+     * as the entropy global. The token global is i32, the cost global
+     * is i64 (micro-USD) so cents-level granularity fits without
+     * float-arithmetic in the fence. */
+    if (ctx->tokens_budget_declared) {
+        fprintf(out,
+                "  ;; agent-declared token budget: %d tokens\n",
+                ctx->tokens_budget);
+    } else {
+        fprintf(out,
+                "  ;; no max_tokens declared -- token fence is a no-op\n");
+    }
+    fprintf(out, "  (global %s (mut i32) (i32.const %d))\n",
+            WASM_TOKENS_GLOBAL, ctx->tokens_budget);
+
+    if (ctx->cost_budget_declared) {
+        fprintf(out,
+                "  ;; agent-declared cost budget: %lld micro-USD\n",
+                (long long)ctx->cost_micro_usd_budget);
+    } else {
+        fprintf(out,
+                "  ;; no max_cost declared -- cost fence is a no-op\n");
+    }
+    fprintf(out, "  (global %s (mut i64) (i64.const %lld))\n",
+            WASM_COST_GLOBAL, (long long)ctx->cost_micro_usd_budget);
+
     /* String data segment. */
     emit_data_segment(ctx);
 
@@ -1757,6 +2075,7 @@ int lcn_emit_wasm(AstNode *program, const char *input,
     preintern_strings(&ctx);
     preregister_host_calls(&ctx);
     scan_entropy_budget(&ctx, program);
+    scan_budget(&ctx, program);
     ctx.data_total = ctx.data_offset;
 
     /* 3. Open temp .wat file. */
@@ -1849,6 +2168,7 @@ int lcn_emit_wasm_wat(AstNode *program, FILE *out, Arena *arena,
     preintern_strings(&ctx);
     preregister_host_calls(&ctx);
     scan_entropy_budget(&ctx, program);
+    scan_budget(&ctx, program);
     ctx.data_total  = ctx.data_offset;
 
     emit_module(out, mod, &ctx);

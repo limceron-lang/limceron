@@ -2174,6 +2174,203 @@ TEST(wasm_entropy_trap_wat_shape) {
 }
 
 /* ============================================================
+ * L13: budget runtime fence (WASM emit)
+ *
+ * The declared `budget: { max_tokens: N, max_cost: F }` becomes two
+ * wasm globals -- `$tokens_remaining` (mut i32) and
+ * `$cost_micro_usd_remaining` (mut i64) -- and a per-call-site fence
+ * that decrements + bounds-checks both before dispatching. The cost
+ * tables are hardcoded in `src/ir_emit_wasm.c::token_cost_for` /
+ * `cost_micro_usd_for`; these tests rely on `llm.classify` having
+ * cost 100 tokens / 500 micro-USD.
+ * ============================================================ */
+
+TEST(wasm_budget_globals_initialised_to_declared_budgets) {
+    /* `budget: { max_tokens: 5000, max_cost: 0.05 }` on an agent must
+     * produce two wasm globals at the module preamble: `$tokens_remaining`
+     * (mut i32) initialised to 5000 and `$cost_micro_usd_remaining`
+     * (mut i64) initialised to 50000 (= 0.05 USD * 1e6). */
+    char *wat = wat_from_source(
+        "agent HasBudget {\n"
+        "    capabilities: [llm.classify]\n"
+        "    budget: { max_tokens: 5000, max_cost: 0.05 }\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+    ASSERT(strstr(wat,
+        "(global $tokens_remaining (mut i32) (i32.const 5000))") != NULL);
+    ASSERT(strstr(wat,
+        "(global $cost_micro_usd_remaining (mut i64) (i64.const 50000))")
+        != NULL);
+    free(wat);
+
+    /* No budget declared -> both globals default to MAX (i32_MAX / i64_MAX)
+     * so the fence is a no-op. */
+    char *wat2 = wat_from_source(
+        "agent NoBudget {\n"
+        "    capabilities: [llm.classify]\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat2);
+    ASSERT(strstr(wat2,
+        "(global $tokens_remaining (mut i32) (i32.const 2147483647))")
+        != NULL);
+    ASSERT(strstr(wat2,
+        "(global $cost_micro_usd_remaining (mut i64) "
+        "(i64.const 9223372036854775807))") != NULL);
+    free(wat2);
+}
+
+TEST(wasm_budget_token_decrement_wat_shape) {
+    /* At every llm.classify site the compiler must emit a token fence
+     * that decrements $tokens_remaining by the per-call cost (100) and
+     * writes the result back via global.set. The fence must follow the
+     * entropy fence in the emission order. */
+    char *wat = wat_from_source(
+        "agent TokenDecrement {\n"
+        "    capabilities: [llm.classify]\n"
+        "    budget: { max_tokens: 5000, max_cost: 0.05 }\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    /* Cost-100 token fence header. */
+    ASSERT(strstr(wat, ";; --- token fence: cost=100 ---") != NULL);
+
+    /* The read-modify-write sequence must appear, AND global.set must
+     * follow i32.sub so the budget actually persists between calls. */
+    const char *fence = strstr(wat, ";; --- token fence: cost=100 ---");
+    ASSERT_NOT_NULL(fence);
+    const char *sub = strstr(fence, "i32.sub");
+    ASSERT_NOT_NULL(sub);
+    const char *set = strstr(sub, "global.set $tokens_remaining");
+    ASSERT_NOT_NULL(set);
+
+    /* Order: entropy fence (if declared) must appear before token fence
+     * at each call site. Here no entropy_budget is declared so the
+     * entropy fence is suppressed (cost=0), but the token fence still
+     * goes before the cost fence. */
+    const char *token = strstr(wat, ";; --- token fence: cost=100 ---");
+    ASSERT_NOT_NULL(token);
+    const char *cost  = strstr(token, ";; --- cost fence:");
+    ASSERT_NOT_NULL(cost);
+
+    free(wat);
+}
+
+TEST(wasm_budget_cost_decrement_wat_shape) {
+    /* The cost fence works on the i64 micro-USD global and uses i64
+     * arithmetic throughout: i64.lt_s for the trap test and i64.sub
+     * for the decrement. The trap pushes the BudgetExceeded sentinel
+     * (-10) before returning. */
+    char *wat = wat_from_source(
+        "agent CostDecrement {\n"
+        "    capabilities: [llm.classify]\n"
+        "    budget: { max_tokens: 5000, max_cost: 0.05 }\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    /* Cost fence header at 500 micro-USD per llm.classify. */
+    const char *fence = strstr(wat, ";; --- cost fence: cost_micro_usd=500 ---");
+    ASSERT_NOT_NULL(fence);
+
+    /* The fence reads the i64 global, compares, traps with -10, then
+     * subtracts. Anchors must appear in that order. */
+    const char *get_ = strstr(fence, "global.get $cost_micro_usd_remaining");
+    ASSERT_NOT_NULL(get_);
+    const char *lt = strstr(get_, "i64.lt_s");
+    ASSERT_NOT_NULL(lt);
+    const char *iff = strstr(lt, "if");
+    ASSERT_NOT_NULL(iff);
+    const char *sentinel = strstr(iff,
+        "i64.const -10  ;; HostError.BudgetExceeded");
+    ASSERT_NOT_NULL(sentinel);
+    const char *ret = strstr(sentinel, "return");
+    ASSERT_NOT_NULL(ret);
+    const char *end = strstr(ret, "end");
+    ASSERT_NOT_NULL(end);
+    const char *sub = strstr(end, "i64.sub");
+    ASSERT_NOT_NULL(sub);
+    const char *set = strstr(sub, "global.set $cost_micro_usd_remaining");
+    ASSERT_NOT_NULL(set);
+
+    free(wat);
+}
+
+TEST(wasm_budget_token_trap_shape) {
+    /* When max_tokens is too small to cover a single llm.classify call
+     * the token fence must trap with HostError.BudgetExceeded = -10
+     * BEFORE the actual host call is dispatched. Budget=0 propagates
+     * verbatim into the global initialiser so the very first call trips. */
+    char *wat = wat_from_source(
+        "agent TokenTrap {\n"
+        "    capabilities: [llm.classify]\n"
+        "    budget: { max_tokens: 0, max_cost: 1.0 }\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+    ASSERT(strstr(wat,
+        "(global $tokens_remaining (mut i32) (i32.const 0))") != NULL);
+
+    const char *fence = strstr(wat, ";; --- token fence: cost=100 ---");
+    ASSERT_NOT_NULL(fence);
+    const char *lt = strstr(fence, "i32.lt_s");
+    ASSERT_NOT_NULL(lt);
+    const char *iff = strstr(lt, "if");
+    ASSERT_NOT_NULL(iff);
+    const char *sentinel = strstr(iff,
+        "i64.const -10  ;; HostError.BudgetExceeded");
+    ASSERT_NOT_NULL(sentinel);
+
+    free(wat);
+}
+
+TEST(wasm_budget_chain_order_entropy_then_tokens_then_cost) {
+    /* At each call site the fences must appear in the canonical chain
+     * order: entropy first (L11), then tokens (L13), then cost (L13).
+     * The first fence to trip wins, so replays observe a deterministic
+     * failure mode regardless of which counter would also have exceeded. */
+    char *wat = wat_from_source(
+        "agent Chain {\n"
+        "    capabilities: [llm.classify]\n"
+        "    entropy_budget: 10\n"
+        "    budget: { max_tokens: 5000, max_cost: 0.05 }\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    const char *entropy = strstr(wat, ";; --- entropy fence: cost=1 ---");
+    ASSERT_NOT_NULL(entropy);
+    const char *token   = strstr(entropy,
+        ";; --- token fence: cost=100 ---");
+    ASSERT_NOT_NULL(token);
+    const char *cost    = strstr(token,
+        ";; --- cost fence: cost_micro_usd=500 ---");
+    ASSERT_NOT_NULL(cost);
+
+    free(wat);
+}
+
+/* ============================================================
  * Main
  * ============================================================ */
 
@@ -2295,6 +2492,13 @@ int main(void) {
     RUN_TEST(wasm_entropy_global_initialised_to_declared_budget);
     RUN_TEST(wasm_entropy_decrement_wat_shape);
     RUN_TEST(wasm_entropy_trap_wat_shape);
+
+    fprintf(stderr, "\n-- L13: budget runtime fence --\n");
+    RUN_TEST(wasm_budget_globals_initialised_to_declared_budgets);
+    RUN_TEST(wasm_budget_token_decrement_wat_shape);
+    RUN_TEST(wasm_budget_cost_decrement_wat_shape);
+    RUN_TEST(wasm_budget_token_trap_shape);
+    RUN_TEST(wasm_budget_chain_order_entropy_then_tokens_then_cost);
 
     ir_test_teardown();
 
