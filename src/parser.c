@@ -70,6 +70,9 @@ const char *ast_kind_name(AstKind kind) {
         [AST_SELECT]        = "Select",
         [AST_SELECT_ARM]    = "SelectArm",
         [AST_TRY]           = "Try",
+        [AST_RESULT_OK]     = "ResultOk",
+        [AST_RESULT_ERR]    = "ResultErr",
+        [AST_TRY_CATCH]     = "TryCatch",
         [AST_UNSAFE_BLOCK]  = "UnsafeBlock",
         [AST_COMPTIME]      = "Comptime",
         [AST_REF]           = "Ref",
@@ -820,6 +823,22 @@ static AstNode *parse_expr(Parser *p, Precedence min_prec) {
             }
             parser_expect(p, TOK_RPAREN, "after function arguments");
             node->params = args;
+            /* L5: rewrite Ok(x) / Err(code) — Result<T,E> constructors —
+             * into dedicated AST kinds so downstream passes (typecheck,
+             * ir_gen) recognize them without name-based pattern matching
+             * on every AST_CALL. */
+            if (left && left->kind == AST_IDENT && left->name && args &&
+                !args->next) {
+                if (strcmp(left->name, "Ok") == 0) {
+                    AstNode *ok = ast_new(p->arena, AST_RESULT_OK, loc);
+                    ok->left = args;
+                    node = ok;
+                } else if (strcmp(left->name, "Err") == 0) {
+                    AstNode *err = ast_new(p->arena, AST_RESULT_ERR, loc);
+                    err->left = args;
+                    node = err;
+                }
+            }
             left = node;
             continue;
         }
@@ -1162,10 +1181,36 @@ static AstNode *parse_prefix(Parser *p) {
 
     /* Try-otherwise: try <expr> otherwise <fallback>
      * Evaluates expr; if it errors, evaluates fallback instead.
-     * 'try' is detected as an identifier (not a keyword). */
+     * 'try' is detected as an identifier (not a keyword).
+     *
+     * L5: `try { body } catch (e: T) { handler }` — Result<T,E> recovery.
+     * If the next token after 'try' is '{', we parse the new form; else we
+     * fall through to the legacy try-otherwise. */
     if (parser_check(p, TOK_IDENT) && p->current.value.str_val &&
         strcmp(p->current.value.str_val, "try") == 0) {
         parser_advance(p); /* consume 'try' */
+        if (parser_check(p, TOK_LBRACE)) {
+            /* try { body } catch (e: T) { handler } */
+            AstNode *node = ast_new(p->arena, AST_TRY_CATCH, loc);
+            node->left = parse_block(p);
+            if (parser_check(p, TOK_IDENT) && p->current.value.str_val &&
+                strcmp(p->current.value.str_val, "catch") == 0) {
+                parser_advance(p); /* consume 'catch' */
+                parser_expect(p, TOK_LPAREN, "after 'catch'");
+                if (parser_check(p, TOK_IDENT)) {
+                    node->name = p->current.value.str_val;
+                    parser_advance(p);
+                } else {
+                    node->name = "e";
+                }
+                if (parser_match(p, TOK_COLON)) {
+                    node->type_expr = parse_type_expr(p);
+                }
+                parser_expect(p, TOK_RPAREN, "after catch binding");
+                node->right = parse_block(p);
+            }
+            return node;
+        }
         AstNode *node = ast_new(p->arena, AST_TRY_OTHERWISE, loc);
         node->left = parse_expr(p, PREC_PIPE_OP);
         if (parser_match(p, TOK_OTHERWISE)) {

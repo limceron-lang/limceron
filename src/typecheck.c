@@ -611,7 +611,14 @@ static void find_tool_calls_in_expr(AstNode *expr, ToolCallCtx *ctx,
     case AST_TRY:
     case AST_AWAIT:
     case AST_SPAWN:
+    case AST_RESULT_OK:
+    case AST_RESULT_ERR:
         find_tool_calls_in_expr(expr->left, ctx, on_call, user);
+        break;
+
+    case AST_TRY_CATCH:
+        find_tool_calls_in_block(expr->left,  ctx, on_call, user);
+        find_tool_calls_in_block(expr->right, ctx, on_call, user);
         break;
 
     case AST_CLOSURE:
@@ -2310,7 +2317,21 @@ static void check_expr(SymbolTable *st, AstNode *expr,
     case AST_TRY:
     case AST_AWAIT:
     case AST_SPAWN:
+    case AST_RESULT_OK:
+    case AST_RESULT_ERR:
         check_expr(st, expr->left, reporter, arena);
+        break;
+
+    case AST_TRY_CATCH:
+        /* The catch-binding `e: T` lives in the handler's scope only.
+         * For v1 we accept any enum-like type as E and rely on the
+         * negative-i32 sentinel encoding; full Result<T,E> generics are a
+         * later increment. We still walk both blocks so nested
+         * expressions get checked. */
+        check_stmt(st, expr->left,  reporter, arena);
+        check_stmt(st, expr->right, reporter, arena);
+        if (expr->type_expr)
+            check_type_expr(st, expr->type_expr, reporter, arena);
         break;
 
     case AST_PIPE:
@@ -4100,7 +4121,14 @@ static void own_check_expr(OwnershipCtx *ctx, AstNode *expr,
     case AST_TRY:
     case AST_AWAIT:
     case AST_SPAWN:
+    case AST_RESULT_OK:
+    case AST_RESULT_ERR:
         own_check_expr(ctx, expr->left, reporter, arena);
+        break;
+
+    case AST_TRY_CATCH:
+        own_check_stmt(ctx, expr->left,  reporter, arena);
+        own_check_stmt(ctx, expr->right, reporter, arena);
         break;
 
     case AST_RANGE:

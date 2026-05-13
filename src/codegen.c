@@ -3481,6 +3481,22 @@ static void cg_expr(CodeGen *g, AstNode *expr) {
         cg_expr(g, expr->left);
         break;
 
+    case AST_RESULT_OK:
+    case AST_RESULT_ERR:
+        /* L5: Result<T,E> constructors. In the C transpiler we use the
+         * negative-i32 sentinel encoding (same as the WASM ABI): Ok(v)
+         * is just v, Err(code) is just code (already negative). */
+        if (expr->left) cg_expr(g, expr->left);
+        else cg_str(g, "0");
+        break;
+
+    case AST_TRY_CATCH:
+        /* L5: try/catch — in the C transpiler we just evaluate the try
+         * block (no early-exit semantics here; full lowering lives in
+         * the IR backend used by the WASM target). */
+        if (expr->left) cg_expr(g, expr->left);
+        break;
+
     case AST_TRY_OTHERWISE: {
         /* try expr otherwise fallback
          * Desugar to: ({ LcnLlmOutput _r = expr; if (_r.kind == LCN_LLM_ERROR) { _r = fallback; } _r; })

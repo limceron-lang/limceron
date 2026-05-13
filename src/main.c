@@ -1528,6 +1528,27 @@ static void fmt_expr(FmtCtx *ctx, AstNode *e) {
         fmt_expr(ctx, e->left);
         fprintf(ctx->out, "?");
         break;
+    case AST_RESULT_OK:
+        fprintf(ctx->out, "Ok(");
+        if (e->left) fmt_expr(ctx, e->left);
+        fprintf(ctx->out, ")");
+        break;
+    case AST_RESULT_ERR:
+        fprintf(ctx->out, "Err(");
+        if (e->left) fmt_expr(ctx, e->left);
+        fprintf(ctx->out, ")");
+        break;
+    case AST_TRY_CATCH:
+        fprintf(ctx->out, "try ");
+        if (e->left) fmt_expr(ctx, e->left);
+        fprintf(ctx->out, " catch (%s", e->name ? e->name : "e");
+        if (e->type_expr) {
+            fprintf(ctx->out, ": ");
+            fmt_type_expr(ctx, e->type_expr);
+        }
+        fprintf(ctx->out, ") ");
+        if (e->right) fmt_expr(ctx, e->right);
+        break;
     case AST_REF:
         fprintf(ctx->out, "&");
         if (e->is_mut) fprintf(ctx->out, "mut ");

@@ -369,6 +369,9 @@ typedef enum {
     AST_SELECT,
     AST_SELECT_ARM,
     AST_TRY,
+    AST_RESULT_OK,         /* Ok(expr) — Result<T,E> success variant */
+    AST_RESULT_ERR,        /* Err(code) — Result<T,E> error variant */
+    AST_TRY_CATCH,         /* try { body } catch (e: T) { handler } */
     AST_UNSAFE_BLOCK,
     AST_COMPTIME,
     AST_REF,

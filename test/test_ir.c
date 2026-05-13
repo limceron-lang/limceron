@@ -966,6 +966,157 @@ TEST(ir_gen_json_chained_pipeline) {
 }
 
 /* ============================================================
+ * L5: Result<T,E> + ? propagator + try/catch
+ *
+ * Tests verify the lowering shape: Ok/Err constructors are no-ops at
+ * the i64 level (negative-i32 sentinel encoding doubles as the Result
+ * runtime repr); `?` lowers to cmp_lt + br with either ret-Err or
+ * jump-to-catch on the negative branch; and `try {} catch {}` produces
+ * three blocks with a PHI in merge.
+ * ============================================================ */
+
+TEST(ir_gen_result_ok_pass_through) {
+    /* Ok(v) lowers to v as i64: no wrapping, no extra opcode. */
+    IrModule *mod = ir_from_source(
+        "fn make() -> int {\n"
+        "    Ok(42)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    IrInst *c = find_opcode(fn, IR_CONST_INT);
+    ASSERT_NOT_NULL(c);
+    ASSERT_EQ(c->imm_int, 42);
+    ASSERT_EQ(count_opcode(fn, IR_CALL), 0);
+    ASSERT(count_opcode(fn, IR_RET) >= 1);
+}
+
+TEST(ir_gen_result_err_pass_through) {
+    /* Err(-3) lowers to a neg of 3 — no call to lcn_Err. */
+    IrModule *mod = ir_from_source(
+        "fn make() -> int {\n"
+        "    Err(-3)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    ASSERT_EQ(count_opcode(fn, IR_CALL), 0);
+    ASSERT(count_opcode(fn, IR_RET) >= 1);
+}
+
+TEST(ir_gen_try_propagates_via_ret) {
+    /* `expr?` outside a try-catch lowers to cmp_lt + br;
+     * the err branch ends in ret %v. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Err(-3) }\n"
+        "fn main() -> int {\n"
+        "    let x = fetch()?\n"
+        "    x + 1\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(main_fn);
+    ASSERT(count_opcode(main_fn, IR_CMP_LT) >= 1);
+    ASSERT(count_opcode(main_fn, IR_BR) >= 1);
+    ASSERT(count_opcode(main_fn, IR_RET) >= 2);
+}
+
+TEST(ir_gen_try_emits_try_err_and_try_ok_blocks) {
+    /* Block labels carry the rationale: try.err / try.ok. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Ok(7) }\n"
+        "fn caller() -> int { let x = fetch()?\nx }\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(fn);
+    bool saw_err = false, saw_ok = false;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        if (bb->label && strcmp(bb->label, "try.err") == 0) saw_err = true;
+        if (bb->label && strcmp(bb->label, "try.ok")  == 0) saw_ok  = true;
+    }
+    ASSERT(saw_err);
+    ASSERT(saw_ok);
+}
+
+TEST(ir_gen_try_catch_emits_three_blocks_with_phi) {
+    /* try { ok_val } catch (e) { err_val } produces try.body, try.catch,
+     * try.merge — and a phi in merge joining both incoming values. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Err(-3) }\n"
+        "fn main() -> int {\n"
+        "    try {\n"
+        "        let x = fetch()?\n"
+        "        x + 1\n"
+        "    } catch (e: int) {\n"
+        "        e\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(main_fn);
+    bool body = false, cat = false, merge = false;
+    for (IrBasicBlock *bb = main_fn->entry; bb; bb = bb->next) {
+        if (bb->label && strcmp(bb->label, "try.body")  == 0) body  = true;
+        if (bb->label && strcmp(bb->label, "try.catch") == 0) cat   = true;
+        if (bb->label && strcmp(bb->label, "try.merge") == 0) merge = true;
+    }
+    ASSERT(body);
+    ASSERT(cat);
+    ASSERT(merge);
+    IrInst *phi = find_opcode(main_fn, IR_PHI);
+    ASSERT_NOT_NULL(phi);
+    ASSERT(phi->phi_count >= 2);
+}
+
+TEST(ir_gen_try_catch_question_jumps_to_catch_not_ret) {
+    /* Inside a try-catch, `?` must NOT emit a `ret`. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Err(-3) }\n"
+        "fn main() -> int {\n"
+        "    try {\n"
+        "        let x = fetch()?\n"
+        "        x\n"
+        "    } catch (e: int) {\n"
+        "        e\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(main_fn);
+    ASSERT_EQ(count_opcode(main_fn, IR_RET), 1);
+}
+
+TEST(ir_gen_try_catch_chained_propagation) {
+    /* Chain of three ? calls: each produces its own cmp_lt + br pair. */
+    IrModule *mod = ir_from_source(
+        "fn a() -> int { Ok(1) }\n"
+        "fn b() -> int { Ok(2) }\n"
+        "fn c() -> int { Ok(3) }\n"
+        "fn main() -> int {\n"
+        "    try {\n"
+        "        let x = a()?\n"
+        "        let y = b()?\n"
+        "        let z = c()?\n"
+        "        x + y + z\n"
+        "    } catch (e: int) {\n"
+        "        e\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 3);
+    ASSERT_NOT_NULL(main_fn);
+    ASSERT(count_opcode(main_fn, IR_CMP_LT) >= 3);
+    ASSERT(count_opcode(main_fn, IR_BR)     >= 3);
+}
+
+/* ============================================================
  * IR Optimization Tests
  * ============================================================ */
 
@@ -1900,6 +2051,15 @@ int main(void) {
     RUN_TEST(ir_gen_json_is_null_host_call);
     RUN_TEST(ir_gen_json_stringify_host_call);
     RUN_TEST(ir_gen_json_chained_pipeline);
+
+    fprintf(stderr, "\n-- L5: Result + ? + try/catch --\n");
+    RUN_TEST(ir_gen_result_ok_pass_through);
+    RUN_TEST(ir_gen_result_err_pass_through);
+    RUN_TEST(ir_gen_try_propagates_via_ret);
+    RUN_TEST(ir_gen_try_emits_try_err_and_try_ok_blocks);
+    RUN_TEST(ir_gen_try_catch_emits_three_blocks_with_phi);
+    RUN_TEST(ir_gen_try_catch_question_jumps_to_catch_not_ret);
+    RUN_TEST(ir_gen_try_catch_chained_propagation);
 
     fprintf(stderr, "\n-- IR Optimization --\n");
     RUN_TEST(ir_opt_constant_fold);

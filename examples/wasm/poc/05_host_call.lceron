@@ -7,69 +7,63 @@
 // declaration and the buffer-protocol ABI documented in
 // Visual-DAG/internal/nodes/code/imports.go.
 //
-// The host-call return value is an i32 whose magnitude is the byte
-// length of the label written into the call-site's scratch buffer
-// (and whose sign distinguishes success from a HostErr* code). We use
-// that integer as the "signal" the act/observe stages route on, which
-// keeps this sample faithful to the wider ReAct shape while staying
-// inside Limceron's current type system (strings flowing through the
-// language are still a stage-1 problem).
+// L5 update: every `vdag:*` host call now logically returns
+// `Result<i64, HostError>`. At the WASM ABI level the encoding is
+// unchanged — positive = bytes written, negative = HostErr* — but the
+// Limceron front-end exposes this through the `?` propagator. A call
+// like `llm.classify(prompt)?` short-circuits the enclosing fn (or
+// the enclosing try/catch) when the host returns a negative code,
+// instead of letting the negative value flow through downstream math.
 //
-// Verdict mapping (returned by main / agent_main):
+// The verdict mapping below is what `main` produces under three scenarios:
 //   2 = ESCALATE   (label length >= 8)
 //   1 = PROCEED    (label length in [3,7])
 //   0 = ABORT      (label length in [0,2])
-//  -1 = host error (HostErr* propagated as a negative signal)
+//   <0 = host error propagated upward via `?` (e.g. -3 BudgetExceeded)
 //
 // With Visual-DAG's MockClient queued to return "ESCALATE" (8 bytes),
-// reason() yields 8, act() collapses to 2, and observe() preserves it,
-// so agent_main returns 2.
+// reason() yields Ok(8), act() collapses to 2, and observe() preserves
+// it, so agent_main returns 2.
 
 agent ReactLoop {
     capabilities: [llm.classify]
     budget: { max_tokens: 200, max_cost: 0.02 }
 
     // Stage 1: "reason" — ask the LLM to classify a fixed prompt. The
-    // returned integer is the label byte count (positive) or a negative
-    // HostErr* code.
+    // `?` after `llm.classify` propagates any HostErr* upward instead
+    // of letting it leak into act()'s signed comparisons. The Ok value
+    // is the byte count of the label written into the scratch buffer.
     fn reason() -> int {
-        llm.classify("react-stage1-reason")
+        let label_len = llm.classify("react-stage1-reason")?
+        label_len
     }
 
-    // Stage 2: "act" — bucket the reason signal into a coarse band.
-    // Negative signals propagate as -1 so observe() can short-circuit
-    // without inventing a verdict from an error.
+    // Stage 2: "act" — bucket the label length into a coarse verdict.
+    // Because reason() already filtered out negatives via `?`, signal
+    // here is guaranteed >= 0.
     fn act(signal: int) -> int {
-        if signal < 0 {
-            signal
+        if signal >= 8 {
+            2
         } else {
-            if signal >= 8 {
-                2
+            if signal >= 3 {
+                1
             } else {
-                if signal >= 3 {
-                    1
-                } else {
-                    0
-                }
+                0
             }
         }
     }
 
-    // Stage 3: "observe" — collapse the refined band into a terminal
-    // verdict, propagating host errors as -1.
-    fn observe(refined: int, signal: int) -> int {
-        if signal < 0 {
-            -1
-        } else {
-            refined
-        }
+    // Stage 3: "observe" — pass through. (The earlier negative-signal
+    // guard moved up to reason() now that `?` does the propagation.)
+    fn observe(refined: int) -> int {
+        refined
     }
 
-    // main wires the three stages together — the agent_main export the
-    // Visual-DAG runtime invokes via wazero.
+    // main wires the three stages together. Any HostErr* from reason()
+    // exits agent_main with the same negative code thanks to `?`.
     fn main() -> int {
-        let signal = reason()
+        let signal = reason()?
         let refined = act(signal)
-        observe(refined, signal)
+        observe(refined)
     }
 }

@@ -397,6 +397,17 @@ typedef struct {
                          * used to warn about provably-infinite loops    */
 } IrGenLoopCtx;
 
+/* L5: catch-handler stack. Each `try { } catch (e: T) { }` pushes a frame
+ * before lowering the try-block; `?` inside the body jumps to the top
+ * frame's handler block (with the err value stored to err_addr) instead
+ * of returning Err from the enclosing function. */
+#define IR_GEN_MAX_CATCH_DEPTH 16
+
+typedef struct {
+    int catch_bb;      /* block to jump to on Err propagation */
+    int err_addr;      /* alloca address where ? stashes the err code */
+} IrGenCatchCtx;
+
 typedef struct {
     IrModule   *mod;
     IrFunction *current_fn;
@@ -407,6 +418,10 @@ typedef struct {
      * naturally gives innermost-loop semantics under nesting. */
     IrGenLoopCtx loop_stack[IR_GEN_MAX_LOOP_DEPTH];
     int          loop_depth;
+
+    /* L5: catch-handler stack. NULL/empty means `?` returns Err from fn. */
+    IrGenCatchCtx catch_stack[IR_GEN_MAX_CATCH_DEPTH];
+    int           catch_depth;
 
     /* Function name registry for call target resolution */
     struct {
@@ -914,6 +929,203 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
                 }
             }
             return phi_id;
+        }
+        return -1;
+    }
+
+    case AST_RESULT_OK:
+        /* Ok(v) — lower v and pass through. The encoding is "non-negative
+         * i64 = Ok"; the caller of `?` will dispatch on sign. */
+        return expr->left ? irgen_expr(ctx, expr->left)
+                          : ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+
+    case AST_RESULT_ERR:
+        /* Err(code) — lower the (already-negative) sentinel code and pass
+         * through. We trust the source-level code to be negative; if it
+         * is not, downstream `?` sees a non-negative value and treats
+         * it as Ok, which matches "Err(0) means no-error" only by accident.
+         * The v1 contract is: Err arguments must be negative. */
+        return expr->left ? irgen_expr(ctx, expr->left)
+                          : ir_emit_const_int(ctx->current_fn, ctx->mod, -1);
+
+    case AST_TRY: {
+        /* `expr?` — Result propagation. Lower the operand to value V, then:
+         *   if V < 0 -> jump to current catch handler (or return V from fn)
+         *   else     -> continue with V as the expression result
+         *
+         * Shape:
+         *
+         *   bbN:  %v = <expr>
+         *         %neg = cmp_lt %v, 0
+         *         br %neg, @try.err, @try.ok
+         *   try.err:
+         *         <store err to catch slot OR ret %v>
+         *   try.ok:
+         *         (V is the result)
+         */
+        int v = irgen_expr(ctx, expr->left);
+        if (v < 0) return -1;
+        int zero = ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+        int is_err = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                    IR_CMP_LT, IR_TYPE_BOOL, v, zero);
+
+        /* Remember the block where the br must live (where %is_err was
+         * just defined). ir_bb_new below will move current_bb. */
+        IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
+
+        IrBasicBlock *err_bb = ir_bb_new(ctx->current_fn, ctx->mod, "try.err");
+        IrBasicBlock *ok_bb  = ir_bb_new(ctx->current_fn, ctx->mod, "try.ok");
+
+        ir_set_current_bb(ctx->current_fn, pre_bb);
+        ir_emit_br(ctx->current_fn, ctx->mod, is_err, err_bb->id, ok_bb->id);
+
+        ir_set_current_bb(ctx->current_fn, err_bb);
+        if (ctx->catch_depth > 0) {
+            /* Stash the err value into the catch slot, then jump there. */
+            IrGenCatchCtx *top =
+                &ctx->catch_stack[ctx->catch_depth - 1];
+            ir_emit_store(ctx->current_fn, ctx->mod, v, top->err_addr);
+            ir_emit_jmp(ctx->current_fn, ctx->mod, top->catch_bb);
+        } else {
+            /* No enclosing try-catch: propagate Err by returning from fn. */
+            ir_emit_ret(ctx->current_fn, ctx->mod, v);
+        }
+
+        ir_set_current_bb(ctx->current_fn, ok_bb);
+        return v;
+    }
+
+    case AST_TRY_CATCH: {
+        /* try { body } catch (e: T) { handler }
+         *
+         * Shape:
+         *
+         *   pre:
+         *     %err_addr = alloca i64
+         *     jmp @try.body
+         *   try.body:
+         *     <body lowered with (catch_bb=catch, err_addr) pushed>
+         *     <tail expr ok_val>
+         *     jmp @try.merge
+         *   catch:
+         *     <handler scope binds `e` to load(%err_addr)>
+         *     <tail expr err_val>
+         *     jmp @try.merge
+         *   try.merge:
+         *     %r = phi [ok_val, body_pred] [err_val, catch_pred]
+         */
+        if (ctx->catch_depth >= IR_GEN_MAX_CATCH_DEPTH) return -1;
+
+        /* 1) Alloca err slot in the CURRENT (pre) block, then snapshot
+         * the pre-block pointer BEFORE creating new blocks (ir_bb_new
+         * moves current_bb away from us). */
+        int err_addr = ir_emit_alloca(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+        IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
+
+        IrBasicBlock *try_bb   = ir_bb_new(ctx->current_fn, ctx->mod, "try.body");
+        IrBasicBlock *catch_bb = ir_bb_new(ctx->current_fn, ctx->mod, "try.catch");
+        IrBasicBlock *merge_bb = ir_bb_new(ctx->current_fn, ctx->mod, "try.merge");
+
+        /* Stitch pre_bb -> try_bb. */
+        ir_set_current_bb(ctx->current_fn, pre_bb);
+        ir_emit_jmp(ctx->current_fn, ctx->mod, try_bb->id);
+
+        /* 2) Lower try-body with catch frame pushed. Use the existing
+         * branch-lowering shape: tail-expr of the block becomes the
+         * value flowing into the PHI. */
+        ctx->catch_stack[ctx->catch_depth].catch_bb = catch_bb->id;
+        ctx->catch_stack[ctx->catch_depth].err_addr = err_addr;
+        ctx->catch_depth++;
+
+        ir_set_current_bb(ctx->current_fn, try_bb);
+        int ok_val = -1;
+        IrBasicBlock *body_pred = NULL;
+        AstNode *body = expr->left;
+        irgen_scope_push(&ctx->scope);
+        if (body && body->kind == AST_BLOCK) {
+            AstNode *tail = NULL;
+            for (AstNode *s = body->params; s; s = s->next) {
+                if (!s->next && s->kind == AST_EXPR_STMT && s->left)
+                    tail = s;
+            }
+            for (AstNode *s = body->params; s; s = s->next) {
+                if (s == tail) {
+                    ok_val = irgen_expr(ctx, s->left);
+                } else {
+                    irgen_stmt(ctx, s);
+                }
+            }
+        } else if (body) {
+            ok_val = irgen_expr(ctx, body);
+        }
+        {
+            IrBasicBlock *cur = ctx->current_fn->current_bb;
+            IrInst *last = cur ? cur->last : NULL;
+            if (!last || (last->op != IR_RET && last->op != IR_JMP &&
+                          last->op != IR_BR)) {
+                ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
+                body_pred = ctx->current_fn->current_bb;
+            }
+        }
+        irgen_scope_pop(&ctx->scope);
+        ctx->catch_depth--;
+
+        /* 3) Lower catch handler. The catch variable (expr->name, type i64)
+         * is bound by allocating a fresh slot and storing the loaded err
+         * value into it; the handler body can then reference `e` like any
+         * other let-bound local. */
+        ir_set_current_bb(ctx->current_fn, catch_bb);
+        irgen_scope_push(&ctx->scope);
+        const char *err_name = expr->name ? expr->name : "e";
+        int err_val = ir_emit_load(ctx->current_fn, ctx->mod,
+                                    IR_TYPE_I64, err_addr);
+        int e_slot = ir_emit_alloca(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+        ir_emit_store(ctx->current_fn, ctx->mod, err_val, e_slot);
+        irgen_scope_add(&ctx->scope, err_name, e_slot, IR_TYPE_I64);
+
+        int catch_val = -1;
+        IrBasicBlock *catch_pred = NULL;
+        AstNode *handler = expr->right;
+        if (handler && handler->kind == AST_BLOCK) {
+            AstNode *tail = NULL;
+            for (AstNode *s = handler->params; s; s = s->next) {
+                if (!s->next && s->kind == AST_EXPR_STMT && s->left)
+                    tail = s;
+            }
+            for (AstNode *s = handler->params; s; s = s->next) {
+                if (s == tail) {
+                    catch_val = irgen_expr(ctx, s->left);
+                } else {
+                    irgen_stmt(ctx, s);
+                }
+            }
+        } else if (handler) {
+            catch_val = irgen_expr(ctx, handler);
+        }
+        {
+            IrBasicBlock *cur = ctx->current_fn->current_bb;
+            IrInst *last = cur ? cur->last : NULL;
+            if (!last || (last->op != IR_RET && last->op != IR_JMP &&
+                          last->op != IR_BR)) {
+                ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
+                catch_pred = ctx->current_fn->current_bb;
+            }
+        }
+        irgen_scope_pop(&ctx->scope);
+
+        /* 4) PHI in merge_bb. */
+        ir_set_current_bb(ctx->current_fn, merge_bb);
+        if ((ok_val >= 0 && body_pred) ||
+            (catch_val >= 0 && catch_pred)) {
+            int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+            IrInst *phi_inst = merge_bb->last;
+            if (phi_inst && phi_inst->op == IR_PHI && phi_inst->id == phi) {
+                if (ok_val >= 0 && body_pred)
+                    ir_phi_add_incoming(phi_inst, ok_val, body_pred->id);
+                if (catch_val >= 0 && catch_pred)
+                    ir_phi_add_incoming(phi_inst, catch_val, catch_pred->id);
+            }
+            return phi;
         }
         return -1;
     }
