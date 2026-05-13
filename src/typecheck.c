@@ -946,6 +946,206 @@ static void check_capabilities(SymbolTable *st, CapRegistry *cr,
 }
 
 /* ============================================================
+ * Pass 2c: Parameterised Capability Allowlist Validation (L12)
+ *
+ * The new syntactic form `capabilities: [http.fetch(["host:port",
+ * ...])]` introduces a compile-time allowlist on network-shaped
+ * capabilities. This pass enforces the host pattern rules so that
+ * malformed lists are caught up front rather than surfacing as
+ * runtime allowlist mismatches:
+ *
+ *   1. Each entry must be a non-empty string.
+ *   2. Entries must be of the form "host:port".
+ *   3. The host part may begin with `*.` (glob suffix match) but a
+ *      bare `*` is rejected -- use the bare verb form for that.
+ *   4. Port must be a base-10 integer in (0, 65535].
+ *   5. IP literals are rejected in v1 (host must be a domain).
+ *
+ * v1 only enforces the rule on `http.fetch`; future verbs like
+ * `agent.call(["worker_a", ...])` will plug in here with their
+ * own pattern validators.
+ * ============================================================ */
+
+static bool host_port_check_ip(const char *spec, const char *colon);
+
+static bool host_pattern_is_ip_literal(const char *host, size_t len) {
+    /* Quick heuristic: all characters are digits or dots and the
+     * string contains at least one dot -- treat as IPv4 dotted-quad.
+     * (Full validation isn't necessary here; we just refuse the
+     * shape to avoid users sneaking past the domain-based allowlist
+     * by spelling addresses literally.) */
+    size_t i;
+    int dots = 0;
+    if (len == 0) return false;
+    for (i = 0; i < len; i++) {
+        char c = host[i];
+        if (c == '.') { dots++; continue; }
+        if (c < '0' || c > '9') return false;
+    }
+    return dots >= 1;
+}
+
+static void validate_host_port_spec(const char *spec, SourceLoc loc,
+                                    const char *agent_name,
+                                    const char *verb,
+                                    ErrorReporter *reporter) {
+    if (!spec || spec[0] == '\0') {
+        report_error_fmt(reporter, loc,
+            "use \"host:port\" (e.g. \"api.openai.com:443\")",
+            "agent '%s': capability '%s' allowlist contains empty entry",
+            agent_name, verb);
+        return;
+    }
+    /* Reject the unrestricted wildcard explicitly -- the bare verb
+     * form already conveys "all hosts" without compile-time fence. */
+    if (strcmp(spec, "*") == 0 || strcmp(spec, "*:*") == 0) {
+        report_error_fmt(reporter, loc,
+            "for an unrestricted fetch use the bare form "
+            "`capabilities: [http.fetch]`",
+            "agent '%s': capability '%s' allowlist entry '%s' is the "
+            "unrestricted wildcard -- not allowed in parameterised form",
+            agent_name, verb, spec);
+        return;
+    }
+    const char *colon = strrchr(spec, ':');
+    if (!colon || colon == spec || colon[1] == '\0') {
+        report_error_fmt(reporter, loc,
+            "use \"host:port\" (e.g. \"api.openai.com:443\")",
+            "agent '%s': capability '%s' allowlist entry '%s' "
+            "missing host or port",
+            agent_name, verb, spec);
+        return;
+    }
+    size_t host_len = (size_t)(colon - spec);
+    /* Glob: only allowed as `*.suffix:port` -- a leading `*.` then a
+     * normal hostname. Reject embedded `*` elsewhere. */
+    size_t i;
+    bool saw_star = false;
+    for (i = 0; i < host_len; i++) {
+        if (spec[i] == '*') {
+            if (saw_star) {
+                report_error_fmt(reporter, loc,
+                    "use \"*.suffix:port\" for subdomain glob",
+                    "agent '%s': capability '%s' allowlist entry '%s' "
+                    "has multiple '*' wildcards",
+                    agent_name, verb, spec);
+                return;
+            }
+            if (i != 0 || host_len < 2 || spec[1] != '.') {
+                report_error_fmt(reporter, loc,
+                    "use \"*.suffix:port\" for subdomain glob "
+                    "(glob only valid as leading '*.')",
+                    "agent '%s': capability '%s' allowlist entry '%s' "
+                    "has '*' outside the leading position",
+                    agent_name, verb, spec);
+                return;
+            }
+            saw_star = true;
+        }
+    }
+    if (host_port_check_ip(spec, colon)) {
+        /* Fallthrough: keep the explicit IP rejection separate so
+         * the diagnostic stays specific. */
+        report_error_fmt(reporter, loc,
+            "use a domain name (IP literals are rejected in v1)",
+            "agent '%s': capability '%s' allowlist entry '%s' "
+            "looks like an IP literal",
+            agent_name, verb, spec);
+        return;
+    }
+    /* Port: integer in (0, 65535]. */
+    const char *p = colon + 1;
+    long port = 0;
+    while (*p) {
+        if (*p < '0' || *p > '9') {
+            report_error_fmt(reporter, loc,
+                "port must be a decimal integer in (0, 65535]",
+                "agent '%s': capability '%s' allowlist entry '%s' "
+                "has non-numeric port",
+                agent_name, verb, spec);
+            return;
+        }
+        port = port * 10 + (*p - '0');
+        if (port > 65535) {
+            report_error_fmt(reporter, loc,
+                "port must be in (0, 65535]",
+                "agent '%s': capability '%s' allowlist entry '%s' "
+                "port out of range",
+                agent_name, verb, spec);
+            return;
+        }
+        p++;
+    }
+    if (port <= 0) {
+        report_error_fmt(reporter, loc,
+            "port must be in (0, 65535]",
+            "agent '%s': capability '%s' allowlist entry '%s' "
+            "has port 0 (not allowed)",
+            agent_name, verb, spec);
+        return;
+    }
+}
+
+/* Tiny shim: returns true iff spec[:colon-spec] is an IPv4 literal.
+ * Pulled out so `validate_host_port_spec` stays linear. */
+static bool host_port_check_ip(const char *spec, const char *colon) {
+    return host_pattern_is_ip_literal(spec, (size_t)(colon - spec));
+}
+
+static void check_capability_allowlists(AstNode *program,
+                                        ErrorReporter *reporter) {
+    AstNode *decl, *field, *elem, *host;
+    if (!program || program->kind != AST_PROGRAM) return;
+
+    for (decl = program->params; decl; decl = decl->next) {
+        if (decl->kind != AST_AGENT) continue;
+        const char *agent_name = decl->name ? decl->name : "<anon>";
+
+        for (field = decl->params; field; field = field->next) {
+            if (field->kind != AST_FIELD || !field->name) continue;
+            if (strcmp(field->name, "capabilities") != 0) continue;
+            if (!field->right || field->right->kind != AST_ARRAY) break;
+
+            for (elem = field->right->params; elem; elem = elem->next) {
+                /* Only AST_CAPABILITY_ITEM carries the parameterised
+                 * payload. Bare AST_IDENT entries are the
+                 * backwards-compatible form and need no validation. */
+                if (elem->kind != AST_CAPABILITY_ITEM) continue;
+                if (!elem->name) continue;
+                /* v1: only enforce on http.fetch. */
+                if (strcmp(elem->name, "http.fetch") != 0) continue;
+
+                if (!elem->params) {
+                    report_error_fmt(reporter, elem->loc,
+                        "drop the empty parens, or supply at least "
+                        "one \"host:port\" entry",
+                        "agent '%s': capability 'http.fetch' "
+                        "allowlist is empty",
+                        agent_name);
+                    continue;
+                }
+                for (host = elem->params; host; host = host->next) {
+                    const char *spec = NULL;
+                    if (host->kind == AST_STRING_LIT)
+                        spec = host->val.str_val;
+                    if (!spec) {
+                        report_error_fmt(reporter, host->loc,
+                            "use \"host:port\" string literals",
+                            "agent '%s': capability 'http.fetch' "
+                            "allowlist entry is not a string literal",
+                            agent_name);
+                        continue;
+                    }
+                    validate_host_port_spec(spec, host->loc, agent_name,
+                                            elem->name, reporter);
+                }
+            }
+            break;
+        }
+    }
+}
+
+/* ============================================================
  * Pass 3: Guard Enforcement
  *
  * "Sensitive" capabilities are heuristically detected by name
@@ -4490,6 +4690,10 @@ bool typecheck_program(AstNode *program, ErrorReporter *reporter,
 
     /* Pass 2: Capability verification (enforced — security critical) */
     check_capabilities(&st, &cr, program, reporter, arena);
+
+    /* Pass 2c: Parameterised capability allowlist (L12) -- validates
+     * the host:port patterns inside `capabilities: [http.fetch([...])]` */
+    check_capability_allowlists(program, reporter);
 
     /* Pass 2b: Access control enforcement (network endpoints + binary) */
     {

@@ -2371,6 +2371,251 @@ TEST(wasm_budget_chain_order_entropy_then_tokens_then_cost) {
 }
 
 /* ============================================================
+ * L12: capability.network compile-time allowlist
+ *
+ * These tests verify that the parameterised capability form
+ *   `capabilities: [http.fetch(["api.openai.com:443", ...])]`
+ * (a) parses (round-trip through the parser yields an
+ *     AST_CAPABILITY_ITEM with string-literal hosts),
+ * (b) is rejected by typecheck for malformed entries,
+ * (c) propagates into the emitted .wit as a `hosts: [...]` field,
+ * (d) propagates into the wasm WAT as a `vdag.capability.network.
+ *     allowlist` custom section carrying the JSON-encoded payload.
+ * ============================================================ */
+
+#include "wit_emit.h"
+
+/* Parse the given source, locate the (sole) AST_AGENT, and return
+ * the AST_FIELD node for `capabilities` (or NULL). Used by L12
+ * parser-shape tests. */
+static AstNode *parse_first_agent_field(const char *source,
+                                        const char *field_name) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(source);
+    ErrorReporter reporter = reporter_new("<test>", source, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", source, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *program = parse_program(&parser);
+    if (parser.had_error || !program) return NULL;
+    AstNode *decl;
+    for (decl = program->params; decl; decl = decl->next) {
+        if (decl->kind != AST_AGENT) continue;
+        AstNode *f;
+        for (f = decl->params; f; f = f->next) {
+            if (f->kind == AST_FIELD && f->name &&
+                strcmp(f->name, field_name) == 0)
+                return f;
+        }
+    }
+    return NULL;
+}
+
+TEST(l12_parser_accepts_parameterised_http_fetch) {
+    /* The parameterised form must lower to AST_CAPABILITY_ITEM with
+     * the qualified verb as `name` and a chain of AST_STRING_LIT
+     * host:port specs in `params`. */
+    AstNode *caps = parse_first_agent_field(
+        "agent Net {\n"
+        "    capabilities: [http.fetch([\"api.openai.com:443\", \"*.example.com:443\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n",
+        "capabilities");
+    ASSERT_NOT_NULL(caps);
+    ASSERT_NOT_NULL(caps->right);
+    ASSERT(caps->right->kind == AST_ARRAY);
+
+    AstNode *elem = caps->right->params;
+    ASSERT_NOT_NULL(elem);
+    ASSERT(elem->kind == AST_CAPABILITY_ITEM);
+    ASSERT_NOT_NULL(elem->name);
+    ASSERT(strcmp(elem->name, "http.fetch") == 0);
+
+    /* Two host entries, both string literals. */
+    AstNode *h1 = elem->params;
+    ASSERT_NOT_NULL(h1);
+    ASSERT(h1->kind == AST_STRING_LIT);
+    ASSERT(strcmp(h1->val.str_val, "api.openai.com:443") == 0);
+    AstNode *h2 = h1->next;
+    ASSERT_NOT_NULL(h2);
+    ASSERT(h2->kind == AST_STRING_LIT);
+    ASSERT(strcmp(h2->val.str_val, "*.example.com:443") == 0);
+    ASSERT(h2->next == NULL);
+
+    /* And the bare form must still parse to AST_IDENT (back-compat). */
+    AstNode *caps_bare = parse_first_agent_field(
+        "agent Bare {\n"
+        "    capabilities: [http.fetch]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n",
+        "capabilities");
+    ASSERT_NOT_NULL(caps_bare);
+    AstNode *bare_elem = caps_bare->right->params;
+    ASSERT_NOT_NULL(bare_elem);
+    ASSERT(bare_elem->kind == AST_IDENT);
+    ASSERT(strcmp(bare_elem->name, "http.fetch") == 0);
+}
+
+/* Parse + typecheck the given source. Returns the number of errors
+ * the reporter accumulated. */
+static int typecheck_error_count(const char *source) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(source);
+    ErrorReporter reporter = reporter_new("<test>", source, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", source, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *program = parse_program(&parser);
+    if (!program) return -1;
+    /* Don't short-circuit on parse error: we want to see typecheck
+     * diagnostics even when the parser already raised something. */
+    (void)typecheck_program(program, &reporter, &test_arena);
+    return reporter.count;
+}
+
+TEST(l12_typecheck_rejects_malformed_hosts) {
+    /* Missing port. */
+    int n1 = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"api.openai.com\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n1 > 0);
+
+    /* Port out of range. */
+    int n2 = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"api.openai.com:99999\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n2 > 0);
+
+    /* Wildcard not at leading position. */
+    int n3 = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"api.*.com:443\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n3 > 0);
+
+    /* IP literal rejected. */
+    int n4 = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"127.0.0.1:443\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n4 > 0);
+
+    /* Unrestricted '*' wildcard rejected. */
+    int n5 = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"*\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n5 > 0);
+
+    /* The "good" form must produce ZERO L12 errors. */
+    int n_ok = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"api.openai.com:443\", "
+        "\"*.example.com:443\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n_ok == 0);
+}
+
+TEST(l12_wit_emit_writes_hosts_field) {
+    /* End-to-end: write a temp .wit file with the parameterised form
+     * and confirm the `import http.fetch { hosts: [...] }` block
+     * appears verbatim. */
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    const char *src =
+        "agent NetCap {\n"
+        "    capabilities: [http.fetch([\"api.openai.com:443\", "
+        "\"*.example.com:443\"])]\n"
+        "    fn run() -> int { 0 }\n"
+        "}\n";
+    size_t len = strlen(src);
+    ErrorReporter reporter = reporter_new("<test>", src, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", src, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *program = parse_program(&parser);
+    ASSERT_NOT_NULL(program);
+
+    char wit_path[] = "/tmp/l12_wit_emit_XXXXXX.wit";
+    int fd = mkstemps(wit_path, 4);
+    ASSERT(fd >= 0);
+    close(fd);
+    int rc = lcn_emit_wit(program, wit_path);
+    ASSERT(rc == 0);
+
+    /* Read the file back. */
+    FILE *fp = fopen(wit_path, "rb");
+    ASSERT_NOT_NULL(fp);
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    rewind(fp);
+    char *buf = (char *)malloc((size_t)sz + 1);
+    fread(buf, 1, (size_t)sz, fp);
+    buf[sz] = '\0';
+    fclose(fp);
+    unlink(wit_path);
+
+    /* The block must appear with both hosts inside. */
+    ASSERT(strstr(buf, "import http.fetch {") != NULL);
+    ASSERT(strstr(buf, "hosts: [") != NULL);
+    ASSERT(strstr(buf, "\"api.openai.com:443\"") != NULL);
+    ASSERT(strstr(buf, "\"*.example.com:443\"") != NULL);
+
+    free(buf);
+}
+
+TEST(l12_wasm_custom_section_contains_allowlist) {
+    /* The wasm module must carry a `(@custom
+     * "vdag.capability.network.allowlist" "...JSON...")` block whose
+     * payload matches the declared host list verbatim. */
+    char *wat = wat_from_source(
+        "agent NetCap {\n"
+        "    capabilities: [http.fetch([\"api.openai.com:443\", "
+        "\"*.example.com:443\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    /* Custom-section anchor + name. */
+    const char *anchor =
+        "(@custom \"vdag.capability.network.allowlist\"";
+    const char *sec = strstr(wat, anchor);
+    ASSERT_NOT_NULL(sec);
+    /* Payload must be a JSON list with both hosts. The payload appears
+     * WAT-escaped (`\"verb\"`) inside the source-level string literal. */
+    ASSERT(strstr(sec, "\\\"verb\\\":\\\"http.fetch\\\"") != NULL);
+    ASSERT(strstr(sec, "api.openai.com:443") != NULL);
+    ASSERT(strstr(sec, "*.example.com:443") != NULL);
+
+    free(wat);
+
+    /* And the bare form (no allowlist) must NOT emit the custom
+     * section, so the runtime keeps the bare contract = unrestricted
+     * fetch at compile time. */
+    char *wat_bare = wat_from_source(
+        "agent BareNet {\n"
+        "    capabilities: [http.fetch]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat_bare);
+    ASSERT(strstr(wat_bare,
+        "(@custom \"vdag.capability.network.allowlist\"") == NULL);
+    free(wat_bare);
+}
+
+/* ============================================================
  * Main
  * ============================================================ */
 
@@ -2499,6 +2744,12 @@ int main(void) {
     RUN_TEST(wasm_budget_cost_decrement_wat_shape);
     RUN_TEST(wasm_budget_token_trap_shape);
     RUN_TEST(wasm_budget_chain_order_entropy_then_tokens_then_cost);
+
+    fprintf(stderr, "\n-- L12: capability.network compile-time allowlist --\n");
+    RUN_TEST(l12_parser_accepts_parameterised_http_fetch);
+    RUN_TEST(l12_typecheck_rejects_malformed_hosts);
+    RUN_TEST(l12_wit_emit_writes_hosts_field);
+    RUN_TEST(l12_wasm_custom_section_contains_allowlist);
 
     ir_test_teardown();
 

@@ -391,6 +391,63 @@ static int emit_interface(WitBuf *out,
     return witbuf_append(out, "}\n\n");
 }
 
+/* L12: locate the parameterised capability entry for a qualified verb in
+ * the agent's `capabilities:` array, if any. The bare form is encoded as
+ * AST_IDENT and returns NULL here; only AST_CAPABILITY_ITEM nodes carry
+ * a host:port allowlist payload via their `params` chain of
+ * AST_STRING_LIT. */
+static const AstNode *find_param_cap_item(const AstNode *agent,
+                                          const char *qualified) {
+    const AstNode *field, *elem;
+    if (!agent || !qualified) return NULL;
+    for (field = agent->params; field != NULL; field = field->next) {
+        if (field->kind != AST_FIELD) continue;
+        if (!field->name || strcmp(field->name, "capabilities") != 0)
+            continue;
+        if (!field->right || field->right->kind != AST_ARRAY) break;
+        for (elem = field->right->params; elem != NULL; elem = elem->next) {
+            if (elem->kind != AST_CAPABILITY_ITEM) continue;
+            if (!elem->name) continue;
+            if (strcmp(elem->name, qualified) == 0) return elem;
+        }
+        break;
+    }
+    return NULL;
+}
+
+/* Emit a WIT-style `import <verb> { hosts: [...] }` block when the
+ * agent's capability list pins a host allowlist on a network-shaped
+ * verb. The shape mirrors the documented L12 advertisement:
+ *
+ *   import http.fetch {
+ *       hosts: ["api.openai.com:443", "*.example.com:443"]
+ *   }
+ *
+ * Returns 0 on success, 1 on buffer error, and -1 if no parameterised
+ * allowlist exists (caller should emit the bare `import` line). */
+static int emit_param_cap_import(WitBuf *out,
+                                 const AstNode *agent,
+                                 const char *qualified) {
+    const AstNode *item = find_param_cap_item(agent, qualified);
+    if (!item) return -1;
+    const AstNode *host;
+    int first = 1;
+    if (witbuf_appendf(out, "    import %s {\n", qualified) != 0) return 1;
+    if (witbuf_append(out, "        hosts: [") != 0) return 1;
+    for (host = item->params; host != NULL; host = host->next) {
+        const char *spec = NULL;
+        if (host->kind == AST_STRING_LIT) spec = host->val.str_val;
+        if (!spec) continue;
+        if (!first) {
+            if (witbuf_append(out, ", ") != 0) return 1;
+        }
+        first = 0;
+        if (witbuf_appendf(out, "\"%s\"", spec) != 0) return 1;
+    }
+    if (witbuf_append(out, "]\n    }\n") != 0) return 1;
+    return 0;
+}
+
 /* Emit `export <fn>: func(<params>) -> <ret>;` lines for every fn in the
  * agent's body (`agent->left` is the linked list of AST_FN nodes set up
  * by `parse_agent`). */
@@ -470,6 +527,17 @@ static int emit_agent(WitBuf *out, const AstNode *agent) {
     for (i = 0; i < prefix_count; i++) {
         if (witbuf_appendf(out, "    import %s;\n", prefixes[i]) != 0)
             return 1;
+    }
+    /* L12: for every parameterised capability entry emit a richer
+     * `import <verb> { hosts: [...] }` block carrying the compile-time
+     * allowlist alongside the bare prefix import. The runtime side
+     * (wazero) reads the same shape out of the wasm custom section --
+     * the WIT block is the human-readable advertisement of the same
+     * contract. */
+    for (i = 0; i < cap_count; i++) {
+        int rc = emit_param_cap_import(out, agent, caps[i]);
+        if (rc == 1) return 1;
+        /* rc == -1 means the cap is bare; nothing to emit here. */
     }
     if (prefix_count > 0) {
         if (witbuf_append(out, "\n") != 0) return 1;

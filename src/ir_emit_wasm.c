@@ -209,6 +209,21 @@ typedef struct {
     int           tokens_budget_declared;
     int64_t       cost_micro_usd_budget;
     int           cost_budget_declared;
+
+    /* L12: capability.network compile-time allowlist.
+     *
+     * If any agent declares a parameterised `capabilities:
+     * [http.fetch(["host:port", ...])]` entry we capture the list
+     * here so the module emit can write a `vdag.capability.network
+     * .allowlist` custom section carrying the JSON-encoded payload.
+     * The runtime (wazero) reads this section at instantiate time
+     * and rejects the module if any declared host:port is not in
+     * the worker's runtime allowlist. If no parameterised form is
+     * declared, `net_allow_count` stays at 0 and no custom section
+     * is emitted (bare form = no compile-time fence). */
+#define WASM_MAX_NET_ALLOW   64
+    const char   *net_allow_hosts[WASM_MAX_NET_ALLOW];
+    int           net_allow_count;
 } EmitCtx;
 
 /* Per-function emission state. */
@@ -640,6 +655,88 @@ static void scan_budget(EmitCtx *ctx, AstNode *program) {
         }
         if (tokens_found || cost_found) return;
     }
+}
+
+/* ============================================================
+ * L12: capability.network compile-time allowlist scan + emit
+ *
+ * Walks the program AST for any agent whose `capabilities:` list
+ * contains a parameterised `http.fetch(["host:port", ...])` entry,
+ * collects the host specs into ctx->net_allow_hosts, and -- if any
+ * were declared -- emits a wasm custom section
+ * `vdag.capability.network.allowlist` whose payload is the
+ * UTF-8 JSON `[{"verb":"http.fetch","hosts":[...]}]`.
+ *
+ * The custom section is module-level metadata: wat2wasm preserves
+ * `(@custom "name" "payload")` blocks verbatim into the binary's
+ * custom-section vector, where wazero's instantiate-time policy
+ * reader picks them up (see Visual-DAG follow-up F36c).
+ * ============================================================ */
+
+static void scan_capability_network_allowlist(EmitCtx *ctx,
+                                              AstNode *program) {
+    ctx->net_allow_count = 0;
+    if (!program || program->kind != AST_PROGRAM) return;
+
+    AstNode *decl;
+    for (decl = program->params; decl; decl = decl->next) {
+        if (decl->kind != AST_AGENT) continue;
+        AstNode *field;
+        for (field = decl->params; field; field = field->next) {
+            if (field->kind != AST_FIELD || !field->name) continue;
+            if (strcmp(field->name, "capabilities") != 0) continue;
+            if (!field->right || field->right->kind != AST_ARRAY) break;
+            AstNode *elem;
+            for (elem = field->right->params; elem; elem = elem->next) {
+                if (elem->kind != AST_CAPABILITY_ITEM) continue;
+                if (!elem->name) continue;
+                if (strcmp(elem->name, "http.fetch") != 0) continue;
+                AstNode *h;
+                for (h = elem->params; h; h = h->next) {
+                    if (h->kind != AST_STRING_LIT) continue;
+                    if (!h->val.str_val) continue;
+                    if (ctx->net_allow_count >= WASM_MAX_NET_ALLOW) break;
+                    ctx->net_allow_hosts[ctx->net_allow_count++] =
+                        h->val.str_val;
+                }
+            }
+            break;
+        }
+        /* First agent that declares a parameterised http.fetch wins
+         * (stage0 supports a single agent per wasm module). */
+        if (ctx->net_allow_count > 0) return;
+    }
+}
+
+/* Emit the module-level custom section. Caller must be inside the
+ * `(module ...)` block. Section is omitted when no parameterised
+ * allowlist was declared (bare form keeps the runtime fence as the
+ * only enforcement layer).
+ *
+ * The JSON payload contains `"` characters which must be escaped as
+ * `\"` inside the WAT string literal; wat2wasm un-escapes them on
+ * its way into the binary's custom-section byte vector, so the
+ * actual payload bytes are valid JSON. We render the WAT-escaped
+ * form directly to ctx->out to keep the source readable. */
+static void emit_capability_network_custom_section(EmitCtx *ctx) {
+    FILE *out = ctx->out;
+    if (ctx->net_allow_count <= 0) return;
+
+    fprintf(out,
+        "  ;; --- L12: capability.network compile-time allowlist ---\n"
+        "  ;; %d host(s) declared via http.fetch([...])\n"
+        "  (@custom \"vdag.capability.network.allowlist\" "
+        "\"[{\\\"verb\\\":\\\"http.fetch\\\",\\\"hosts\\\":[",
+        ctx->net_allow_count);
+    int i;
+    for (i = 0; i < ctx->net_allow_count; i++) {
+        /* Host strings are validated upstream (typecheck) so they
+         * are guaranteed not to contain `"` or `\` -- straight
+         * concatenation is safe here. */
+        fprintf(out, "%s\\\"%s\\\"",
+                i == 0 ? "" : ",", ctx->net_allow_hosts[i]);
+    }
+    fprintf(out, "]}]\")\n");
 }
 
 /* Emit the per-call-site token fence: load $tokens_remaining, compare
@@ -1950,6 +2047,13 @@ static void emit_module(FILE *out, IrModule *mod, EmitCtx *ctx) {
     fprintf(out, "  (global %s (mut i64) (i64.const %lld))\n",
             WASM_COST_GLOBAL, (long long)ctx->cost_micro_usd_budget);
 
+    /* L12: capability.network compile-time allowlist custom section.
+     * Emitted only if the agent used the parameterised form
+     * `http.fetch(["host:port", ...])`. The runtime reads this
+     * section at instantiate time and refuses the module if any
+     * declared host:port is not in its allowlist. */
+    emit_capability_network_custom_section(ctx);
+
     /* String data segment. */
     emit_data_segment(ctx);
 
@@ -2028,8 +2132,13 @@ static void emit_module(FILE *out, IrModule *mod, EmitCtx *ctx) {
 
 static int run_wat2wasm(const char *wat_path, const char *wasm_path) {
     char cmd[2048];
+    /* `--enable-annotations` is required for `(@custom "name" "data")`
+     * annotation blocks (e.g. the L12 capability.network allowlist) to
+     * be propagated into the binary's custom-section vector. The flag
+     * is no-op for modules that don't use any annotations, so we set
+     * it unconditionally. */
     snprintf(cmd, sizeof(cmd),
-             "wat2wasm --debug-names -o %s %s 2>&1",
+             "wat2wasm --debug-names --enable-annotations -o %s %s 2>&1",
              wasm_path, wat_path);
     int rc = system(cmd);
     if (rc != 0) {
@@ -2076,6 +2185,7 @@ int lcn_emit_wasm(AstNode *program, const char *input,
     preregister_host_calls(&ctx);
     scan_entropy_budget(&ctx, program);
     scan_budget(&ctx, program);
+    scan_capability_network_allowlist(&ctx, program);
     ctx.data_total = ctx.data_offset;
 
     /* 3. Open temp .wat file. */
@@ -2169,6 +2279,7 @@ int lcn_emit_wasm_wat(AstNode *program, FILE *out, Arena *arena,
     preregister_host_calls(&ctx);
     scan_entropy_budget(&ctx, program);
     scan_budget(&ctx, program);
+    scan_capability_network_allowlist(&ctx, program);
     ctx.data_total  = ctx.data_offset;
 
     emit_module(out, mod, &ctx);

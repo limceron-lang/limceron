@@ -2013,15 +2013,65 @@ static AstNode *parse_decl_field(Parser *p) {
     field->name = consume_ident_name(p);
     parser_expect(p, TOK_COLON, "after field name");
 
-    /* Array value: [item, item, ...] — parse as identifiers (qualified) */
+    /* Array value: [item, item, ...] — parse as identifiers (qualified).
+     *
+     * L12: an array element may carry a parameterised form
+     *   http.fetch(["api.openai.com:443", "*.example.com:443"])
+     * that pins a compile-time host:port allowlist for the
+     * network-shaped capability. The bare form (just `http.fetch`)
+     * is preserved verbatim as AST_IDENT for backwards compatibility.
+     * The parameterised form lowers to AST_CAPABILITY_ITEM whose
+     * `name` is the qualified verb and whose `params` is a linked
+     * list of AST_STRING_LIT host:port specs. Downstream consumers
+     * that only read `elem->name` (wit_collect_caps,
+     * collect_agent_caps) keep working unchanged. */
     if (parser_check(p, TOK_LBRACKET)) {
         parser_advance(p);
         AstNode *arr = ast_new(p->arena, AST_ARRAY, loc);
         AstNode *elems = NULL;
         while (!parser_check(p, TOK_RBRACKET) && !parser_check(p, TOK_EOF)) {
             SourceLoc eloc = p->current.loc;
-            AstNode *elem = ast_new(p->arena, AST_IDENT, eloc);
-            elem->name = parse_qualified_ident(p);
+            const char *qname = parse_qualified_ident(p);
+            AstNode *elem;
+            /* Parameterised form: ident(["host:port", ...]) */
+            if (parser_check(p, TOK_LPAREN)) {
+                parser_advance(p); /* consume '(' */
+                elem = ast_new(p->arena, AST_CAPABILITY_ITEM, eloc);
+                elem->name = qname;
+                /* Inside parens we require a single bracketed list of
+                 * string literals: ["host:port", ...]. The full grammar
+                 * for parameterised capabilities will grow later (e.g.
+                 * `agent.call(["worker_a", "worker_b"])`); for v1 we
+                 * only accept the host:port allowlist shape. */
+                if (parser_check(p, TOK_LBRACKET)) {
+                    parser_advance(p); /* consume '[' */
+                    AstNode *hosts = NULL;
+                    while (!parser_check(p, TOK_RBRACKET) &&
+                           !parser_check(p, TOK_EOF)) {
+                        SourceLoc hloc = p->current.loc;
+                        Token tok = parser_expect(p, TOK_STRING_LIT,
+                            "host:port string in capability allowlist");
+                        AstNode *s = ast_new(p->arena, AST_STRING_LIT, hloc);
+                        s->val.str_val = tok.value.str_val;
+                        hosts = ast_append(hosts, s);
+                        if (!parser_match(p, TOK_COMMA)) break;
+                    }
+                    parser_expect(p, TOK_RBRACKET,
+                                  "after capability allowlist");
+                    elem->params = hosts;
+                } else {
+                    report_error(p->reporter, p->current.loc,
+                        "expected '[\"host:port\", ...]' after capability '('",
+                        NULL);
+                    p->had_error = true;
+                }
+                parser_expect(p, TOK_RPAREN,
+                              "after parameterised capability");
+            } else {
+                /* Bare form: just the qualified verb. */
+                elem = ast_new(p->arena, AST_IDENT, eloc);
+                elem->name = qname;
+            }
             elems = ast_append(elems, elem);
             if (!parser_match(p, TOK_COMMA)) break;
         }

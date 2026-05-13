@@ -1,0 +1,29 @@
+// 02_restricted_fetch.lceron -- L12 sample: single-host allowlist
+//
+// The parameterised form pins a single host:port that the compiled
+// wasm module is allowed to fetch. The compiler validates the host
+// pattern at compile time and embeds the list into a wasm custom
+// section (`vdag.capability.network.allowlist`) so the runtime can
+// refuse module instantiation if the declared list contradicts the
+// worker's configured allowlist.
+//
+// Expected emitted artifacts:
+//   - .wit advertises:
+//       import http.fetch {
+//           hosts: ["api.openai.com:443"]
+//       }
+//   - .wasm contains a custom section
+//       vdag.capability.network.allowlist
+//     whose UTF-8 JSON payload is
+//       [{"verb":"http.fetch","hosts":["api.openai.com:443"]}]
+
+agent RestrictedFetch {
+    capabilities: [http.fetch(["api.openai.com:443"])]
+
+    fn main() -> int {
+        // Only api.openai.com:443 is reachable; any other host the
+        // module attempts at runtime is rejected by the wazero
+        // allowlist check that reads the custom section.
+        0
+    }
+}
