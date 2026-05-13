@@ -384,3 +384,37 @@ Dual-licensed under [Apache 2.0](LICENSE-APACHE) and [MIT](LICENSE-MIT) — your
 ## Etymology
 
 **Limceron** /lim.ke.ron/ -- from Tolkien's Sindarin. **lim** (swift) + **ceron** (doer, agent). "Swift Agent."
+
+## Documentation
+
+- **[Language reference](docs/language-reference.md)** — every syntactic
+  form: agent declarations, capabilities (bare + parameterised),
+  budget block, entropy_budget, host calls (vdag:llm / http / kb / data /
+  mcp / json), `Ok` / `Err` / `Result`, `try` / `catch` / `?`,
+  `while` / `for` / `loop` / `break` / `continue`, `if`-as-expression,
+  tail-expression returns.
+
+- **Architecture decision records** (`docs/adr/`):
+  - [ADR-0001](docs/adr/0001-wasm-target.md) — wasm32-wasi-preview2 primary target.
+  - [ADR-0002](docs/adr/0002-result-as-negative-i64-union.md) — L5
+    Result<T,E> as the negative-i64 union.
+  - [ADR-0003](docs/adr/0003-entropy-budget-runtime-fence.md) — L11
+    entropy_budget runtime fence.
+  - [ADR-0004](docs/adr/0004-budget-runtime-fence-chain-order.md) —
+    L13 budget runtime fence + chain order.
+  - [ADR-0005](docs/adr/0005-capability-network-compile-time-allowlist.md)
+    — L12 capability.network compile-time allowlist.
+  - [ADR-0006](docs/adr/0006-vdag-json-host-module.md) — L3 vdag:json
+    host module.
+
+- **Examples** (`examples/wasm/`):
+  - `poc/` — arithmetic, branching, ReAct loop.
+  - `loops/` — `while`, `for`, `break`/`continue`.
+  - `errors/` — `Ok` / `Err` / `try` / `catch` / `?`.
+  - `entropy/` — entropy_budget fence (within + exceeds).
+  - `budget/` — budget fence (within + exceeds).
+  - `capabilities/` — network allowlist (open / restricted / glob).
+  - `json/` — vdag:json host calls.
+
+- **[Integration with Agent A (Visual-DAG)](INTEGRATION-WITH-AGENT-A.md)**
+  — substrate handoff notes.
