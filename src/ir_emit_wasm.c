@@ -95,6 +95,28 @@
 #define WASM_HOST_OUTBUF_MAX     1024
 #define WASM_MAX_HOST_CALLS      64
 
+/* Entropy-budget runtime fence (L11).
+ *
+ * Each agent may declare `entropy_budget: <bits>` in its agent block.
+ * When present, the compiler emits a wasm `(global $entropy_remaining
+ * (mut i32))` initialised to that many bits, and decrements it before
+ * every entropy-consuming host call. If the remaining budget would
+ * drop below the call's cost, the function returns the sentinel
+ * `HostError.EntropyExceeded = -9` instead of dispatching the call.
+ *
+ * The cost table is per host-call qualified name and is currently
+ * hardcoded (refined later when we measure log-prob). Capabilities
+ * that don't consume entropy (network/db/json) return 0 here and
+ * incur no fence overhead at the emission site.
+ *
+ * If the agent does NOT declare entropy_budget (or the form is the
+ * legacy block-of-knobs `entropy_budget: { ... }` rather than a
+ * scalar bit count), the global is still emitted but initialised to
+ * INT32_MAX so the fence is effectively a no-op. */
+#define WASM_ENTROPY_GLOBAL          "$entropy_remaining"
+#define WASM_HOST_ERR_ENTROPY_EXC    (-9)
+#define WASM_ENTROPY_UNBOUNDED       2147483647
+
 typedef struct {
     const char *value;       /* pointer into IR (arena-owned), key for dedup */
     int         offset;      /* byte offset in linear memory */
@@ -135,6 +157,15 @@ typedef struct {
     /* Host-call sites (deduped by qualified name). */
     HostCallSite  host_calls[WASM_MAX_HOST_CALLS];
     int           host_call_count;
+
+    /* Entropy budget (L11). `entropy_budget_bits` is the scalar bit count
+     * the agent declared; if no agent declared it (or only the legacy
+     * block form was used), this stays at WASM_ENTROPY_UNBOUNDED so the
+     * fence is a no-op. `entropy_budget_declared` records whether we
+     * found an explicit scalar form, used for diagnostic comments in
+     * the emitted WAT. */
+    int           entropy_budget_bits;
+    int           entropy_budget_declared;
 } EmitCtx;
 
 /* Per-function emission state. */
@@ -301,6 +332,144 @@ static void preregister_host_calls(EmitCtx *ctx) {
             }
         }
     }
+}
+
+/* ============================================================
+ * Entropy fence (L11)
+ *
+ * Map a qualified host-call name to its entropy cost in bits. The
+ * table is intentionally small and hardcoded for stage0: capabilities
+ * that probe a non-deterministic external service (an LLM) consume
+ * entropy; passive readers (kb.search, data.read, http.fetch — yes,
+ * network responses are non-deterministic too but timing-only
+ * entropy is out of scope) do not. Per-agent `vdag:agent` imports
+ * default to 0 and can be raised later by per-agent declaration.
+ *
+ * Cost values:
+ *   llm.classify  -> 1   (default; refined when we measure log-prob)
+ *   llm.chat      -> 4   (longer responses, higher uncertainty)
+ *   http.fetch    -> 0   (network-response timing not in scope yet)
+ *   kb.search     -> 0
+ *   data.read     -> 0
+ *   json.x        -> 0   (deterministic byte manipulation)
+ *   vdag:agent    -> 0   (per-agent override default)
+ * ============================================================ */
+static int entropy_cost_for(const char *qname) {
+    if (!qname) return 0;
+    if (strcmp(qname, "llm.classify") == 0) return 1;
+    if (strcmp(qname, "llm.chat")     == 0) return 4;
+    return 0;
+}
+
+/* Walk an AST_AGENT looking for an `entropy_budget: <int>` field and
+ * return the integer literal value if found. Returns -1 if the agent
+ * doesn't declare entropy_budget in scalar form. The legacy block
+ * shape (`entropy_budget: { max_avg_entropy: ... }`) is intentionally
+ * not interpreted here — it carries no bit-count and predates the
+ * runtime fence, so we treat it as "no declared budget". */
+static int agent_entropy_budget_bits(AstNode *agent) {
+    if (!agent || agent->kind != AST_AGENT) return -1;
+    AstNode *f;
+    for (f = agent->params; f; f = f->next) {
+        if (f->kind != AST_FIELD || !f->name) continue;
+        if (strcmp(f->name, "entropy_budget") != 0) continue;
+        if (!f->right) return -1;
+        /* Scalar form: `entropy_budget: 10` -> AST_INT_LIT */
+        if (f->right->kind == AST_INT_LIT) {
+            int64_t v = f->right->val.int_val;
+            if (v < 0)                       return 0;
+            if (v > WASM_ENTROPY_UNBOUNDED)  return WASM_ENTROPY_UNBOUNDED;
+            return (int)v;
+        }
+        /* Block form: legacy, no scalar bit count -- skip. */
+        return -1;
+    }
+    return -1;
+}
+
+/* Walk the program-level AST and capture the first agent's
+ * entropy_budget scalar. Stage0 supports a single agent per module
+ * for the WASM emit path; if multiple agents exist we take the first
+ * one that declares a scalar budget. */
+static void scan_entropy_budget(EmitCtx *ctx, AstNode *program) {
+    ctx->entropy_budget_bits     = WASM_ENTROPY_UNBOUNDED;
+    ctx->entropy_budget_declared = 0;
+    if (!program || program->kind != AST_PROGRAM) return;
+    AstNode *decl;
+    for (decl = program->params; decl; decl = decl->next) {
+        if (decl->kind != AST_AGENT) continue;
+        int bits = agent_entropy_budget_bits(decl);
+        if (bits >= 0) {
+            ctx->entropy_budget_bits     = bits;
+            ctx->entropy_budget_declared = 1;
+            return;
+        }
+    }
+}
+
+/* Emit the per-call-site fence: load $entropy_remaining, compare against
+ * the cost, return EntropyExceeded if the call would underflow, otherwise
+ * subtract and proceed. The fence is structurally local to the host-call
+ * site so it composes with the existing dispatch-loop CFG without
+ * needing a new IR opcode or basic block.
+ *
+ * `ret_type` is the enclosing function's return type so we can push the
+ * sentinel as the correct WASM value type before `return`. Limceron
+ * host-call sites in practice produce i64 (their result flows through
+ * Limceron int math), but the fence has to be polymorphic enough that
+ * a `fn foo() -> bool { llm.classify(x)? }` still validates. */
+static void emit_entropy_fence(EmitCtx *ctx, int cost, IrType ret_type) {
+    FILE *out = ctx->out;
+    if (cost <= 0) return;
+    /* Push the sentinel using the function's return type. For void
+     * returns we emit a bare `return` (no value). */
+    const char *sentinel_push;
+    char buf[64];
+    switch (ret_type) {
+    case IR_TYPE_F64:
+        snprintf(buf, sizeof(buf),
+                 "        f64.const %d  ;; HostError.EntropyExceeded",
+                 WASM_HOST_ERR_ENTROPY_EXC);
+        sentinel_push = buf;
+        break;
+    case IR_TYPE_BOOL:
+    case IR_TYPE_PTR:
+    case IR_TYPE_STRING:
+    case IR_TYPE_STRUCT:
+        snprintf(buf, sizeof(buf),
+                 "        i32.const %d  ;; HostError.EntropyExceeded",
+                 WASM_HOST_ERR_ENTROPY_EXC);
+        sentinel_push = buf;
+        break;
+    case IR_TYPE_VOID:
+        sentinel_push = NULL;
+        break;
+    case IR_TYPE_I64:
+    default:
+        snprintf(buf, sizeof(buf),
+                 "        i64.const %d  ;; HostError.EntropyExceeded",
+                 WASM_HOST_ERR_ENTROPY_EXC);
+        sentinel_push = buf;
+        break;
+    }
+    fprintf(out,
+        "      ;; --- entropy fence: cost=%d ---\n"
+        "      global.get %s\n"
+        "      i32.const %d\n"
+        "      i32.lt_s\n"
+        "      if\n",
+        cost, WASM_ENTROPY_GLOBAL, cost);
+    if (sentinel_push) {
+        fprintf(out, "%s\n", sentinel_push);
+    }
+    fprintf(out,
+        "        return\n"
+        "      end\n"
+        "      global.get %s\n"
+        "      i32.const %d\n"
+        "      i32.sub\n"
+        "      global.set %s\n",
+        WASM_ENTROPY_GLOBAL, cost, WASM_ENTROPY_GLOBAL);
 }
 
 /* Emit the `(import "vdag:<ns>" "<fn>" (func ...))` declarations for
@@ -793,6 +962,13 @@ static void emit_instruction(FnCtx *fctx, IrBasicBlock *bb, IrInst *inst) {
     case IR_HOST_CALL: {
         /* Host-call lowering.
          *
+         * Before any marshalling we emit the L11 entropy fence for
+         * capabilities that consume entropy. The fence reads the
+         * module-level `$entropy_remaining` global, compares it
+         * against the per-capability cost from `entropy_cost_for`,
+         * and either traps with HostError.EntropyExceeded (-9) or
+         * subtracts the cost and proceeds.
+         *
          * The buffer-protocol ABI (see imports.go) is built around
          * (ptr, len) input pairs and a (ptr, max) output pair, plus a
          * scalar status slot for some capabilities (confidence f64 for
@@ -819,6 +995,12 @@ static void emit_instruction(FnCtx *fctx, IrBasicBlock *bb, IrInst *inst) {
             emit_set_value(fctx, inst->id);
             break;
         }
+
+        /* L11: entropy fence -- decrement and bounds-check the
+         * agent-declared bit budget before dispatching the call. */
+        emit_entropy_fence(fctx->gctx,
+                           entropy_cost_for(qname),
+                           fctx->fn->return_type);
 
         int out_buf = s->scratch_off;
         int conf_off = s->scratch_off + WASM_HOST_OUTBUF_MAX;
@@ -1436,6 +1618,20 @@ static void emit_module(FILE *out, IrModule *mod, EmitCtx *ctx) {
     fprintf(out, "  (global %s (mut i32) (i32.const %d))\n",
             WASM_BUMP_PTR_GLOBAL, bump_init);
 
+    /* L11: entropy budget global. Always emitted so the fence has a
+     * stable target; defaults to INT32_MAX (no-op) when the agent did
+     * not declare a scalar budget. */
+    if (ctx->entropy_budget_declared) {
+        fprintf(out,
+                "  ;; agent-declared entropy budget: %d bits\n",
+                ctx->entropy_budget_bits);
+    } else {
+        fprintf(out,
+                "  ;; no entropy_budget declared -- fence is a no-op\n");
+    }
+    fprintf(out, "  (global %s (mut i32) (i32.const %d))\n",
+            WASM_ENTROPY_GLOBAL, ctx->entropy_budget_bits);
+
     /* String data segment. */
     emit_data_segment(ctx);
 
@@ -1560,6 +1756,7 @@ int lcn_emit_wasm(AstNode *program, const char *input,
     scan_module_features(&ctx);
     preintern_strings(&ctx);
     preregister_host_calls(&ctx);
+    scan_entropy_budget(&ctx, program);
     ctx.data_total = ctx.data_offset;
 
     /* 3. Open temp .wat file. */
@@ -1620,5 +1817,40 @@ int lcn_emit_wasm(AstNode *program, const char *input,
     }
 
     /* Leave the .wat file for inspection; do not unlink. */
+    return 0;
+}
+
+/* ============================================================
+ * Test helper: emit WAT to a FILE* (no wat2wasm step).
+ *
+ * Used by test_ir.c to assert on the textual WAT shape (e.g. that
+ * the entropy fence emits the expected sequence at host-call sites)
+ * without depending on wat2wasm or wasmtime being installed.
+ *
+ * Mirrors lcn_emit_wasm's pre-passes verbatim so the WAT we
+ * produce here is byte-identical to what wat2wasm would consume.
+ * ============================================================ */
+int lcn_emit_wasm_wat(AstNode *program, FILE *out, Arena *arena,
+                      const LcnTarget *target) {
+    if (!program || !out || !arena) return 1;
+
+    IrModule *mod = ir_gen_program(program, arena);
+    if (!mod) return 1;
+
+    EmitCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.module      = mod;
+    ctx.arena       = arena;
+    ctx.target      = target;
+    ctx.data_offset = WASM_DATA_BASE;
+    ctx.out         = out;
+
+    scan_module_features(&ctx);
+    preintern_strings(&ctx);
+    preregister_host_calls(&ctx);
+    scan_entropy_budget(&ctx, program);
+    ctx.data_total  = ctx.data_offset;
+
+    emit_module(out, mod, &ctx);
     return 0;
 }

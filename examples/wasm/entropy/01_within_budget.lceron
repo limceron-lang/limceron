@@ -1,0 +1,31 @@
+// 01_within_budget.lceron -- L11 sample: entropy_budget runtime fence (Ok path)
+//
+// The agent declares `entropy_budget: 10` (10 bits) and makes two
+// llm.classify calls. Each llm.classify consumes 1 bit, so the
+// total spend is 2 bits and the remaining budget at exit is 8.
+//
+// Expected behaviour at the wasm runtime:
+//   - $entropy_remaining is initialised to 10
+//   - first  llm.classify: 10 >= 1 -> dispatch, budget = 9
+//   - second llm.classify:  9 >= 1 -> dispatch, budget = 8
+//   - main returns Ok(sum of returned byte counts) -- non-negative.
+//
+// At the Limceron level the fence is invisible: callers never see the
+// budget global. A budget breach surfaces as `Err(HostError.EntropyExceeded
+// = -9)` via the same Result<i64, HostError> shape every host call
+// already uses, which composes with `?` and try/catch.
+
+agent EntropyOk {
+    capabilities: [llm.classify]
+    entropy_budget: 10
+
+    fn main() -> int {
+        let a = llm.classify("first")?
+        let b = llm.classify("second")?
+        // Sum is the program verdict. With MockClient returning 8-byte
+        // labels both calls produce Ok(8), so main returns 16. Even if
+        // the mock returns 0 bytes the value is still non-negative,
+        // i.e. Ok per the encoding -- the test asserts only "not -9".
+        a + b
+    }
+}

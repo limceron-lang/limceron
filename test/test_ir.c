@@ -2005,6 +2005,175 @@ TEST(ir_emit_x86_full_program) {
 }
 
 /* ============================================================
+ * L11: entropy_budget runtime fence (WASM emit)
+ *
+ * These tests assert on the textual WAT shape produced by the WASM
+ * backend, avoiding any dependency on wat2wasm/wasmtime. The backend
+ * exposes a test entry that emits WAT to a FILE* directly; we run
+ * end-to-end (parse -> typecheck -> IR -> WASM-WAT) and search the
+ * output for the structural markers the runtime fence relies on.
+ *
+ * The cost table is hardcoded in `src/ir_emit_wasm.c::entropy_cost_for`.
+ * For these tests we rely on `llm.classify` having cost 1.
+ * ============================================================ */
+
+extern int lcn_emit_wasm_wat(AstNode *program, FILE *out, Arena *arena,
+                             const LcnTarget *target);
+
+/* Parse `source`, emit WAT, return as a malloc'd null-terminated string.
+ * Returns NULL on parse error. Caller must free(). */
+static char *wat_from_source(const char *source) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+
+    size_t len = strlen(source);
+    ErrorReporter reporter = reporter_new("<test>", source, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", source, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+
+    AstNode *program = parse_program(&parser);
+    if (parser.had_error || !program) return NULL;
+
+    FILE *f = tmpfile();
+    if (!f) return NULL;
+    int rc = lcn_emit_wasm_wat(program, f, &test_arena, NULL);
+    if (rc != 0) { fclose(f); return NULL; }
+
+    long size = ftell(f);
+    rewind(f);
+    char *buf = (char *)malloc((size_t)size + 1);
+    if (!buf) { fclose(f); return NULL; }
+    fread(buf, 1, (size_t)size, f);
+    buf[size] = '\0';
+    fclose(f);
+    return buf;
+}
+
+TEST(wasm_entropy_global_initialised_to_declared_budget) {
+    /* `entropy_budget: 42` on an agent must produce a wasm global named
+     * `$entropy_remaining` initialised to exactly 42. Without an entropy
+     * declaration the global defaults to INT32_MAX (no-op fence). */
+    char *wat = wat_from_source(
+        "agent HasBudget {\n"
+        "    capabilities: [llm.classify]\n"
+        "    entropy_budget: 42\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+    /* Global is declared and is the bit count from the agent. */
+    ASSERT(strstr(wat,
+        "(global $entropy_remaining (mut i32) (i32.const 42))") != NULL);
+    /* Make sure it is mutable (the fence needs to write back). */
+    ASSERT(strstr(wat, "(mut i32)") != NULL);
+    free(wat);
+
+    /* Default budget: agent with no entropy_budget declaration gets
+     * the unbounded sentinel so the fence is a no-op. */
+    char *wat2 = wat_from_source(
+        "agent NoBudget {\n"
+        "    capabilities: [llm.classify]\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat2);
+    ASSERT(strstr(wat2,
+        "(global $entropy_remaining (mut i32) (i32.const 2147483647))") != NULL);
+    free(wat2);
+}
+
+TEST(wasm_entropy_decrement_wat_shape) {
+    /* At every llm.classify site the compiler must emit a fence that
+     * (a) decrements the global by the per-call cost, and
+     * (b) writes the result back via global.set $entropy_remaining.
+     *
+     * We check the structural sequence rather than exact whitespace. */
+    char *wat = wat_from_source(
+        "agent Decrement {\n"
+        "    capabilities: [llm.classify]\n"
+        "    entropy_budget: 10\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    /* Cost-1 fence header (llm.classify is hardcoded to cost 1). */
+    ASSERT(strstr(wat, ";; --- entropy fence: cost=1 ---") != NULL);
+
+    /* Find the read-modify-write sequence: global.get, sub, global.set.
+     * They must appear in order, AND the global.set has to follow the
+     * sub, otherwise the budget is never persisted between calls. */
+    const char *get_after_if = strstr(wat, "i32.sub");
+    ASSERT_NOT_NULL(get_after_if);
+    const char *set = strstr(get_after_if, "global.set $entropy_remaining");
+    ASSERT_NOT_NULL(set);
+
+    /* The decrement uses i32.sub on i32 operands -- not i64. The global
+     * itself is i32 to keep cost arithmetic cheap. */
+    ASSERT(strstr(wat, "      i32.sub") != NULL);
+
+    free(wat);
+}
+
+TEST(wasm_entropy_trap_wat_shape) {
+    /* The fence must trap with HostError.EntropyExceeded = -9 BEFORE
+     * dispatching the call when remaining < cost. The trap shape is:
+     *
+     *   global.get $entropy_remaining
+     *   i32.const <cost>
+     *   i32.lt_s
+     *   if
+     *     <push -9 in fn's return type>
+     *     return
+     *   end
+     *
+     * For an int-returning fn the sentinel push is `i64.const -9`. */
+    char *wat = wat_from_source(
+        "agent Trap {\n"
+        "    capabilities: [llm.classify]\n"
+        "    entropy_budget: 0\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    /* Budget=0 propagates verbatim into the global initial value. */
+    ASSERT(strstr(wat,
+        "(global $entropy_remaining (mut i32) (i32.const 0))") != NULL);
+
+    /* The trap conditional is the canonical `lt_s` + `if` + `return`. */
+    const char *fence = strstr(wat, ";; --- entropy fence: cost=1 ---");
+    ASSERT_NOT_NULL(fence);
+    /* All four anchors must appear inside this fence, in order. */
+    const char *lt = strstr(fence, "i32.lt_s");
+    ASSERT_NOT_NULL(lt);
+    const char *iff = strstr(lt, "if");
+    ASSERT_NOT_NULL(iff);
+    const char *sentinel = strstr(iff,
+        "i64.const -9  ;; HostError.EntropyExceeded");
+    ASSERT_NOT_NULL(sentinel);
+    const char *ret = strstr(sentinel, "return");
+    ASSERT_NOT_NULL(ret);
+    const char *end = strstr(ret, "end");
+    ASSERT_NOT_NULL(end);
+    /* The post-trap subtract/store still has to be reachable for the
+     * "did not trap" path. */
+    const char *post_sub = strstr(end, "global.set $entropy_remaining");
+    ASSERT_NOT_NULL(post_sub);
+
+    free(wat);
+}
+
+/* ============================================================
  * Main
  * ============================================================ */
 
@@ -2121,6 +2290,11 @@ int main(void) {
 
     fprintf(stderr, "\n-- Full Program x86_64 --\n");
     RUN_TEST(ir_emit_x86_full_program);
+
+    fprintf(stderr, "\n-- L11: entropy_budget runtime fence --\n");
+    RUN_TEST(wasm_entropy_global_initialised_to_declared_budget);
+    RUN_TEST(wasm_entropy_decrement_wat_shape);
+    RUN_TEST(wasm_entropy_trap_wat_shape);
 
     ir_test_teardown();
 
