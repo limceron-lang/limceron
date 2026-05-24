@@ -57,6 +57,22 @@ interface data {
 // field / array-index issue child handles; the four value
 // accessors decode. int-value is the documented i64 exception
 // (see docs/language-reference.md "Host calls").
+//
+// L3 surface expansion (2026-05-13): seven additional verbs cover
+// the language-level sugar -- dotted field access (`x.foo`) lowers
+// to `field-get`, null-safe access (`x?.foo`) to `field-get-safe`,
+// and `as int|string|bool` coercions to `as-int|as-string|as-bool`.
+// `array-get` / `array-len` mirror the existing `array-index` /
+// `length` verbs with the names the L3 ROADMAP row pins.
+//
+// TODO(runtime-side): Visual-DAG's internal/nodes/code/imports.go
+// currently declares only the original nine verbs (parse, field,
+// array-index, length, string-value, int-value, bool-value,
+// is-null, stringify). The seven new verbs below must land in
+// imports.go (tracked as F36) before .wasm modules using the L3
+// sugar will instantiate at wazero load time. Until then the
+// signature-mismatch check still passes (the names are declared
+// here), but the missing host stubs will trip linker failures.
 interface json {
     parse: func(bytes: string) -> s64;
     field: func(handle: s32, key: string) -> s64;
@@ -67,6 +83,16 @@ interface json {
     bool-value: func(handle: s32) -> s64;
     is-null: func(handle: s32) -> s64;
     stringify: func(handle: s32) -> s64;
+
+    // L3 sugar surface (2026-05-13). Names mirror the language-level
+    // operators the front-end exposes to authors.
+    field-get: func(value: s64, name: string) -> s64;
+    field-get-safe: func(value: s64, name: string) -> s64;
+    as-int: func(value: s64) -> s64;
+    as-string: func(value: s64) -> s64;
+    as-bool: func(value: s64) -> s64;
+    array-get: func(value: s64, index: s32) -> s64;
+    array-len: func(value: s64) -> s32;
 }
 
 // vdag:mcp -- MCP tool dispatch passthrough. Reserved for the

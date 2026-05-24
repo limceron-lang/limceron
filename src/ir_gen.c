@@ -372,6 +372,14 @@ typedef struct {
     const char *name;
     int         addr_id;    /* SSA value of the alloca */
     IrType      type;
+    /* L3: marks a local that holds a Json handle. The IR-gen pass
+     * sets this when the let-initializer is one of `json.parse`,
+     * `json.field`, `json.field_get`, `json.field_get_safe`,
+     * `json.array_index`, or `json.array_get`, or when the let has
+     * an explicit `: Json` annotation. Field-access / `as` lowering
+     * dispatches on this flag rather than on the IR type (every
+     * Json value occupies the same i64 SSA slot as a regular int). */
+    bool        is_json;
 } IrGenVar;
 
 typedef struct {
@@ -477,6 +485,7 @@ static void irgen_scope_add(IrGenScope *s, const char *name, int addr_id, IrType
         s->vars[s->var_count].name = name;
         s->vars[s->var_count].addr_id = addr_id;
         s->vars[s->var_count].type = type;
+        s->vars[s->var_count].is_json = false;
         s->var_count++;
     }
 }
@@ -557,6 +566,11 @@ static IrType ast_type_to_ir(AstNode *type_expr) {
             return IR_TYPE_STRING;
         if (strcmp(type_expr->name, "void") == 0)
             return IR_TYPE_VOID;
+        /* L3: `Json` is an opaque handle. On the wasm side it is an
+         * i32 handle issued by the host, but at the SSA layer (where
+         * every host-call return lives) it occupies an i64 slot. */
+        if (strcmp(type_expr->name, "Json") == 0)
+            return IR_TYPE_I64;
         /* Default: treat unknown named types as struct/ptr */
         return IR_TYPE_PTR;
     }
@@ -756,6 +770,61 @@ static int irgen_call(IrGenContext *ctx, AstNode *expr) {
     return ir_emit_call(ctx->current_fn, ctx->mod, fn_name, ret_type, args, arg_count);
 }
 
+/* ============================================================
+ * L3: Json provenance helpers
+ *
+ * The front-end exposes `Json` as an opaque handle type. At the SSA
+ * level every Json handle lives in an i64 slot identical to a regular
+ * integer, so we cannot dispatch field-access lowering on IR type.
+ * Instead we tag scope variables whose initializer originates from
+ * the vdag:json namespace; field access (`x.foo`) and the `as int |
+ * string | bool` coercion operators then consult this tag to decide
+ * whether to lower to a host call or fall through to the
+ * default-no-op behaviour.
+ * ============================================================ */
+
+/* Return true if the qualified host-call name produces a Json handle
+ * we should track across let-bindings. Verbs that decode a handle
+ * into a primitive (string-value/int-value/bool-value/length/is-null
+ * /stringify/as-*) are NOT in this set -- their result is the leaf
+ * value, not another handle. */
+static bool host_call_returns_json(const char *qname) {
+    if (!qname) return false;
+    return strcmp(qname, "json.parse")            == 0 ||
+           strcmp(qname, "json.field")            == 0 ||
+           strcmp(qname, "json.field_get")        == 0 ||
+           strcmp(qname, "json.field_get_safe")   == 0 ||
+           strcmp(qname, "json.array_index")      == 0 ||
+           strcmp(qname, "json.array_get")        == 0;
+}
+
+/* True when `expr` evaluates to a Json handle. Used at let-binding
+ * sites (to tag the bound name) and at field-access / cast sites (to
+ * decide whether to rewrite to the vdag:json sugar). */
+static bool expr_is_json(IrGenContext *ctx, AstNode *expr) {
+    if (!expr) return false;
+    switch (expr->kind) {
+    case AST_HOST_CALL:
+        return host_call_returns_json(expr->name);
+    case AST_IDENT: {
+        if (!expr->name) return false;
+        IrGenVar *v = irgen_scope_lookup(&ctx->scope, expr->name);
+        return v && v->is_json;
+    }
+    case AST_FIELD_ACCESS:
+        /* `x.foo.bar` -- recursing into ->left tells us whether the
+         * intermediate result is Json. Field access on a Json
+         * receiver itself returns Json (see field-get/field-get-safe). */
+        return expr_is_json(ctx, expr->left);
+    case AST_TRY:
+        /* `expr?` is transparent -- the propagator just strips the
+         * Err half; the Ok half retains the underlying type. */
+        return expr_is_json(ctx, expr->left);
+    default:
+        return false;
+    }
+}
+
 /* Main expression IR generator */
 static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
     if (!expr) return -1;
@@ -852,9 +921,50 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
     }
 
     case AST_CAST: {
+        /* L3: when the source operand is a Json handle, `as int`,
+         * `as string`, and `as bool` lower to vdag:json coercion
+         * verbs instead of the front-end's value-cast IR. */
+        if (expr_is_json(ctx, expr->left) &&
+            expr->type_expr && expr->type_expr->kind == AST_TYPE_NAMED &&
+            expr->type_expr->name) {
+            const char *target_name = expr->type_expr->name;
+            const char *qname = NULL;
+            if (strcmp(target_name, "int") == 0 ||
+                strcmp(target_name, "i64") == 0) {
+                qname = "json.as_int";
+            } else if (strcmp(target_name, "string") == 0 ||
+                       strcmp(target_name, "str") == 0) {
+                qname = "json.as_string";
+            } else if (strcmp(target_name, "bool") == 0) {
+                qname = "json.as_bool";
+            }
+            if (qname) {
+                int handle = irgen_expr(ctx, expr->left);
+                int args[1] = { handle };
+                return ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                          qname, args, 1);
+            }
+        }
         int val = irgen_expr(ctx, expr->left);
         IrType target = ast_type_to_ir(expr->type_expr);
         return ir_emit_cast(ctx->current_fn, ctx->mod, target, val);
+    }
+
+    case AST_FIELD_ACCESS: {
+        /* L3 sugar: Json field access -> json.field_get(_, "name"). */
+        if (expr_is_json(ctx, expr->left) && expr->name) {
+            int handle = irgen_expr(ctx, expr->left);
+            int key    = ir_emit_const_string(ctx->current_fn, ctx->mod,
+                                              expr->name);
+            int args[2] = { handle, key };
+            const char *qname = expr->is_unsafe
+                ? "json.field_get_safe"
+                : "json.field_get";
+            return ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                      qname, args, 2);
+        }
+        if (expr->left) (void)irgen_expr(ctx, expr->left);
+        return ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
     }
 
     case AST_IF: {
@@ -1319,8 +1429,22 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
 
         int addr = ir_emit_alloca(ctx->current_fn, ctx->mod, var_type);
 
+        /* L3: detect Json provenance so subsequent `.foo` / `as int`
+         * usages of `stmt->name` lower to vdag:json host calls. */
+        bool json_local = false;
+        if (stmt->type_expr && stmt->type_expr->kind == AST_TYPE_NAMED &&
+            stmt->type_expr->name &&
+            strcmp(stmt->type_expr->name, "Json") == 0) {
+            json_local = true;
+        } else if (stmt->right) {
+            json_local = expr_is_json(ctx, stmt->right);
+        }
+
         if (stmt->name) {
             irgen_scope_add(&ctx->scope, stmt->name, addr, var_type);
+            if (json_local) {
+                ctx->scope.vars[ctx->scope.var_count - 1].is_json = true;
+            }
         }
 
         if (stmt->right) {

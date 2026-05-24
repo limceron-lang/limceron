@@ -341,13 +341,30 @@ int lcn_wit_load(LcnWitContract *contract, const char *path) {
     return 0;
 }
 
+/* WIT identifiers are kebab-case (`field-get`); the Limceron front-end
+ * uses snake_case (`field_get`) because `-` is not a valid identifier
+ * character there. Compare with `-` and `_` treated as equivalent so
+ * the contract round-trips cleanly in both directions. */
+static int qualified_eq_canonical(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a;
+        char cb = *b;
+        if (ca == '-') ca = '_';
+        if (cb == '-') cb = '_';
+        if (ca != cb) return 0;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
 const LcnWitFunc *lcn_wit_lookup_signature(const LcnWitContract *contract,
                                            const char *qualified) {
     int i;
     if (!contract || !qualified) return NULL;
     if (!contract->load_ok) return NULL;
     for (i = 0; i < contract->count; i++) {
-        if (strcmp(contract->funcs[i].qualified, qualified) == 0)
+        if (qualified_eq_canonical(contract->funcs[i].qualified, qualified))
             return &contract->funcs[i];
     }
     return NULL;

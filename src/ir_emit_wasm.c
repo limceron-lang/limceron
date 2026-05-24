@@ -917,6 +917,20 @@ static void emit_host_imports(EmitCtx *ctx) {
         } else if (strcmp(s->qualified, "json.stringify") == 0) {
             /* (handle, out_ptr, out_cap) -> byte count */
             param_list = "(param i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.field_get") == 0) {
+            param_list = "(param i32 i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.field_get_safe") == 0) {
+            param_list = "(param i32 i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.as_int") == 0) {
+            param_list = "(param i32) (result i64)";
+        } else if (strcmp(s->qualified, "json.as_string") == 0) {
+            param_list = "(param i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.as_bool") == 0) {
+            param_list = "(param i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.array_get") == 0) {
+            param_list = "(param i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "json.array_len") == 0) {
+            param_list = "(param i32) (result i32)";
         } else {
             /* Unknown capability: emit a 4-arg/i32-result placeholder so
              * the wasm at least validates. wazero will fail to link the
@@ -1590,6 +1604,73 @@ static void emit_instruction(FnCtx *fctx, IrBasicBlock *bb, IrInst *inst) {
             fprintf(out, "      i32.wrap_i64\n");
             fprintf(out, "      i32.const %d\n", out_buf);
             fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if ((strcmp(qname, "json.field_get") == 0 ||
+                    strcmp(qname, "json.field_get_safe") == 0) &&
+                   inst->call_arg_count >= 2) {
+            int h_arg = inst->call_args[0];
+            int k_arg = inst->call_args[1];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            emit_get_value(fctx, k_arg);
+            emit_get_value(fctx, k_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.as_int") == 0 &&
+                   inst->call_arg_count >= 1) {
+            int h_arg = inst->call_args[0];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.as_string") == 0 &&
+                   inst->call_arg_count >= 1) {
+            int h_arg = inst->call_args[0];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.as_bool") == 0 &&
+                   inst->call_arg_count >= 1) {
+            int h_arg = inst->call_args[0];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.array_get") == 0 &&
+                   inst->call_arg_count >= 2) {
+            int h_arg = inst->call_args[0];
+            int i_arg = inst->call_args[1];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            emit_get_value(fctx, i_arg);
+            fprintf(out, "      i32.wrap_i64\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "json.array_len") == 0 &&
+                   inst->call_arg_count >= 1) {
+            int h_arg = inst->call_args[0];
+            emit_get_value(fctx, h_arg);
+            fprintf(out, "      i32.wrap_i64\n");
             fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
             fprintf(out, "      i64.extend_i32_s\n");
             emit_set_value(fctx, inst->id);

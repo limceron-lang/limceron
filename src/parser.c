@@ -735,6 +735,7 @@ static Precedence get_precedence(TokenKind kind) {
     case TOK_POWER:                             return PREC_POWER;
     case TOK_DOT: case TOK_LPAREN:
     case TOK_LBRACKET: case TOK_QUESTION:
+    case TOK_QUESTION_DOT:
     case TOK_AS: case TOK_IS:
     case TOK_COLON_COLON:                       return PREC_POSTFIX;
     default:                                    return PREC_NONE;

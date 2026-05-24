@@ -2464,6 +2464,8 @@ static bool is_builtin_type(const char *name) {
         "bool", "void", "string", "String",
         "Result", "Vec", "List", "Option", "Map", "Set",
         "char", "byte", "usize", "isize",
+        /* L3: Json is an opaque handle type. */
+        "Json",
         NULL
     };
     int i;
