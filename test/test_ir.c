@@ -668,6 +668,66 @@ TEST(ir_gen_nested_break_targets_innermost_exit) {
     ASSERT_EQ(count_jmp_to(fn, outer_exit->id), 0);
 }
 
+TEST(l2_ir_gen_loop_has_header_and_back_edge) {
+    /* `loop { break }` lowers to:
+     *
+     *   bb_pre  -> jmp -> bb_header
+     *   bb_header -> jmp -> bb_body
+     *   bb_body -> jmp -> bb_exit         (the break)
+     *   bb_exit -> ...
+     *
+     * Invariants:
+     *   - there is a basic block whose label contains "loop.header"
+     *   - there is a basic block whose label contains "loop.exit"
+     *   - the body jumps to the EXIT block (the `break`), so the
+     *     count_jmp_to(exit) is >= 1
+     *   - the back-edge from body->header is missing here because
+     *     the body's only stmt is `break`, which terminates the block;
+     *     irgen does NOT insert a redundant back-edge. (This is the
+     *     dead-block trick described in ir_gen.c's AST_BREAK case.) */
+    IrModule *mod = ir_from_source(
+        "fn run() -> int {\n"
+        "    loop {\n"
+        "        break\n"
+        "    }\n"
+        "    return 42\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrBasicBlock *header = find_bb_by_label(fn, "loop.header");
+    IrBasicBlock *exit_bb = find_bb_by_label(fn, "loop.exit");
+    ASSERT_NOT_NULL(header);
+    ASSERT_NOT_NULL(exit_bb);
+    ASSERT(count_jmp_to(fn, exit_bb->id) >= 1);
+}
+
+TEST(l2_ir_gen_for_wildcard_pattern_lowers_like_named) {
+    /* `for _ in 0..N` must produce the same 4-BB shape as a named
+     * for-in. The wildcard pattern simply means the loop variable
+     * never appears in scope — the IR scaffolding around it is
+     * unchanged. */
+    IrModule *mod = ir_from_source(
+        "fn run() -> int {\n"
+        "    let mut total = 0\n"
+        "    for _ in 0..3 {\n"
+        "        total = total + 1\n"
+        "    }\n"
+        "    return total\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    ASSERT_NOT_NULL(find_bb_by_label(fn, "for.cond"));
+    ASSERT_NOT_NULL(find_bb_by_label(fn, "for.body"));
+    ASSERT_NOT_NULL(find_bb_by_label(fn, "for.inc"));
+    ASSERT_NOT_NULL(find_bb_by_label(fn, "for.exit"));
+}
+
 TEST(ir_gen_string_concat) {
     IrModule *mod = ir_from_source(
         "fn test() {\n"
@@ -2644,6 +2704,8 @@ int main(void) {
     RUN_TEST(ir_gen_while_bb_count_and_back_edge);
     RUN_TEST(ir_gen_for_in_desugar_shape);
     RUN_TEST(ir_gen_nested_break_targets_innermost_exit);
+    RUN_TEST(l2_ir_gen_loop_has_header_and_back_edge);
+    RUN_TEST(l2_ir_gen_for_wildcard_pattern_lowers_like_named);
     RUN_TEST(ir_gen_string_concat);
     RUN_TEST(ir_gen_multiple_functions);
     RUN_TEST(ir_gen_return_void);

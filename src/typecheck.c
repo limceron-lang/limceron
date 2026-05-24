@@ -2882,6 +2882,103 @@ static void check_stmt(SymbolTable *st, AstNode *stmt,
     }
 }
 
+/* ============================================================
+ * L2: break / continue scope check
+ *
+ * Walks a fn body tracking a `loop_depth` counter. Every AST_WHILE /
+ * AST_FOR / AST_LOOP enters a loop frame (++depth); every AST_BREAK
+ * or AST_CONTINUE seen while depth==0 raises a diagnostic.
+ *
+ * This pass is intentionally independent of `check_stmt` / `check_expr`
+ * so a future revisit (e.g. labelled break) only touches one walker.
+ * Match arms are walked WITHOUT inheriting the enclosing loop frame:
+ * a `break` inside `match { _ -> { break } }` IS valid only if the
+ * match itself is inside a loop.
+ * ============================================================ */
+
+static void check_loop_scope_stmt(AstNode *stmt, int loop_depth,
+                                  ErrorReporter *reporter);
+
+static void check_loop_scope_expr(AstNode *expr, int loop_depth,
+                                  ErrorReporter *reporter) {
+    if (!expr) return;
+    /* break and continue can only appear at statement position in
+     * stage0, but be defensive — walk both children. */
+    check_loop_scope_stmt(expr->left,   loop_depth, reporter);
+    check_loop_scope_stmt(expr->right,  loop_depth, reporter);
+    check_loop_scope_stmt(expr->params, loop_depth, reporter);
+}
+
+static void check_loop_scope_stmt(AstNode *stmt, int loop_depth,
+                                  ErrorReporter *reporter) {
+    if (!stmt) return;
+
+    switch (stmt->kind) {
+    case AST_WHILE:
+        check_loop_scope_expr(stmt->left, loop_depth, reporter);
+        check_loop_scope_stmt(stmt->right, loop_depth + 1, reporter);
+        break;
+
+    case AST_FOR:
+        check_loop_scope_expr(stmt->params, loop_depth, reporter);
+        check_loop_scope_stmt(stmt->right,  loop_depth + 1, reporter);
+        break;
+
+    case AST_LOOP:
+        check_loop_scope_stmt(stmt->left, loop_depth + 1, reporter);
+        break;
+
+    case AST_BREAK:
+        if (loop_depth <= 0) {
+            report_error(reporter, stmt->loc,
+                         "`break` used outside of a loop body",
+                         "`break` is only valid inside a `while`, "
+                         "`for`, or `loop { ... }` block");
+        }
+        break;
+
+    case AST_CONTINUE:
+        if (loop_depth <= 0) {
+            report_error(reporter, stmt->loc,
+                         "`continue` used outside of a loop body",
+                         "`continue` is only valid inside a `while`, "
+                         "`for`, or `loop { ... }` block");
+        }
+        break;
+
+    case AST_BLOCK: {
+        AstNode *s = stmt->params;
+        while (s) {
+            check_loop_scope_stmt(s, loop_depth, reporter);
+            s = s->next;
+        }
+        break;
+    }
+
+    case AST_IF:
+        check_loop_scope_expr(stmt->left,   loop_depth, reporter);
+        check_loop_scope_stmt(stmt->right,  loop_depth, reporter);
+        check_loop_scope_stmt(stmt->params, loop_depth, reporter);
+        break;
+
+    case AST_MATCH: {
+        check_loop_scope_expr(stmt->left, loop_depth, reporter);
+        AstNode *arm = stmt->params;
+        while (arm) {
+            if (arm->kind == AST_MATCH_ARM)
+                check_loop_scope_stmt(arm->right, loop_depth, reporter);
+            arm = arm->next;
+        }
+        break;
+    }
+
+    default:
+        check_loop_scope_expr(stmt->left,   loop_depth, reporter);
+        check_loop_scope_expr(stmt->right,  loop_depth, reporter);
+        break;
+    }
+}
+
 /* Check function body */
 static void check_fn_body(SymbolTable *st, AstNode *fn,
                           ErrorReporter *reporter, Arena *arena) {
@@ -2900,6 +2997,8 @@ static void check_fn_body(SymbolTable *st, AstNode *fn,
     /* Check body */
     if (fn->left) {
         check_stmt(st, fn->left, reporter, arena);
+        /* L2: surface break/continue used outside any loop body. */
+        check_loop_scope_stmt(fn->left, 0, reporter);
     }
 }
 
@@ -2931,6 +3030,8 @@ static void check_tool_decl(SymbolTable *st, AstNode *tool,
     /* Check body */
     if (tool->left) {
         check_stmt(st, tool->left, reporter, arena);
+        /* L2: same break/continue scope check for tool bodies. */
+        check_loop_scope_stmt(tool->left, 0, reporter);
     }
 }
 

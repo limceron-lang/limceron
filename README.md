@@ -406,9 +406,11 @@ Dual-licensed under [Apache 2.0](LICENSE-APACHE) and [MIT](LICENSE-MIT) — your
     — L12 capability.network compile-time allowlist.
   - [ADR-0006](docs/adr/0006-vdag-json-host-module.md) — L3 vdag:json
     host module.
+  - [ADR-0007](docs/adr/0007-loops-and-loop-carried-bindings.md) — L2
+    while / for / loop and loop-carried bindings.
 
 - **Examples** (`examples/wasm/`):
-  - `poc/` — arithmetic, branching, ReAct loop.
+  - `poc/` — arithmetic, branching, ReAct loop, bounded loops.
   - `loops/` — `while`, `for`, `break`/`continue`.
   - `errors/` — `Ok` / `Err` / `try` / `catch` / `?`.
   - `entropy/` — entropy_budget fence (within + exceeds).

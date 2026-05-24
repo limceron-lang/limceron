@@ -3114,6 +3114,112 @@ TEST(codegen_for_range_expr) {
 }
 
 /* ============================================================
+ * L2: loop AST + typecheck scope tests
+ *
+ * These pin the L2 surface area that's load-bearing for the bounded
+ * ReAct example in examples/wasm/poc/06_loops.lceron:
+ *   - parser recognises the bare `loop { }` form
+ *   - parser recognises a `for _ in 0..N` wildcard pattern
+ *   - typecheck rejects `break` outside any loop
+ *   - typecheck rejects `continue` outside any loop
+ *   - typecheck ACCEPTS a `break` nested inside an if-inside-a-loop
+ *     (the scope check must walk into match/if branches, not only the
+ *     direct loop body)
+ * ============================================================ */
+
+TEST(l2_parse_loop_keyword_infinite) {
+    bool err;
+    AstNode *prog = parse_source(
+        "fn run() {\n"
+        "    loop {\n"
+        "        break\n"
+        "    }\n"
+        "}",
+        &err
+    );
+    ASSERT_FALSE(err);
+    AstNode *loop_stmt = prog->params->left->params;
+    ASSERT_EQ(loop_stmt->kind, AST_LOOP);
+    /* loop body sits in stmt->left (AST_BLOCK) and its first stmt is BREAK */
+    ASSERT_NOT_NULL(loop_stmt->left);
+    ASSERT_EQ(loop_stmt->left->params->kind, AST_BREAK);
+}
+
+TEST(l2_parse_for_wildcard_pattern) {
+    bool err;
+    AstNode *prog = parse_source(
+        "fn run() {\n"
+        "    for _ in 0..3 {\n"
+        "        let x = 1\n"
+        "    }\n"
+        "}",
+        &err
+    );
+    ASSERT_FALSE(err);
+    AstNode *for_stmt = prog->params->left->params;
+    ASSERT_EQ(for_stmt->kind, AST_FOR);
+    /* pattern slot must be a wildcard, not a named binding */
+    ASSERT_NOT_NULL(for_stmt->left);
+    ASSERT_EQ(for_stmt->left->kind, AST_PAT_WILDCARD);
+    /* iterator must be a range expression */
+    ASSERT_NOT_NULL(for_stmt->params);
+    ASSERT_EQ(for_stmt->params->kind, AST_RANGE);
+}
+
+TEST(l2_typecheck_rejects_break_outside_loop) {
+    bool ok = typecheck_source(
+        "agent T {\n"
+        "    capabilities: []\n"
+        "    budget: { max_tokens: 1, max_cost: 0.01 }\n"
+        "    fn main() -> int {\n"
+        "        break\n"
+        "        0\n"
+        "    }\n"
+        "}"
+    );
+    ASSERT_FALSE(ok);
+}
+
+TEST(l2_typecheck_rejects_continue_outside_loop) {
+    bool ok = typecheck_source(
+        "agent T {\n"
+        "    capabilities: []\n"
+        "    budget: { max_tokens: 1, max_cost: 0.01 }\n"
+        "    fn main() -> int {\n"
+        "        if true {\n"
+        "            continue\n"
+        "        }\n"
+        "        0\n"
+        "    }\n"
+        "}"
+    );
+    ASSERT_FALSE(ok);
+}
+
+TEST(l2_typecheck_accepts_break_inside_if_inside_loop) {
+    /* The scope walker must descend into AST_IF branches WHILE keeping
+     * the enclosing loop frame on the stack. Without this, the natural
+     * `if cond { break }` pattern would be flagged. */
+    bool ok = typecheck_source(
+        "agent T {\n"
+        "    capabilities: []\n"
+        "    budget: { max_tokens: 1, max_cost: 0.01 }\n"
+        "    fn main() -> int {\n"
+        "        let mut i = 0\n"
+        "        while i < 10 {\n"
+        "            if i == 5 {\n"
+        "                break\n"
+        "            }\n"
+        "            i = i + 1\n"
+        "        }\n"
+        "        i\n"
+        "    }\n"
+        "}"
+    );
+    ASSERT(ok);
+}
+
+/* ============================================================
  * PATTERN MATCHING TESTS
  * ============================================================ */
 
@@ -7526,6 +7632,13 @@ int main(void) {
     RUN_TEST(parse_break_continue);
     RUN_TEST(parse_nested_loops);
     RUN_TEST(codegen_for_range_expr);
+
+    fprintf(stderr, "\n── L2: loops + loop-carried bindings ──\n");
+    RUN_TEST(l2_parse_loop_keyword_infinite);
+    RUN_TEST(l2_parse_for_wildcard_pattern);
+    RUN_TEST(l2_typecheck_rejects_break_outside_loop);
+    RUN_TEST(l2_typecheck_rejects_continue_outside_loop);
+    RUN_TEST(l2_typecheck_accepts_break_inside_if_inside_loop);
 
     fprintf(stderr, "\n── Pattern Matching Tests ──\n");
     RUN_TEST(parse_match_wildcard);

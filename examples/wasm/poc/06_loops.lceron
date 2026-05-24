@@ -1,0 +1,48 @@
+// 06_loops.lceron — WASM PoC sample: bounded ReAct loop over a host call.
+//
+// L2 deliverable. Demonstrates the three control-flow constructs introduced
+// for L2 — `while`, `for ... in <range>`, and `loop { }` — composed with
+// the L5 `?` propagator and the L1 host-call lowering.
+//
+// The agent runs a bounded retry-style loop against `llm.classify`, capped
+// at MAX_ITER iterations via a half-open range `0..N`. Inside the body the
+// loop-carried `total` accumulator is a `let mut` binding; each iteration
+// reads the previous value and writes a fresh one. At the IR level this
+// becomes an alloca + load/store on the loop var (the same shape as ADR-
+// 0002's PHI lowering — see ADR-0007 for why we picked alloca-store over
+// header-phi for L2 stage0).
+//
+// Bounded ReAct properties this sample pins:
+//
+//   1. The loop is GUARANTEED to terminate after at most MAX_ITER
+//      iterations. No `loop { }` is used (which would never terminate
+//      without an explicit `break`); we use `for _ in 0..N` so the
+//      compiler can prove the bound at IR-gen time.
+//   2. Every host call short-circuits via `?`. If `llm.classify` returns a
+//      negative HostErr* sentinel the whole agent returns that code.
+//   3. `total` is loop-carried — its value at iteration i+1 is `total at
+//      i + label_len at i`, where label_len is the host-returned count.
+//
+// Expected runtime: with Visual-DAG's MockClient seeded to return an
+// 8-byte label "ESCALATE" for every llm.classify call, three iterations
+// produce total = 3 * 8 = 24.
+//
+// Compile & run:
+//   ./build/limceron-stage0 build --target wasm32-wasi-preview2 \
+//       -o /tmp/loop_06.wasm examples/wasm/poc/06_loops.lceron
+//   wasmtime --invoke main /tmp/loop_06.wasm    # => 24 under MockClient
+
+agent ReactBounded {
+    capabilities: [llm.classify]
+    budget: { max_tokens: 100, max_cost: 0.02 }
+
+    fn main() -> int {
+        let max_iter = 3
+        let mut total = 0
+        for _ in 0..max_iter {
+            let label_len = llm.classify("react-bounded-step")?
+            total = total + label_len
+        }
+        total
+    }
+}

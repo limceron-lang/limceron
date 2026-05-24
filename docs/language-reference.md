@@ -1,6 +1,6 @@
 # Limceron language reference
 
-Covers every syntactic form stage0 supports as of L13 (2026-05-13).
+Covers every syntactic form stage0 supports as of L13 + L2 (2026-05-13).
 The reference is grouped by feature; each section names the
 implementing files in `src/`.
 
@@ -224,6 +224,47 @@ for i in 0..100 {
     sum = sum + i
 }
 ```
+
+`break` or `continue` outside any loop body is a typecheck error
+(`` `break` used outside of a loop body``). The check walks into
+`if` and `match` arms while preserving the enclosing loop frame, so
+`if cond { break }` inside a loop is accepted.
+
+### Loop-carried `let mut` bindings (L2)
+
+A `let mut` declared *outside* a loop and reassigned *inside* the
+body has its mutation surface to the next iteration:
+
+```limceron
+let mut sum = 0
+let mut i = 0
+while i < 10 {
+    sum = sum + i      // sum at iter N+1 = sum at iter N + i
+    i = i + 1
+}
+// sum == 45, i == 10
+```
+
+The compiler lowers each loop-carried binding to an `alloca` slot in
+the entry block with `load`/`store` at each access. There are no PHI
+nodes at the loop header in stage 0 — the alloca address is itself
+single-assignment, which keeps the wasm backend emission simple. See
+[ADR-0007](adr/0007-loops-and-loop-carried-bindings.md) for the full
+rationale and the deferred alternatives (header phis, mem2reg,
+iterator protocols).
+
+The wildcard `_` pattern is accepted in `for-in` and skips binding
+the counter into scope:
+
+```limceron
+for _ in 0..MAX {
+    work()             // counter unused
+}
+```
+
+Both shapes — named (`for i in 0..N`) and wildcard (`for _ in 0..N`)
+— lower to the same 4-BB CFG (init → cond → body → inc → exit). See
+[ADR-0007](adr/0007-loops-and-loop-carried-bindings.md).
 
 ## Result, `?` and `try/catch` (L5)
 
