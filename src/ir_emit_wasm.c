@@ -64,6 +64,14 @@
 #include <unistd.h>
 #include <inttypes.h>
 
+/* --emit-wit / --no-emit-wit toggle. Defaults to ON; cmd_build flips
+ * it OFF for non-wasm targets unless the operator passes --emit-wit
+ * explicitly. The setter has C linkage so main.c can call it without
+ * pulling ir_emit_wasm's full header surface. */
+static int g_emit_wit_enabled = 1;
+void lcn_set_emit_wit(int on) { g_emit_wit_enabled = on ? 1 : 0; }
+int  lcn_emit_wit_enabled(void) { return g_emit_wit_enabled; }
+
 /* ============================================================
  * Helpers
  * ============================================================ */
@@ -2226,8 +2234,14 @@ int lcn_emit_wasm(AstNode *program, const char *input,
 
     /* Sibling .wit emit. Replace the .wasm extension; if there is none,
      * append .wit so we always produce an artifact. WIT is auxiliary
-     * metadata: a missing-agents source shouldn't fail the wasm build. */
-    {
+     * metadata: a missing-agents source shouldn't fail the wasm build.
+     *
+     * Gated by lcn_set_emit_wit (default ON for wasm32-wasi-preview2
+     * via cmd_build; can be flipped with --no-emit-wit). The L1b
+     * requirement is "always co-emit alongside output.wasm" -- the
+     * unconditional invocation lives here so the wasm path always
+     * produces both artefacts unless explicitly disabled. */
+    if (lcn_emit_wit_enabled()) {
         char wit_path[1024];
         size_t n = strlen(output);
         const char *dot = strrchr(output, '.');

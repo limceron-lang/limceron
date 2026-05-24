@@ -13,6 +13,7 @@
 #include "lcn.h"
 #include "package.h"
 #include "ir.h"
+#include "wit_emit.h"
 #include <sys/stat.h>
 #include <libgen.h>
 #include <unistd.h>
@@ -568,8 +569,19 @@ static int cmd_emit(const char *filename, const char *output_path) {
     return 0;
 }
 
+/* Tri-state for --emit-wit / --no-emit-wit. ON is the default for
+ * wasm32-wasi-preview2 (where the runtime needs the sibling .wit
+ * to resolve host imports); OFF is the default elsewhere. The user
+ * can override either default with the explicit flag. */
+typedef enum {
+    LCN_EMIT_WIT_DEFAULT = 0,
+    LCN_EMIT_WIT_ON      = 1,
+    LCN_EMIT_WIT_OFF     = 2
+} LcnEmitWitMode;
+
 static int cmd_build(const char *input, const char *output, const char *argv0,
-                     bool serve_mode, const LcnTarget *target) {
+                     bool serve_mode, const LcnTarget *target,
+                     LcnEmitWitMode emit_wit) {
     Arena source_arena = arena_new(16 * 1024 * 1024);
     Arena intern_arena = arena_new(4 * 1024 * 1024);
     Arena ast_arena = arena_new(64 * 1024 * 1024);
@@ -706,17 +718,48 @@ static int cmd_build(const char *input, const char *output, const char *argv0,
 
     /* 4a. WASM branch — fork before C codegen. The wasm flow:
      *     program (AST) -> ir_emit_wasm.c writes .wat -> wat2wasm produces .wasm
-     *     We also emit a sibling .wit when capabilities are declared.
-     *     ir_emit_wasm.c stub returns -1 today; agent A fills it in. */
+     *     The sibling .wit is emitted alongside the .wasm by
+     *     ir_emit_wasm.c::lcn_emit_wasm; the --emit-wit / --no-emit-wit
+     *     flag (default ON for wasm32-wasi-preview2) gates whether
+     *     lcn_emit_wit gets called, so operators can opt out for
+     *     embedded targets that ship only the binary. The default OFF
+     *     path for non-wasm targets is the existing C99/native flow,
+     *     where WIT has no consumer. */
     if (target && target->arch == LCN_ARCH_WASM32 && target->os == LCN_OS_WASI) {
         extern int lcn_emit_wasm(AstNode *program, const char *input,
                                  const char *output, Arena *arena,
                                  const LcnTarget *target);
+        bool want_wit = (emit_wit != LCN_EMIT_WIT_OFF);
+        extern void lcn_set_emit_wit(int on);
+        lcn_set_emit_wit(want_wit ? 1 : 0);
         int rc = lcn_emit_wasm(program, input, output, &ast_arena, target);
         arena_free(&source_arena);
         arena_free(&intern_arena);
         arena_free(&ast_arena);
         return rc;
+    }
+
+    /* For non-wasm targets the flag is explicit-only; the C99 /
+     * native backend does not consume WIT today, so the default-OFF
+     * path is a no-op. Honouring `--emit-wit` here still produces
+     * the sibling artefact next to the binary, which is useful for
+     * operators preparing a wasm port of the same source. */
+    if (emit_wit == LCN_EMIT_WIT_ON) {
+        char wit_path[1024];
+        size_t n = strlen(output);
+        const char *dot = strrchr(output, '.');
+        if (dot && dot > output) {
+            size_t prefix = (size_t)(dot - output);
+            if (prefix + 5 < sizeof(wit_path)) {
+                memcpy(wit_path, output, prefix);
+                memcpy(wit_path + prefix, ".wit", 5);
+                (void)lcn_emit_wit(program, wit_path);
+            }
+        } else if (n + 5 < sizeof(wit_path)) {
+            memcpy(wit_path, output, n);
+            memcpy(wit_path + n, ".wit", 5);
+            (void)lcn_emit_wit(program, wit_path);
+        }
     }
 
     /* 4. Generate C (build mode — uses #include "lcn_runtime.h") */
@@ -958,7 +1001,8 @@ static int cmd_run(const char *input, const char *argv0) {
     char tmp_bin[256];
     snprintf(tmp_bin, sizeof(tmp_bin), "/tmp/lcn_run_%d", (int)getpid());
 
-    int rc = cmd_build(input, tmp_bin, argv0, false, NULL);
+    int rc = cmd_build(input, tmp_bin, argv0, false, NULL,
+                       LCN_EMIT_WIT_DEFAULT);
     if (rc != 0) return rc;
 
     fprintf(stderr, "\n--- Running %s ---\n\n", input);
@@ -3029,6 +3073,9 @@ static void print_usage(const char *prog) {
         "  --target <triple>   Target triple: ARCH-OS[-ABI]\n"
         "                      Examples: aarch64-linux, x86_64-linux-musl, aarch64-darwin\n"
         "  --static            Link statically (Linux targets, for containers/Lambda)\n"
+        "  --emit-wit          Always co-emit a sibling .wit alongside the output\n"
+        "                      (default ON for wasm32-wasi-preview2, OFF elsewhere)\n"
+        "  --no-emit-wit       Skip sibling .wit emission even for wasm targets\n"
         "\n"
         "Package commands:\n"
         "  add <pkg> <version>        Add registry dependency\n"
@@ -3102,6 +3149,7 @@ int main(int argc, char **argv) {
         bool serve_mode = false;
         const char *target_triple = NULL;
         bool static_link = false;
+        LcnEmitWitMode emit_wit = LCN_EMIT_WIT_DEFAULT;
         int i;
         for (i = 2; i < argc; i++) {
             if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -3114,6 +3162,10 @@ int main(int argc, char **argv) {
                 i++;
             } else if (strcmp(argv[i], "--static") == 0) {
                 static_link = true;
+            } else if (strcmp(argv[i], "--emit-wit") == 0) {
+                emit_wit = LCN_EMIT_WIT_ON;
+            } else if (strcmp(argv[i], "--no-emit-wit") == 0) {
+                emit_wit = LCN_EMIT_WIT_OFF;
             } else if (argv[i][0] != '-' && !input) {
                 /* First non-flag argument is the input file */
                 input = argv[i];
@@ -3178,7 +3230,21 @@ int main(int argc, char **argv) {
             target_ptr = &target;
         }
 
-        return cmd_build(input, output, argv[0], serve_mode, target_ptr);
+        /* Resolve the default emit-wit policy. wasm32-wasi-preview2
+         * defaults ON (the runtime needs the sibling .wit to resolve
+         * host imports); every other target defaults OFF (no consumer
+         * for the artefact in the C99 / native flow). */
+        if (emit_wit == LCN_EMIT_WIT_DEFAULT) {
+            if (target_ptr && target_ptr->arch == LCN_ARCH_WASM32 &&
+                target_ptr->os == LCN_OS_WASI) {
+                emit_wit = LCN_EMIT_WIT_ON;
+            } else {
+                emit_wit = LCN_EMIT_WIT_OFF;
+            }
+        }
+
+        return cmd_build(input, output, argv[0], serve_mode, target_ptr,
+                         emit_wit);
     }
 
     if (strcmp(argv[1], "targets") == 0) {

@@ -14,6 +14,7 @@
  */
 
 #include "lcn.h"
+#include "wit_load.h"
 
 /* ============================================================
  * Configuration
@@ -1142,6 +1143,167 @@ static void check_capability_allowlists(AstNode *program,
             }
             break;
         }
+    }
+}
+
+/* ============================================================
+ * Pass 2d: Host-call signature check (L1b)
+ *
+ * Walks every AST_HOST_CALL and compares its qualified name +
+ * argument count against the canonical contract loaded from
+ * `include/vdag.wit`. Mismatches raise
+ * `ERR_HOST_CALL_SIGNATURE_MISMATCH` with the expected signature
+ * surfaced inline so the operator can fix the call site or extend
+ * the contract.
+ *
+ * When the canonical contract does not declare the qualified call
+ * (e.g. a new agent verb that has not landed in vdag.wit yet) we
+ * emit a one-line warning and fall back to the legacy behaviour --
+ * the IR backend will still emit the call against the agent-side
+ * WIT advertisement, so the build does not break.
+ *
+ * Type-shape checking is intentionally narrow at L1b: the goal is
+ * to catch arity drift and "calling a function the host does not
+ * export". Full WIT-type vs Limceron-type unification waits for
+ * the L8 module type system; today's check is sufficient because
+ * every host argument bottoms out at `string` or `s32`/`s64` and
+ * the Limceron front-end already enforces those at expression
+ * level.
+ * ============================================================ */
+
+static void format_expected_sig(const LcnWitFunc *fn,
+                                char *out, size_t out_cap) {
+    int i;
+    int n = snprintf(out, out_cap, "%s(", fn->qualified);
+    for (i = 0; i < fn->param_count && (size_t)n < out_cap; i++) {
+        n += snprintf(out + n,
+                      (size_t)n < out_cap ? out_cap - (size_t)n : 0,
+                      "%s%s: %s",
+                      i == 0 ? "" : ", ",
+                      fn->params[i].name,
+                      fn->params[i].type);
+    }
+    if ((size_t)n < out_cap) {
+        n += snprintf(out + n, out_cap - (size_t)n, ")");
+    }
+    if (fn->ret_type[0] && (size_t)n < out_cap) {
+        snprintf(out + n,
+                 (size_t)n < out_cap ? out_cap - (size_t)n : 0,
+                 " -> %s", fn->ret_type);
+    }
+}
+
+static int count_args(AstNode *first) {
+    int n = 0;
+    AstNode *a;
+    for (a = first; a; a = a->next) n++;
+    return n;
+}
+
+static void walk_for_host_calls(AstNode *node,
+                                const LcnWitContract *contract,
+                                ErrorReporter *reporter);
+
+static void walk_list_for_host_calls(AstNode *head,
+                                     const LcnWitContract *contract,
+                                     ErrorReporter *reporter) {
+    AstNode *n;
+    for (n = head; n; n = n->next)
+        walk_for_host_calls(n, contract, reporter);
+}
+
+static void walk_for_host_calls(AstNode *node,
+                                const LcnWitContract *contract,
+                                ErrorReporter *reporter) {
+    if (!node) return;
+
+    if (node->kind == AST_HOST_CALL && node->name) {
+        const LcnWitFunc *fn = lcn_wit_lookup_signature(contract, node->name);
+        if (fn) {
+            int actual = count_args(node->params);
+            if (actual != fn->param_count) {
+                char expected[256];
+                format_expected_sig(fn, expected, sizeof(expected));
+                report_error_fmt(reporter, node->loc,
+                    "fix the call site or update include/vdag.wit",
+                    "ERR_HOST_CALL_SIGNATURE_MISMATCH: host call '%s' "
+                    "expects %d argument%s, got %d -- expected signature: %s",
+                    node->name,
+                    fn->param_count,
+                    fn->param_count == 1 ? "" : "s",
+                    actual,
+                    expected);
+            }
+        } else if (contract && contract->load_ok) {
+            /* Contract loaded but the call is undeclared. Soft
+             * warning so operators can decide whether to extend
+             * include/vdag.wit or remove the call. */
+            report_warning_fmt(reporter, node->loc,
+                "add the function to include/vdag.wit or remove the call",
+                "host call '%s' is not declared in the canonical "
+                "include/vdag.wit contract -- falling back to "
+                "emit-WIT advertisement",
+                node->name);
+        }
+        /* Fall through to walk arguments. */
+    }
+
+    /* Generic recursion across the common AST shape used elsewhere
+     * in this file. Mirrors find_tool_calls_in_expr's coverage. The
+     * list helpers iterate ->next so that an agent's method list
+     * (linked via ->left + ->next chains), a function body's
+     * statement list (->params + ->next), and an expression's
+     * argument list all get fully traversed. */
+    walk_list_for_host_calls(node->left,       contract, reporter);
+    walk_list_for_host_calls(node->right,      contract, reporter);
+    walk_for_host_calls(node->type_expr,       contract, reporter);
+    walk_list_for_host_calls(node->params,     contract, reporter);
+    walk_list_for_host_calls(node->attributes, contract, reporter);
+    /* node->next is walked by the list helper at the caller; we do
+     * not descend ->next here so that walking a single AST node
+     * does not bleed into its siblings. */
+}
+
+/* Walk the program for host-call signature mismatches. The
+ * contract loader is best-effort: a missing or malformed
+ * include/vdag.wit falls back to today's behaviour (the IR backend
+ * still emits the per-call import) so the build never breaks
+ * because of a missing canonical contract -- the worst case is
+ * the absence of compile-time mismatch detection. */
+static void check_host_call_signatures(AstNode *program,
+                                       ErrorReporter *reporter) {
+    static LcnWitContract contract;        /* loaded once per process */
+    static int load_attempted = 0;
+    AstNode *decl;
+    if (!program || program->kind != AST_PROGRAM) return;
+
+    if (!load_attempted) {
+        char path[1024];
+        const char *p = lcn_wit_default_path(path, sizeof(path), NULL);
+        if (p) {
+            int rc = lcn_wit_load(&contract, p);
+            if (rc != 0) {
+                fprintf(stderr,
+                        "  WIT load: %s could not be parsed; "
+                        "host-call signature checks skipped\n", p);
+            }
+        } else {
+            fprintf(stderr,
+                    "  WIT load: include/vdag.wit not found; "
+                    "host-call signature checks skipped\n");
+        }
+        load_attempted = 1;
+    }
+
+    /* Walk every top-level declaration. walk_for_host_calls
+     * descends through left/right/params/attributes/type_expr; for
+     * AST_AGENT this covers the method list (->left) and for AST_FN
+     * it covers the body (also ->left). We intentionally do NOT
+     * descend ->next inside the walker so a single decl's subtree
+     * stays contained -- iteration over siblings is the for-loop's
+     * job. */
+    for (decl = program->params; decl; decl = decl->next) {
+        walk_for_host_calls(decl, &contract, reporter);
     }
 }
 
@@ -4694,6 +4856,14 @@ bool typecheck_program(AstNode *program, ErrorReporter *reporter,
     /* Pass 2c: Parameterised capability allowlist (L12) -- validates
      * the host:port patterns inside `capabilities: [http.fetch([...])]` */
     check_capability_allowlists(program, reporter);
+
+    /* Pass 2d: Host-call signature check (L1b) -- compares every
+     * AST_HOST_CALL against include/vdag.wit, the canonical
+     * Visual-DAG host-import contract. Arity mismatches fail
+     * compilation with ERR_HOST_CALL_SIGNATURE_MISMATCH; unknown
+     * calls log a warning and fall through to the legacy
+     * emit-WIT behaviour. */
+    check_host_call_signatures(program, reporter);
 
     /* Pass 2b: Access control enforcement (network endpoints + binary) */
     {

@@ -1,0 +1,114 @@
+// vdag.wit -- Canonical Visual-DAG host-import contract.
+//
+// This file is the SINGLE source of truth for the signatures that
+// Visual-DAG's `internal/nodes/code/imports.go` exports to wazero
+// guests. The Limceron typechecker loads it (src/wit_load.c) and
+// asserts every `<namespace>.<verb>(args)` host call against the
+// declared shape; mismatches raise ERR_HOST_CALL_SIGNATURE_MISMATCH.
+//
+// Editing rules:
+//
+//   1. Add a function here BEFORE adding it to Visual-DAG's
+//      imports.go. Compile-time mismatches are far cheaper than
+//      runtime linker failures at instantiation.
+//   2. Use the WIT subset the existing emitter (src/wit_emit.c)
+//      understands: `name: func(arg: type, ...) -> type;` lines
+//      inside an `interface <ns>` block.
+//   3. Result-shaped returns are encoded as a single i64 per
+//      ADR-0002 -- non-negative = Ok(v), negative = HostErr*.
+//      We render those as `s64` here; the typechecker treats the
+//      L5 `?` propagator as transparent over `s64` returns.
+//
+// Keep this file checked in. Drift between Visual-DAG's imports.go
+// and this contract is a release-blocking bug.
+
+package limceron:vdag;
+
+// vdag:llm -- LLM dispatch. classify is a length-based label
+// classifier; chat is a full prompt/response round-trip. Both
+// return the bytes-written count in the high nibble of an i64 with
+// negative HostErr* sentinels in the low nibble (Result<i64,_>).
+interface llm {
+    classify: func(text: string) -> s64;
+    chat: func(prompt: string, system: string) -> s64;
+}
+
+// vdag:http -- outbound HTTP. fetch returns the response body byte
+// count; status code is written into an out-of-band scratch slot
+// by the host (see imports.go::httpFetch).
+interface http {
+    fetch: func(url: string, method: string, body: string) -> s64;
+}
+
+// vdag:kb -- tenant-scoped knowledge-base search. search returns a
+// JSON-encoded list<chunk> in the guest's out buffer.
+interface kb {
+    search: func(collection: string, query: string, top-k: s32) -> s64;
+}
+
+// vdag:data -- tenant-scoped read-only SQL. data.read enforces a
+// SELECT-only gate at the host (HostErrDMLRejected = -5 on
+// violation).
+interface data {
+    read: func(query: string, params-json: string) -> s64;
+}
+
+// vdag:json -- per-call arena JSON DOM. parse issues a handle;
+// field / array-index issue child handles; the four value
+// accessors decode. int-value is the documented i64 exception
+// (see docs/language-reference.md "Host calls").
+interface json {
+    parse: func(bytes: string) -> s64;
+    field: func(handle: s32, key: string) -> s64;
+    array-index: func(handle: s32, idx: s32) -> s64;
+    length: func(handle: s32) -> s64;
+    string-value: func(handle: s32) -> s64;
+    int-value: func(handle: s32) -> s64;
+    bool-value: func(handle: s32) -> s64;
+    is-null: func(handle: s32) -> s64;
+    stringify: func(handle: s32) -> s64;
+}
+
+// vdag:mcp -- MCP tool dispatch passthrough. Reserved for the
+// future MCP bridge; today only the `call` verb is wired in the
+// Visual-DAG runtime.
+interface mcp {
+    call: func(tool: string, args: string) -> s64;
+}
+
+// vdag:state -- per-run scratch state (future). Listed here to
+// reserve the namespace prefix so that capability declarations
+// using `state.*` typecheck against a stable contract once the
+// host side is wired.
+interface state {
+    get: func(key: string) -> s64;
+    put: func(key: string, value: string) -> s64;
+}
+
+// vdag:entropy -- entropy-source bridge (future, paired with L11
+// entropy_budget). Reserved for non-deterministic draws that the
+// runtime accounts against the agent's entropy budget.
+interface entropy {
+    draw: func(bits: s32) -> s64;
+}
+
+// vdag:tool -- tool-registry dispatch. Reserved for the F36d tool
+// registry once it lands; today guests use mcp.call as the bridge.
+interface tool {
+    invoke: func(name: string, args: string) -> s64;
+}
+
+// World assembling every interface a typical Visual-DAG agent may
+// import. The compiler only emits the `import <ns>;` lines for
+// namespaces the agent actually uses (see src/wit_emit.c::emit_agent).
+world vdag-agent {
+    import llm;
+    import http;
+    import kb;
+    import data;
+    import json;
+    import mcp;
+    import state;
+    import entropy;
+    import tool;
+}

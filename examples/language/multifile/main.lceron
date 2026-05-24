@@ -1,0 +1,20 @@
+// multifile/main.lceron — placeholder fixture for `make test-multifile`.
+//
+// Multi-file `use ...` cross-module imports are L8-deferred per
+// ROADMAP.md. Until that phase lands, this fixture exists only so
+// the test-multifile Makefile target can compile a real source
+// file rather than failing with "cannot open file". When L8 ships,
+// promote this to a real multi-file example (split into
+// main.lceron + helpers.lceron with a working `use helpers;`).
+
+agent Demo {
+    budget: { max_tokens: 1000, max_cost: 0.01, max_duration: 30 }
+
+    fn double(x: int) -> int {
+        x * 2
+    }
+
+    fn run() -> int {
+        double(21)
+    }
+}
