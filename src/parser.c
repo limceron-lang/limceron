@@ -631,17 +631,25 @@ static AstNode *parse_pattern(Parser *p) {
         AstNode *n = ast_new(p->arena, AST_PAT_IDENT, loc);
         n->name = parser_advance(p).value.str_val;
 
-        /* Qualified: Enum.Variant */
-        while (parser_match(p, TOK_DOT)) {
+        /* Qualified path: Enum.Variant or Enum::Variant.
+         * L5 introduces `Result::Ok(v)` / `Result::Err(e)` patterns; the `::`
+         * separator is preserved in the joined name so the typecheck
+         * exhaustiveness pass can recognise the Result family by suffix
+         * regardless of which separator the user wrote. */
+        while (parser_check(p, TOK_DOT) || parser_check(p, TOK_COLON_COLON)) {
+            bool was_cc = parser_check(p, TOK_COLON_COLON);
+            parser_advance(p);
             if (parser_check(p, TOK_IDENT)) {
                 const char *next = parser_advance(p).value.str_val;
                 size_t len1 = strlen(n->name);
                 size_t len2 = strlen(next);
-                char *qn = (char *)arena_alloc(p->arena, len1 + 1 + len2 + 1);
+                size_t seplen = was_cc ? 2 : 1;
+                char *qn = (char *)arena_alloc(p->arena, len1 + seplen + len2 + 1);
                 memcpy(qn, n->name, len1);
-                qn[len1] = '.';
-                memcpy(qn + len1 + 1, next, len2);
-                qn[len1 + 1 + len2] = '\0';
+                if (was_cc) { qn[len1] = ':'; qn[len1 + 1] = ':'; }
+                else        { qn[len1] = '.'; }
+                memcpy(qn + len1 + seplen, next, len2);
+                qn[len1 + seplen + len2] = '\0';
                 n->name = qn;
             }
         }
@@ -727,7 +735,8 @@ static Precedence get_precedence(TokenKind kind) {
     case TOK_POWER:                             return PREC_POWER;
     case TOK_DOT: case TOK_LPAREN:
     case TOK_LBRACKET: case TOK_QUESTION:
-    case TOK_AS: case TOK_IS:                   return PREC_POSTFIX;
+    case TOK_AS: case TOK_IS:
+    case TOK_COLON_COLON:                       return PREC_POSTFIX;
     default:                                    return PREC_NONE;
     }
 }
@@ -797,6 +806,51 @@ static AstNode *parse_expr(Parser *p, Precedence min_prec) {
                 node->name = field;
                 left = node;
             }
+            continue;
+        }
+
+        if (op == TOK_COLON_COLON) {
+            /* L5: `Type::Variant` qualified path. The two shapes we support
+             * in stage0:
+             *   Result::Ok(v) / Result::Err(code) — rewritten to a bare
+             *     `Ok`/`Err` identifier so the AST_CALL handler below
+             *     converts the subsequent (v) into AST_RESULT_OK / AST_RESULT_ERR.
+             *   host_error::<sentinel>           — rewritten to a single
+             *     joined identifier `host_error::<sentinel>` whose value is
+             *     resolved by typecheck against the enum loaded from
+             *     include/vdag.errors.wit.
+             * Any other `A::B` shape collapses to a joined identifier too,
+             * leaving downstream passes free to resolve it. */
+            parser_advance(p);
+            SourceLoc loc = p->previous.loc;
+            const char *tail =
+                parser_expect(p, TOK_IDENT, "after '::'").value.str_val;
+            if (left && left->kind == AST_IDENT && left->name) {
+                if (strcmp(left->name, "Result") == 0 &&
+                    (strcmp(tail, "Ok") == 0 || strcmp(tail, "Err") == 0)) {
+                    AstNode *short_id = ast_new(p->arena, AST_IDENT, loc);
+                    short_id->name = tail; /* "Ok" or "Err" */
+                    left = short_id;
+                    continue;
+                }
+                size_t a = strlen(left->name), b = strlen(tail);
+                char *joined = (char *)arena_alloc(p->arena, a + 2 + b + 1);
+                memcpy(joined, left->name, a);
+                joined[a]     = ':';
+                joined[a + 1] = ':';
+                memcpy(joined + a + 2, tail, b);
+                joined[a + 2 + b] = '\0';
+                AstNode *q = ast_new(p->arena, AST_IDENT, loc);
+                q->name = joined;
+                left = q;
+                continue;
+            }
+            /* Left was not a bare identifier (rare). Wrap as field access
+             * so downstream printers do not lose the source location. */
+            AstNode *fa = ast_new(p->arena, AST_FIELD_ACCESS, loc);
+            fa->left = left;
+            fa->name = tail;
+            left = fa;
             continue;
         }
 

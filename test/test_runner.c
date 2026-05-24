@@ -7374,6 +7374,177 @@ TEST(md_unknown_section_warning) {
     }
 }
 
+/* ============================================================
+ * L5 surface tests -- Result::Ok / Result::Err, try/catch parsing
+ * shape, match exhaustiveness over Result, host_error::<variant>
+ * resolution. IR-lowering tests live in test/test_ir.c.
+ * ============================================================ */
+
+/* Walk every AstNode in the tree (depth-first across the union of
+ * child pointers used by AstNode). Returns the first match or NULL. */
+static AstNode *find_first_kind(AstNode *node, AstKind kind) {
+    if (!node) return NULL;
+    if (node->kind == kind) return node;
+    AstNode *r;
+    if ((r = find_first_kind(node->left,       kind))) return r;
+    if ((r = find_first_kind(node->right,      kind))) return r;
+    if ((r = find_first_kind(node->type_expr,  kind))) return r;
+    if ((r = find_first_kind(node->params,     kind))) return r;
+    if ((r = find_first_kind(node->next,       kind))) return r;
+    return NULL;
+}
+
+/* Typecheck-side helper: parse, typecheck, return whether the
+ * reporter raised any error containing `needle`. */
+static bool typecheck_emits_error(const char *src, const char *needle) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(src);
+    ErrorReporter reporter = reporter_new("<test>", src, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", src, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *prog = parse_program(&parser);
+    (void)typecheck_program(prog, &reporter, &test_arena);
+    int i;
+    for (i = 0; i < reporter.count; i++) {
+        if (reporter.errors[i].message &&
+            strstr(reporter.errors[i].message, needle) != NULL)
+            return true;
+    }
+    return false;
+}
+
+TEST(l5_parser_try_catch_block_shape) {
+    /* `try { body } catch (e: int) { handler }` must produce an
+     * AST_TRY_CATCH whose ->left is the body block, ->right is the
+     * handler block, and ->name binds the catch variable. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn run() -> int {\n"
+        "    try {\n"
+        "        Result::Ok(7)\n"
+        "    } catch (e: int) {\n"
+        "        e\n"
+        "    }\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *tc = find_first_kind(p, AST_TRY_CATCH);
+    ASSERT_NOT_NULL(tc);
+    ASSERT_NOT_NULL(tc->left);
+    ASSERT_NOT_NULL(tc->right);
+    ASSERT_NOT_NULL(tc->name);
+    ASSERT_EQ(strcmp(tc->name, "e"), 0);
+}
+
+TEST(l5_parser_result_qualified_constructors) {
+    /* `Result::Ok(v)` rewrites to AST_RESULT_OK; `Result::Err(c)`
+     * rewrites to AST_RESULT_ERR. The parser hides the `Result::`
+     * prefix by re-aliasing the head identifier to the bare variant
+     * name, so the subsequent AST_CALL handler picks them up. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn make() -> int {\n"
+        "    let _o = Result::Ok(42)\n"
+        "    let _e = Result::Err(-3)\n"
+        "    0\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *ok  = find_first_kind(p, AST_RESULT_OK);
+    AstNode *erk = find_first_kind(p, AST_RESULT_ERR);
+    ASSERT_NOT_NULL(ok);
+    ASSERT_NOT_NULL(erk);
+}
+
+TEST(l5_parser_match_result_two_arms) {
+    /* `match r { Result::Ok(v) -> v, Result::Err(e) -> e }` must
+     * parse into an AST_MATCH with two AST_MATCH_ARM children whose
+     * patterns are AST_PAT_ENUM tagged with the joined Result::Ok
+     * / Result::Err names. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(r: int) -> int {\n"
+        "    match r {\n"
+        "        Result::Ok(v)  -> v\n"
+        "        Result::Err(e) -> e\n"
+        "    }\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(ast_list_len(m->params), 2);
+    AstNode *a0 = m->params;
+    AstNode *a1 = m->params->next;
+    ASSERT_EQ(a0->left->kind, AST_PAT_ENUM);
+    ASSERT_EQ(a1->left->kind, AST_PAT_ENUM);
+    ASSERT(strstr(a0->left->name, "Ok")  != NULL);
+    ASSERT(strstr(a1->left->name, "Err") != NULL);
+}
+
+TEST(l5_typecheck_match_result_inexhaustive_raises) {
+    /* A match on a Result that only carries the Ok arm must raise
+     * ERR_MATCH_INEXHAUSTIVE. (Wildcard / catch-all patterns are
+     * L6 territory -- see ROADMAP.md L6 row.) */
+    const char *src =
+        "fn pick(r: int) -> int {\n"
+        "    match r {\n"
+        "        Result::Ok(v) -> v\n"
+        "    }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l5_typecheck_match_result_complete_passes) {
+    /* The matching pair (Ok + Err) is exhaustive and must NOT raise
+     * ERR_MATCH_INEXHAUSTIVE -- negative control. */
+    const char *src =
+        "fn pick(r: int) -> int {\n"
+        "    match r {\n"
+        "        Result::Ok(v)  -> v\n"
+        "        Result::Err(e) -> e\n"
+        "    }\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l5_typecheck_host_error_unknown_variant_raises) {
+    /* An unknown HostError variant name must raise
+     * ERR_HOST_ERROR_UNKNOWN_VARIANT (validated against the
+     * canonical include/vdag.errors.wit table loaded by the
+     * typechecker). */
+    const char *src =
+        "fn bad() -> int {\n"
+        "    Result::Err(host_error::no_such_sentinel)\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_HOST_ERROR_UNKNOWN_VARIANT"));
+}
+
+TEST(l5_typecheck_host_error_known_variant_accepted) {
+    /* The canonical `quota_exceeded` sentinel is known to the
+     * loaded enum table and must NOT raise an error. (snake_case
+     * spelling at the source site is mapped onto the kebab-case
+     * canonical form by the loader's kebab/snake bridge.) */
+    const char *src =
+        "fn good() -> int {\n"
+        "    Result::Err(host_error::quota_exceeded)\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_HOST_ERROR_UNKNOWN_VARIANT"));
+}
+
+TEST(l5_typecheck_host_error_kebab_form_accepted) {
+    /* The kebab-case spelling -- as written in vdag.errors.wit --
+     * is also accepted by the loader's case-equivalence rule, in
+     * case authors copy a name out of the canonical file verbatim. */
+    const char *src =
+        "fn good() -> int {\n"
+        "    Result::Err(host_error::cost_budget_exceeded)\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_HOST_ERROR_UNKNOWN_VARIANT"));
+}
+
 int main(void) {
     fprintf(stderr, "\n\033[1mLimceron Stage 0 — Test Suite\033[0m\n\n");
 
@@ -7907,6 +8078,16 @@ int main(void) {
     RUN_TEST(md_guard_text_only);
     RUN_TEST(md_guard_with_code_block);
     RUN_TEST(md_unknown_section_warning);
+
+    fprintf(stderr, "\n── L5: Result<T,E> + try/catch + match + HostError ──\n");
+    RUN_TEST(l5_parser_try_catch_block_shape);
+    RUN_TEST(l5_parser_result_qualified_constructors);
+    RUN_TEST(l5_parser_match_result_two_arms);
+    RUN_TEST(l5_typecheck_match_result_inexhaustive_raises);
+    RUN_TEST(l5_typecheck_match_result_complete_passes);
+    RUN_TEST(l5_typecheck_host_error_unknown_variant_raises);
+    RUN_TEST(l5_typecheck_host_error_known_variant_accepted);
+    RUN_TEST(l5_typecheck_host_error_kebab_form_accepted);
 
     teardown();
 

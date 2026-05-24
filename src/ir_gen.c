@@ -14,6 +14,7 @@
 
 #include "lcn.h"
 #include "ir.h"
+#include "wit_load.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -793,6 +794,31 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
                 }
             }
         }
+        /* L5: `<enum>::<variant>` qualified identifier (parser joins both
+         * halves with `::` into a single name). Resolve against the
+         * canonical include/vdag.errors.wit table and emit an integer
+         * literal carrying the sentinel value. The typecheck pass already
+         * flagged unknown variants; if we still cannot resolve here we
+         * fall through to the zero placeholder below to avoid masking
+         * earlier errors. */
+        {
+            const char *n = expr->name;
+            const char *sep = NULL;
+            for (const char *q = n; q[0] && q[1]; q++) {
+                if (q[0] == ':' && q[1] == ':') { sep = q; break; }
+            }
+            if (sep && (sep - n) > 0) {
+                char enum_name[64];
+                size_t en = (size_t)(sep - n);
+                if (en >= sizeof(enum_name)) en = sizeof(enum_name) - 1;
+                memcpy(enum_name, n, en);
+                enum_name[en] = '\0';
+                int64_t val = 0;
+                if (lcn_wit_resolve_host_error(enum_name, sep + 2, &val)) {
+                    return ir_emit_const_int(ctx->current_fn, ctx->mod, val);
+                }
+            }
+        }
         /* Fallback: emit a const 0 as placeholder */
         return ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
     }
@@ -1124,6 +1150,135 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
                     ir_phi_add_incoming(phi_inst, ok_val, body_pred->id);
                 if (catch_val >= 0 && catch_pred)
                     ir_phi_add_incoming(phi_inst, catch_val, catch_pred->id);
+            }
+            return phi;
+        }
+        return -1;
+    }
+
+    case AST_MATCH: {
+        /* L5: lower `match result { Ok(v) => B1, Err(e) => B2 }` over the
+         * negative-i64 Result encoding. We accept any two-arm match whose
+         * patterns are enum-shaped and whose variant tail is `Ok` or `Err`
+         * (with or without a `Result::` / `Result.` prefix). Anything else
+         * is left to the C-transpiler match (used by tagged-union enums);
+         * returning -1 here keeps the IR backend a no-op for those cases.
+         *
+         * Shape (mirrors the try/catch lowering):
+         *
+         *   pre:  %v   = <subject>
+         *         %neg = cmp_lt %v, 0
+         *         br %neg, @match.err, @match.ok
+         *   match.ok:
+         *         <bind v-name = %v>
+         *         <body lowered ; tail -> ok_val>
+         *         jmp @match.merge
+         *   match.err:
+         *         <bind e-name = %v>
+         *         <body lowered ; tail -> err_val>
+         *         jmp @match.merge
+         *   match.merge:
+         *         %r = phi [ok_val, ok_pred] [err_val, err_pred]
+         */
+        AstNode *arm_ok  = NULL;
+        AstNode *arm_err = NULL;
+        int arm_count = 0;
+        for (AstNode *a = expr->params; a; a = a->next) {
+            arm_count++;
+            if (a->kind != AST_MATCH_ARM || !a->left) continue;
+            AstNode *pat = a->left;
+            if (pat->kind != AST_PAT_ENUM || !pat->name) continue;
+            const char *name = pat->name;
+            const char *tail = name;
+            for (const char *q = name; *q; q++) {
+                if (q[0] == ':' && q[1] == ':') { tail = q + 2; q++; }
+                else if (q[0] == '.')           { tail = q + 1; }
+            }
+            if (strcmp(tail, "Ok")  == 0) arm_ok  = a;
+            if (strcmp(tail, "Err") == 0) arm_err = a;
+        }
+        if (arm_count != 2 || !arm_ok || !arm_err) return -1;
+
+        int subj = irgen_expr(ctx, expr->left);
+        if (subj < 0) return -1;
+        int zero = ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+        int is_err = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                    IR_CMP_LT, IR_TYPE_BOOL, subj, zero);
+        IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
+
+        IrBasicBlock *ok_bb    = ir_bb_new(ctx->current_fn, ctx->mod, "match.ok");
+        IrBasicBlock *err_bb   = ir_bb_new(ctx->current_fn, ctx->mod, "match.err");
+        IrBasicBlock *merge_bb = ir_bb_new(ctx->current_fn, ctx->mod, "match.merge");
+
+        ir_set_current_bb(ctx->current_fn, pre_bb);
+        ir_emit_br(ctx->current_fn, ctx->mod, is_err, err_bb->id, ok_bb->id);
+
+        /* Helper macro: lower one match arm with the variant payload bound
+         * (single-field PAT_ENUM today: Ok(v) / Err(e)). Sets OUT_VAL to
+         * the tail-expr value and OUT_PRED to the BB that jumps to merge. */
+        #define LOWER_ARM(ARM_NODE, BIND_VAL, OUT_VAL, OUT_PRED) do {           \
+            int _val = -1;                                                      \
+            IrBasicBlock *_pred = NULL;                                         \
+            irgen_scope_push(&ctx->scope);                                      \
+            AstNode *_pat = (ARM_NODE)->left;                                   \
+            const char *_bind = NULL;                                           \
+            if (_pat && _pat->params && _pat->params->name)                     \
+                _bind = _pat->params->name;                                     \
+            if (_bind) {                                                        \
+                int _slot = ir_emit_alloca(ctx->current_fn, ctx->mod,           \
+                                            IR_TYPE_I64);                       \
+                ir_emit_store(ctx->current_fn, ctx->mod, (BIND_VAL), _slot);    \
+                irgen_scope_add(&ctx->scope, _bind, _slot, IR_TYPE_I64);        \
+            }                                                                   \
+            AstNode *_body = (ARM_NODE)->right;                                 \
+            if (_body && _body->kind == AST_BLOCK) {                            \
+                AstNode *_tail = NULL;                                          \
+                for (AstNode *_s = _body->params; _s; _s = _s->next) {          \
+                    if (!_s->next && _s->kind == AST_EXPR_STMT && _s->left)     \
+                        _tail = _s;                                             \
+                }                                                               \
+                for (AstNode *_s = _body->params; _s; _s = _s->next) {          \
+                    if (_s == _tail) _val = irgen_expr(ctx, _s->left);          \
+                    else             irgen_stmt(ctx, _s);                       \
+                }                                                               \
+            } else if (_body) {                                                 \
+                _val = irgen_expr(ctx, _body);                                  \
+            }                                                                   \
+            {                                                                   \
+                IrBasicBlock *_cur = ctx->current_fn->current_bb;               \
+                IrInst *_last = _cur ? _cur->last : NULL;                       \
+                if (!_last || (_last->op != IR_RET &&                           \
+                               _last->op != IR_JMP &&                           \
+                               _last->op != IR_BR)) {                           \
+                    ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);       \
+                    _pred = ctx->current_fn->current_bb;                        \
+                }                                                               \
+            }                                                                   \
+            irgen_scope_pop(&ctx->scope);                                       \
+            (OUT_VAL)  = _val;                                                  \
+            (OUT_PRED) = _pred;                                                 \
+        } while (0)
+
+        int ok_val = -1, err_val = -1;
+        IrBasicBlock *ok_pred = NULL, *err_pred = NULL;
+
+        ir_set_current_bb(ctx->current_fn, ok_bb);
+        LOWER_ARM(arm_ok, subj, ok_val, ok_pred);
+
+        ir_set_current_bb(ctx->current_fn, err_bb);
+        LOWER_ARM(arm_err, subj, err_val, err_pred);
+
+        #undef LOWER_ARM
+
+        ir_set_current_bb(ctx->current_fn, merge_bb);
+        if ((ok_val >= 0 && ok_pred) || (err_val >= 0 && err_pred)) {
+            int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+            IrInst *phi_inst = merge_bb->last;
+            if (phi_inst && phi_inst->op == IR_PHI && phi_inst->id == phi) {
+                if (ok_val  >= 0 && ok_pred)
+                    ir_phi_add_incoming(phi_inst, ok_val,  ok_pred->id);
+                if (err_val >= 0 && err_pred)
+                    ir_phi_add_incoming(phi_inst, err_val, err_pred->id);
             }
             return phi;
         }

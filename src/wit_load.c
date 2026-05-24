@@ -62,45 +62,53 @@ static const char *exec_self_path(char *out, size_t out_cap) {
 #endif
 }
 
-const char *lcn_wit_default_path(char *out, size_t out_cap,
-                                 const char *argv0) {
+/* Shared "find a .wit file next to the compiler" helper. The L1
+ * canonical path is `include/vdag.wit`; L5 adds a sibling
+ * `include/vdag.errors.wit`. Both follow the same search order. */
+static const char *resolve_include_file(char *out, size_t out_cap,
+                                        const char *argv0,
+                                        const char *basename_in) {
     char resolved[PATH_MAX];
     char self_buf[PATH_MAX];
     const char *rp = NULL;
-    if (!out || out_cap == 0) return NULL;
+    if (!out || out_cap == 0 || !basename_in) return NULL;
 
-    /* Resolve the compiler binary's real path. Mirrors
-     * find_runtime_dir in src/main.c. */
     if (argv0) rp = realpath(argv0, resolved);
     if (!rp) {
         const char *self = exec_self_path(self_buf, sizeof(self_buf));
         if (self) rp = realpath(self, resolved);
     }
     if (!rp) {
-        /* Last resort: try the literal relative path. */
-        snprintf(out, out_cap, "include/vdag.wit");
+        snprintf(out, out_cap, "include/%s", basename_in);
         return file_exists(out) ? out : NULL;
     }
 
-    /* Walk up from build/limceron-stage0 to the project root. */
     char build_dir_buf[PATH_MAX];
     strncpy(build_dir_buf, resolved, sizeof(build_dir_buf) - 1);
     build_dir_buf[sizeof(build_dir_buf) - 1] = '\0';
-    char *build_dir = dirname(build_dir_buf);          /* .../build      */
+    char *build_dir = dirname(build_dir_buf);
     char project_dir_buf[PATH_MAX];
     strncpy(project_dir_buf, build_dir, sizeof(project_dir_buf) - 1);
     project_dir_buf[sizeof(project_dir_buf) - 1] = '\0';
-    char *project_dir = dirname(project_dir_buf);      /* .../project    */
+    char *project_dir = dirname(project_dir_buf);
 
-    /* Try project_dir/include/vdag.wit first; fall back to
-     * ./include/vdag.wit (running from project root). */
-    snprintf(out, out_cap, "%s/include/vdag.wit", project_dir);
+    snprintf(out, out_cap, "%s/include/%s", project_dir, basename_in);
     if (file_exists(out)) return out;
-    snprintf(out, out_cap, "%s/include/vdag.wit", build_dir);
+    snprintf(out, out_cap, "%s/include/%s", build_dir, basename_in);
     if (file_exists(out)) return out;
-    snprintf(out, out_cap, "include/vdag.wit");
+    snprintf(out, out_cap, "include/%s", basename_in);
     if (file_exists(out)) return out;
     return NULL;
+}
+
+const char *lcn_wit_default_path(char *out, size_t out_cap,
+                                 const char *argv0) {
+    return resolve_include_file(out, out_cap, argv0, "vdag.wit");
+}
+
+const char *lcn_wit_default_errors_path(char *out, size_t out_cap,
+                                        const char *argv0) {
+    return resolve_include_file(out, out_cap, argv0, "vdag.errors.wit");
 }
 
 /* ------------------------------------------------------------------ */
@@ -343,4 +351,191 @@ const LcnWitFunc *lcn_wit_lookup_signature(const LcnWitContract *contract,
             return &contract->funcs[i];
     }
     return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* L5 host-error enum loader                                          */
+/* ------------------------------------------------------------------ */
+
+/* WIT identifiers are kebab-case (`quota-exceeded`); the Limceron
+ * front-end carries snake_case in identifier strings (`-` is not a
+ * valid identifier char there). Compare with `-` and `_` treated as
+ * equivalent so author-written `host_error::quota_exceeded` matches
+ * the canonical `quota-exceeded` enum entry. */
+static int kebab_snake_eq(const char *a, const char *b) {
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca == '-') ca = '_';
+        if (cb == '-') cb = '_';
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+/* Read a signed decimal integer at *p, advancing past it. Returns 1
+ * on success, 0 on failure. Hex / octal not needed -- the canonical
+ * sentinels are plain negative decimals. */
+static int read_signed_int(const char **p, int64_t *out) {
+    const char *s = *p;
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    else if (*s == '+') { s++; }
+    if (!isdigit((unsigned char)*s)) return 0;
+    int64_t v = 0;
+    while (isdigit((unsigned char)*s)) {
+        v = v * 10 + (*s - '0');
+        s++;
+    }
+    *out = neg ? -v : v;
+    *p = s;
+    return 1;
+}
+
+/* Parse one `enum <name> { variant = value, ... }` body. */
+static const char *parse_enum(const char *p, const char *enum_name,
+                              LcnWitContract *c) {
+    p = skip_ws(p);
+    if (!match_char(&p, '{')) return p;
+    if (c->enum_count >= LCN_WIT_MAX_ENUMS) {
+        int depth = 1;
+        while (*p && depth > 0) {
+            if (*p == '{') depth++;
+            else if (*p == '}') depth--;
+            p++;
+        }
+        return p;
+    }
+    LcnWitEnum *e = &c->enums[c->enum_count++];
+    memset(e, 0, sizeof(*e));
+    strncpy(e->name, enum_name, sizeof(e->name) - 1);
+
+    while (1) {
+        p = skip_ws(p);
+        if (!*p) return p;
+        if (*p == '}') return p + 1;
+
+        char vname[LCN_WIT_MAX_NAME];
+        if (!read_ident(&p, vname, sizeof(vname))) {
+            while (*p && *p != ',' && *p != '}') p++;
+            if (*p == ',') p++;
+            continue;
+        }
+        p = skip_ws(p);
+        int64_t value = 0;
+        if (*p == '=') {
+            p++;
+            p = skip_ws(p);
+            (void)read_signed_int(&p, &value);
+        }
+        if (e->variant_count < LCN_WIT_MAX_VARIANTS) {
+            LcnWitEnumVariant *v = &e->variants[e->variant_count++];
+            strncpy(v->name, vname, sizeof(v->name) - 1);
+            v->value = value;
+        }
+        p = skip_ws(p);
+        if (*p == ',') { p++; continue; }
+        if (*p == '}') return p + 1;
+    }
+}
+
+int lcn_wit_load_errors(LcnWitContract *contract, const char *path) {
+    if (!contract) return 1;
+    /* This is an extension load on top of a previously parsed contract.
+     * Do NOT memset -- the func table from lcn_wit_load must survive. */
+    contract->loaded = 1;
+    if (!path) return 1;
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 1;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    if (sz < 0) { fclose(fp); return 1; }
+    rewind(fp);
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(fp); return 1; }
+    size_t got = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    buf[got] = '\0';
+
+    const char *p = buf;
+    while (*p) {
+        p = skip_ws(p);
+        if (!*p) break;
+        char kw[LCN_WIT_MAX_NAME];
+        if (!read_ident(&p, kw, sizeof(kw))) { p++; continue; }
+        if (strcmp(kw, "enum") == 0) {
+            p = skip_ws(p);
+            char ename[LCN_WIT_MAX_NAME];
+            if (!read_ident(&p, ename, sizeof(ename))) continue;
+            p = parse_enum(p, ename, contract);
+        } else {
+            /* Skip `package` / unknown -- advance past the next `;`
+             * or `}` boundary, recursing into `{...}` bodies. */
+            while (*p && *p != ';' && *p != '}') {
+                if (*p == '{') {
+                    int depth = 1;
+                    p++;
+                    while (*p && depth > 0) {
+                        if (*p == '{') depth++;
+                        else if (*p == '}') depth--;
+                        p++;
+                    }
+                    break;
+                }
+                p++;
+            }
+            if (*p) p++;
+        }
+    }
+
+    free(buf);
+    contract->load_ok = 1;
+    return 0;
+}
+
+const LcnWitEnum *lcn_wit_lookup_enum(const LcnWitContract *contract,
+                                      const char *name) {
+    int i;
+    if (!contract || !name) return NULL;
+    for (i = 0; i < contract->enum_count; i++) {
+        if (kebab_snake_eq(contract->enums[i].name, name))
+            return &contract->enums[i];
+    }
+    return NULL;
+}
+
+const LcnWitEnumVariant *
+lcn_wit_lookup_enum_variant(const LcnWitEnum *e, const char *name) {
+    int i;
+    if (!e || !name) return NULL;
+    for (i = 0; i < e->variant_count; i++) {
+        if (kebab_snake_eq(e->variants[i].name, name))
+            return &e->variants[i];
+    }
+    return NULL;
+}
+
+/* Process-wide HostError table. Both typecheck and ir_gen share this
+ * via lcn_wit_resolve_host_error so that the canonical contract is
+ * only parsed once per compile run. */
+static LcnWitContract g_host_err_contract;
+static int            g_host_err_loaded = 0;
+
+int lcn_wit_resolve_host_error(const char *enum_name,
+                               const char *variant_name,
+                               int64_t *out_value) {
+    if (!enum_name || !variant_name || !out_value) return 0;
+    if (!g_host_err_loaded) {
+        char path[1024];
+        const char *p = lcn_wit_default_errors_path(path, sizeof(path), NULL);
+        if (p) (void)lcn_wit_load_errors(&g_host_err_contract, p);
+        g_host_err_loaded = 1;
+    }
+    const LcnWitEnum *e = lcn_wit_lookup_enum(&g_host_err_contract, enum_name);
+    if (!e) return 0;
+    const LcnWitEnumVariant *v = lcn_wit_lookup_enum_variant(e, variant_name);
+    if (!v) return 0;
+    *out_value = v->value;
+    return 1;
 }

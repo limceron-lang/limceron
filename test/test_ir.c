@@ -1177,6 +1177,135 @@ TEST(ir_gen_try_catch_chained_propagation) {
 }
 
 /* ============================================================
+ * L5 surface extension: match Result + HostError lowering.
+ * The match-over-Result lowering mirrors try/catch -- a cmp_lt
+ * against zero splits Ok from Err, both arms join in a PHI.
+ * Host-error sentinels are emitted as immediate i64 constants
+ * sourced from include/vdag.errors.wit.
+ * ============================================================ */
+
+TEST(ir_gen_match_result_emits_ok_err_merge_blocks) {
+    /* `match r { Result::Ok(v) -> v, Result::Err(e) -> e }` must
+     * produce three blocks named match.ok / match.err / match.merge
+     * plus a PHI in the merge block joining both incoming values. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Ok(7) }\n"
+        "fn main() -> int {\n"
+        "    let r = fetch()\n"
+        "    match r {\n"
+        "        Result::Ok(v)  -> v + 1\n"
+        "        Result::Err(e) -> e\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(main_fn);
+    bool ok = false, er = false, mg = false;
+    for (IrBasicBlock *bb = main_fn->entry; bb; bb = bb->next) {
+        if (bb->label && strcmp(bb->label, "match.ok")    == 0) ok = true;
+        if (bb->label && strcmp(bb->label, "match.err")   == 0) er = true;
+        if (bb->label && strcmp(bb->label, "match.merge") == 0) mg = true;
+    }
+    ASSERT(ok);
+    ASSERT(er);
+    ASSERT(mg);
+    bool found_merge_phi = false;
+    for (IrBasicBlock *bb = main_fn->entry; bb; bb = bb->next) {
+        if (!bb->label || strcmp(bb->label, "match.merge") != 0) continue;
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_PHI && i->phi_count >= 2) {
+                found_merge_phi = true;
+            }
+        }
+    }
+    ASSERT(found_merge_phi);
+}
+
+TEST(ir_gen_match_result_cmp_lt_against_zero) {
+    /* The split test against the Result encoding MUST be a
+     * cmp_lt against zero -- the same predicate the ? propagator
+     * uses, so the negative-i64 invariant is enforced uniformly. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Err(-3) }\n"
+        "fn main() -> int {\n"
+        "    let r = fetch()\n"
+        "    match r {\n"
+        "        Result::Ok(v)  -> v\n"
+        "        Result::Err(e) -> e\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(main_fn);
+    ASSERT(count_opcode(main_fn, IR_CMP_LT) >= 1);
+}
+
+TEST(ir_gen_host_error_resolves_to_negative_sentinel) {
+    /* `host_error::quota_exceeded` must resolve to the canonical -3
+     * sentinel sourced from include/vdag.errors.wit. We look for an
+     * IR_CONST_INT carrying that exact value somewhere in the fn. */
+    IrModule *mod = ir_from_source(
+        "fn dispense() -> int {\n"
+        "    Err(host_error::quota_exceeded)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    bool found = false;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_CONST_INT && i->imm_int == -3) {
+                found = true;
+            }
+        }
+    }
+    ASSERT(found);
+}
+
+TEST(ir_gen_host_error_in_try_catch_end_to_end) {
+    /* End-to-end smoke: an inner fn returns host_error::quota_exceeded
+     * (-3), the outer fn `?` propagates it into a try/catch which
+     * binds the code to `e` and returns 99 from the catch arm. The
+     * lowering should still produce the canonical try/catch shape
+     * (try.body / try.catch / try.merge blocks + PHI). */
+    IrModule *mod = ir_from_source(
+        "fn inner() -> int {\n"
+        "    Err(host_error::quota_exceeded)\n"
+        "}\n"
+        "fn outer() -> int {\n"
+        "    try {\n"
+        "        let v = inner()?\n"
+        "        Ok(v + 1)\n"
+        "    } catch (e: int) {\n"
+        "        99\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *outer = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(outer);
+    bool body = false, cat = false, merge = false;
+    for (IrBasicBlock *bb = outer->entry; bb; bb = bb->next) {
+        if (bb->label && strcmp(bb->label, "try.body")  == 0) body  = true;
+        if (bb->label && strcmp(bb->label, "try.catch") == 0) cat   = true;
+        if (bb->label && strcmp(bb->label, "try.merge") == 0) merge = true;
+    }
+    ASSERT(body);
+    ASSERT(cat);
+    ASSERT(merge);
+    bool found_99 = false;
+    for (IrBasicBlock *bb = outer->entry; bb; bb = bb->next) {
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_CONST_INT && i->imm_int == 99) found_99 = true;
+        }
+    }
+    ASSERT(found_99);
+}
+
+/* ============================================================
  * IR Optimization Tests
  * ============================================================ */
 
@@ -2733,6 +2862,12 @@ int main(void) {
     RUN_TEST(ir_gen_try_catch_emits_three_blocks_with_phi);
     RUN_TEST(ir_gen_try_catch_question_jumps_to_catch_not_ret);
     RUN_TEST(ir_gen_try_catch_chained_propagation);
+
+    fprintf(stderr, "\n-- L5 (extension): match Result + HostError --\n");
+    RUN_TEST(ir_gen_match_result_emits_ok_err_merge_blocks);
+    RUN_TEST(ir_gen_match_result_cmp_lt_against_zero);
+    RUN_TEST(ir_gen_host_error_resolves_to_negative_sentinel);
+    RUN_TEST(ir_gen_host_error_in_try_catch_end_to_end);
 
     fprintf(stderr, "\n-- IR Optimization --\n");
     RUN_TEST(ir_opt_constant_fold);

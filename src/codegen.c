@@ -11,6 +11,7 @@
  */
 
 #include "lcn.h"
+#include "wit_load.h"
 
 /* ============================================================
  * Builtin Function Names (skip codegen for these — runtime provides them)
@@ -2260,6 +2261,34 @@ static void cg_expr(CodeGen *g, AstNode *expr) {
             else if (cg_lookup_budget(g, expr->name)) {
                 cg_fmt(g, "lcn_budget_%s()", expr->name);
             } else {
+                /* L5: HostError enum constants like `host_error::quota_exceeded`
+                 * are collapsed into a single AST_IDENT by the parser. Resolve
+                 * them against include/vdag.errors.wit and emit the signed
+                 * sentinel literal; valid C identifiers cannot contain `::`,
+                 * so leaving the joined name in the source would generate
+                 * broken C anyway. */
+                const char *n = expr->name;
+                const char *sep = NULL;
+                for (const char *q = n; q[0] && q[1]; q++) {
+                    if (q[0] == ':' && q[1] == ':') { sep = q; break; }
+                }
+                if (sep && (sep - n) > 0) {
+                    char enum_name[64];
+                    size_t en = (size_t)(sep - n);
+                    if (en >= sizeof(enum_name)) en = sizeof(enum_name) - 1;
+                    memcpy(enum_name, n, en);
+                    enum_name[en] = '\0';
+                    int64_t val = 0;
+                    if (lcn_wit_resolve_host_error(enum_name, sep + 2, &val)) {
+                        cg_fmt(g, "((int64_t)%lld)", (long long)val);
+                        break;
+                    }
+                    /* Unknown -> emit 0 so the C compiler still accepts the
+                     * file; the typechecker already raised
+                     * ERR_HOST_ERROR_UNKNOWN_VARIANT. */
+                    cg_str(g, "0");
+                    break;
+                }
                 cg_str(g, expr->name);
             }
         }

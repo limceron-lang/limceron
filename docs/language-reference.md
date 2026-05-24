@@ -283,8 +283,15 @@ The encoding matches the existing `HostErr*` sentinel space, so every
 
 ```limceron
 Ok(42)
-Err(-7)            // HostError.CapMissing
+Err(-7)                            // HostError.CapMissing (legacy short form)
+
+Result::Ok(42)                     // L5 qualified form -- preferred
+Result::Err(host_error::quota_exceeded)
 ```
+
+Both spellings parse to the same AST kinds (`AST_RESULT_OK`,
+`AST_RESULT_ERR`). The qualified form documents intent and pairs
+with `match Result::Ok / Result::Err` arm patterns.
 
 ### `?` propagator
 
@@ -296,7 +303,9 @@ fn reason() -> int {
 ```
 
 `expr?` short-circuits the current fn (or the enclosing `try` body)
-when `expr` is `Err(...)`.
+when `expr` is `Err(...)`. Already shipped in L1b -- L5 documents
+it under the new error-handling surface but does not redefine its
+lowering. See ADR-0002 for the IR shape (cmp_lt + br + ret/jmp).
 
 ### `try` / `catch`
 
@@ -317,6 +326,76 @@ name (`e`) is in scope in the handler with the captured error code.
 
 `try` and `catch` are soft identifiers (not keywords); detected by
 lookahead at the `{` following `try`.
+
+### `match` over Result
+
+```limceron
+fn classify_or_default(r: int) -> int {
+    match r {
+        Result::Ok(v)  -> v
+        Result::Err(e) -> if e == host_error::quota_exceeded {
+                              fallback()
+                          } else {
+                              -1
+                          }
+    }
+}
+```
+
+The L5 typechecker enforces exhaustiveness on Result-shaped matches:
+both `Result::Ok(_)` and `Result::Err(_)` arms must be present.
+A single-arm match raises `ERR_MATCH_INEXHAUSTIVE`. Wildcard /
+catch-all patterns (`_ -> ...`) are L6 territory and are NOT
+recognised as a substitute for the missing arm today.
+
+The lowering mirrors `try/catch`: one `cmp_lt %r, 0` split, two
+arm blocks (`match.ok`, `match.err`), and a join block
+(`match.merge`) holding a PHI of both arm values.
+
+### Canonical HostError enum
+
+The negative-sentinel space is now formally declared in
+`include/vdag.errors.wit`:
+
+```wit
+enum host-error {
+    not-found              = -1,
+    permission-denied      = -2,
+    quota-exceeded         = -3,
+    cost-budget-exceeded   = -4,
+    dml-rejected           = -5,
+    sandbox-violation      = -6,
+    json-field-missing     = -7,
+    json-type-mismatch     = -8,
+    entropy-budget-exceeded = -9,
+    limceron-budget-exceeded = -10,
+    network-not-allowed    = -11,
+    invalid-arg            = -12,
+}
+```
+
+Reference a variant from Limceron source as
+`host_error::<name>` (snake_case at the call site -- the loader
+treats `-` and `_` as equivalent). The typechecker validates the
+variant name against the canonical file; an unknown name raises
+`ERR_HOST_ERROR_UNKNOWN_VARIANT` before codegen runs. Resolution
+emits the integer sentinel as a `const i64` so the `?` propagator
+and `try/catch` recognise it through the existing negative-i64
+encoding -- no new IR opcodes.
+
+The numbers are an ABI contract: changing one is a release-blocking
+break because Visual-DAG's `internal/nodes/code/imports.go`
+returns the same numbers from every host call.
+
+### Host-call failure surface
+
+A host call that returns a negative sentinel **is** a
+`Result::Err(host_error::*)` value at the language level. The `?`
+propagator catches it; an enclosing `try/catch` recovers it; a
+`match` arm dispatches on the specific sentinel. No host call traps
+the wasm module on its own -- traps are reserved for the L11/L13
+budget fences (which themselves return -9 / -10 through the same
+encoding).
 
 ## Host calls
 

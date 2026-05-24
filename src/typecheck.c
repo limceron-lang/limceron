@@ -1248,6 +1248,39 @@ static void walk_for_host_calls(AstNode *node,
         /* Fall through to walk arguments. */
     }
 
+    /* L5: validate `host_error::<name>` references against the canonical
+     * vdag.errors.wit enum. Parser collapses qualified identifiers like
+     * `host_error::quota_exceeded` into a single AST_IDENT whose name
+     * contains the `::` separator -- so we look for that marker here
+     * rather than introducing yet another AST kind. */
+    if (node->kind == AST_IDENT && node->name && contract && contract->load_ok) {
+        const char *n = node->name;
+        const char *sep = NULL;
+        for (const char *q = n; q[0] && q[1]; q++) {
+            if (q[0] == ':' && q[1] == ':') { sep = q; break; }
+        }
+        if (sep && (sep - n) > 0) {
+            char enum_name[LCN_WIT_MAX_NAME];
+            size_t en = (size_t)(sep - n);
+            if (en >= sizeof(enum_name)) en = sizeof(enum_name) - 1;
+            memcpy(enum_name, n, en);
+            enum_name[en] = '\0';
+            const char *variant = sep + 2;
+            const LcnWitEnum *e = lcn_wit_lookup_enum(contract, enum_name);
+            if (e) {
+                const LcnWitEnumVariant *v =
+                    lcn_wit_lookup_enum_variant(e, variant);
+                if (!v) {
+                    report_error_fmt(reporter, node->loc,
+                        "check the variant name against include/vdag.errors.wit",
+                        "ERR_HOST_ERROR_UNKNOWN_VARIANT: enum '%s' has no "
+                        "variant '%s'",
+                        enum_name, variant);
+                }
+            }
+        }
+    }
+
     /* Generic recursion across the common AST shape used elsewhere
      * in this file. Mirrors find_tool_calls_in_expr's coverage. The
      * list helpers iterate ->next so that an agent's method list
@@ -1291,6 +1324,17 @@ static void check_host_call_signatures(AstNode *program,
             fprintf(stderr,
                     "  WIT load: include/vdag.wit not found; "
                     "host-call signature checks skipped\n");
+        }
+        /* L5: load the canonical HostError enum on top of the func
+         * contract. This is a soft extension -- a missing file
+         * leaves the enum table empty, which only affects validation
+         * of `host_error::<name>` references (they degrade to "we
+         * don't know that name, accept it"). */
+        char epath[1024];
+        const char *ep = lcn_wit_default_errors_path(epath,
+                                                      sizeof(epath), NULL);
+        if (ep) {
+            (void)lcn_wit_load_errors(&contract, ep);
         }
         load_attempted = 1;
     }
@@ -2742,6 +2786,39 @@ static void check_expr(SymbolTable *st, AstNode *expr,
 
     case AST_MATCH:
         check_expr(st, expr->left, reporter, arena);
+        {
+            /* L5: exhaustiveness check for `match Result { ... }`. We treat
+             * the match as Result-shaped if any arm pattern's variant tail
+             * is `Ok` or `Err`. In that case both arms must be present
+             * (wildcard / catch-all patterns are L6 work -- see
+             * ROADMAP.md L6 row). Single-arm match raises
+             * ERR_MATCH_INEXHAUSTIVE. */
+            bool saw_ok = false, saw_err = false, looks_resultish = false;
+            AstNode *first_arm = expr->params;
+            for (AstNode *arm = expr->params; arm; arm = arm->next) {
+                if (arm->kind != AST_MATCH_ARM || !arm->left) continue;
+                AstNode *pat = arm->left;
+                if (pat->kind != AST_PAT_ENUM || !pat->name) continue;
+                const char *name = pat->name;
+                const char *tail = name;
+                for (const char *q = name; *q; q++) {
+                    if (q[0] == ':' && q[1] == ':') { tail = q + 2; q++; }
+                    else if (q[0] == '.')           { tail = q + 1; }
+                }
+                if (strcmp(tail, "Ok")  == 0) { saw_ok  = true; looks_resultish = true; }
+                if (strcmp(tail, "Err") == 0) { saw_err = true; looks_resultish = true; }
+            }
+            if (looks_resultish && (!saw_ok || !saw_err)) {
+                report_error_fmt(
+                    reporter,
+                    first_arm ? first_arm->loc : expr->loc,
+                    "add the missing arm (wildcard patterns are L6)",
+                    "ERR_MATCH_INEXHAUSTIVE: match over Result requires "
+                    "both Ok(_) and Err(_) arms (saw %s%s)",
+                    saw_ok  ? "Ok "  : "",
+                    saw_err ? "Err " : "");
+            }
+        }
         {
             AstNode *arm = expr->params;
             while (arm) {
