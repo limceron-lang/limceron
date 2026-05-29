@@ -1,0 +1,78 @@
+{
+  "name": "limceron-language",
+  "displayName": "Limceron",
+  "description": "Limceron language support: syntax highlighting + language server (LSP).",
+  "version": "0.1.0",
+  "publisher": "limceron",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/limceron/limceron"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "limceron",
+        "aliases": [
+          "Limceron",
+          "limceron"
+        ],
+        "extensions": [
+          ".lceron",
+          ".lceron.md"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "limceron",
+        "scopeName": "source.limceron",
+        "path": "./syntaxes/limceron.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Limceron",
+      "properties": {
+        "limceron.serverPath": {
+          "type": "string",
+          "default": "limceron-lsp",
+          "description": "Path to the limceron-lsp executable. Defaults to looking on $PATH; otherwise set to e.g. `/usr/local/bin/limceron-lsp` or the absolute path of `build/limceron-lsp` from the Limceron source tree."
+        },
+        "limceron.trace.server": {
+          "type": "string",
+          "scope": "window",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Traces communication between VS Code and the limceron-lsp server."
+        }
+      }
+    }
+  },
+  "activationEvents": [
+    "onLanguage:limceron"
+  ],
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.3.0"
+  }
+}

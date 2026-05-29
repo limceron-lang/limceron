@@ -387,7 +387,7 @@ static void lsp_handle_initialize(long id) {
     const char *result =
         "{"
             "\"capabilities\":{"
-                "\"textDocumentSync\":1,"
+                "\"textDocumentSync\":{\"openClose\":true,\"change\":1,\"save\":{\"includeText\":true}},"
                 "\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},"
                 "\"hoverProvider\":true,"
                 "\"definitionProvider\":true,"
@@ -463,6 +463,27 @@ static void lsp_handle_did_change(const char *params) {
         memcpy(doc->content, text_buf, doc->content_len + 1);
     }
 
+    lsp_parse_and_diagnose(doc);
+}
+
+/* ============================================================
+ * textDocument/didSave (L10: re-run typecheck on save)
+ * ============================================================ */
+
+static void lsp_handle_did_save(const char *params) {
+    const char *td = json_find_object(params, "textDocument");
+    if (!td) return;
+    char uri[LSP_MAX_URI_LEN];
+    if (!lsp_json_get_string(td, "uri", uri, sizeof(uri))) return;
+    LspDocument *doc = lsp_find_doc(uri);
+    if (!doc) return;
+    char text_buf[LSP_MAX_MSG_SIZE];
+    if (lsp_json_get_string(params, "text", text_buf, sizeof(text_buf))) {
+        free(doc->content);
+        doc->content_len = strlen(text_buf);
+        doc->content = (char *)malloc(doc->content_len + 1);
+        if (doc->content) memcpy(doc->content, text_buf, doc->content_len + 1);
+    }
     lsp_parse_and_diagnose(doc);
 }
 
@@ -1028,6 +1049,236 @@ static void lsp_handle_definition(long id, const char *params) {
  * Main LSP event loop
  * ============================================================ */
 
+/* L10 additions appended below */
+
+/* Host module + enum variant tables for completion. */
+typedef struct { const char *module; const char **members; } LspHostModule;
+static const char *lsp_host_llm_m[]    = { "classify", "complete", "embed", "rerank", NULL };
+static const char *lsp_host_json_m[]   = { "parse", "get", "set", "array_len", "array_get", "stringify", NULL };
+static const char *lsp_host_http_m[]   = { "fetch", "post", "get", NULL };
+static const char *lsp_host_mcp_m[]    = { "call", "list_tools", NULL };
+static const char *lsp_host_log_m[]    = { "info", "warn", "error", "debug", NULL };
+static const char *lsp_host_time_m[]   = { "now", "sleep", "format", "since", NULL };
+static const char *lsp_host_math_m[]   = { "abs", "min", "max", "sqrt", "pow", "floor", "ceil", "clamp", NULL };
+static const char *lsp_host_string_m[] = { "len", "upper", "lower", "contains", "starts_with",
+                                            "ends_with", "split", "trim", "replace", "find", NULL };
+static const LspHostModule lsp_host_modules_tbl[] = {
+    { "llm", lsp_host_llm_m }, { "json", lsp_host_json_m }, { "http", lsp_host_http_m },
+    { "mcp", lsp_host_mcp_m }, { "log", lsp_host_log_m }, { "time", lsp_host_time_m },
+    { "math", lsp_host_math_m }, { "string", lsp_host_string_m }, { NULL, NULL },
+};
+
+typedef struct { const char *type_name; const char **variants; } LspEnumVariants;
+static const char *lsp_var_host_err_v[] = {
+    "BudgetExceeded", "EntropyExceeded", "InvalidArgument", "RuntimeError",
+    "Timeout", "NetworkError", "PermissionDenied", "Unavailable", NULL,
+};
+static const char *lsp_var_result_v[] = { "Ok", "Err", NULL };
+static const char *lsp_var_option_v[] = { "Some", "None", NULL };
+static const LspEnumVariants lsp_enum_table_tbl[] = {
+    { "host-error", lsp_var_host_err_v }, { "HostError", lsp_var_host_err_v },
+    { "Result", lsp_var_result_v }, { "Option", lsp_var_option_v }, { NULL, NULL },
+};
+
+int lsp_test_diagnostics_for_source(const char *uri, const char *source,
+                                     char *out, size_t out_sz) {
+    if (!source || !out || out_sz == 0) return 0;
+    out[0] = '\0';
+    LspDocument doc; memset(&doc, 0, sizeof(doc));
+    strncpy(doc.uri, uri ? uri : "file:///test.lceron", LSP_MAX_URI_LEN - 1);
+    doc.arena        = arena_new(2 * 1024 * 1024);
+    doc.intern_arena = arena_new(512 * 1024);
+    doc.content_len  = strlen(source);
+    doc.content      = (char *)malloc(doc.content_len + 1);
+    memcpy(doc.content, source, doc.content_len + 1);
+    const char *filename = uri_to_filename(doc.uri);
+    ErrorReporter reporter = reporter_new(filename, doc.content, doc.content_len);
+    StringIntern intern = intern_new(&doc.intern_arena);
+    Lexer lexer = lexer_new(filename, doc.content, doc.content_len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &doc.arena, &reporter);
+    doc.ast = parse_program(&parser);
+    if (doc.ast && !parser.had_error) typecheck_program(doc.ast, &reporter, &doc.arena);
+    int off = 0;
+    char esc[2048];
+    off += snprintf(out + off, out_sz - (size_t)off,
+                    "{\"uri\":\"%s\",\"diagnostics\":[", doc.uri);
+    for (int i = 0; i < reporter.count && (size_t)off < out_sz - 512; i++) {
+        CompileError *e = &reporter.errors[i];
+        uint32_t line = e->loc.line > 0 ? e->loc.line - 1 : 0;
+        uint32_t col  = e->loc.column > 0 ? e->loc.column - 1 : 0;
+        int severity  = e->is_warning ? 2 : 1;
+        char *p = esc; const char *s = e->message ? e->message : "";
+        size_t k = 0;
+        while (*s && k < sizeof(esc) - 6) {
+            if (*s == '"') { p[k++]='\\'; p[k++]='"'; }
+            else if (*s == '\\') { p[k++]='\\'; p[k++]='\\'; }
+            else if (*s == '\n') { p[k++]='\\'; p[k++]='n'; }
+            else p[k++] = *s;
+            s++;
+        }
+        p[k] = '\0';
+        if (i > 0) out[off++] = ',';
+        off += snprintf(out + off, out_sz - (size_t)off,
+                        "{\"range\":{\"start\":{\"line\":%u,\"character\":%u},"
+                        "\"end\":{\"line\":%u,\"character\":%u}},"
+                        "\"severity\":%d,\"code\":\"LCN-%03d\","
+                        "\"source\":\"limceron\",\"message\":\"%s\"}",
+                        line, col, line,
+                        col + (e->underline_len > 0 ? e->underline_len : 1),
+                        severity, i + 1, esc);
+    }
+    off += snprintf(out + off, out_sz - (size_t)off, "]}");
+    free(doc.content); arena_free(&doc.arena); arena_free(&doc.intern_arena);
+    return off;
+}
+
+int lsp_test_hover_for_source(const char *source, long line, long col,
+                               char *out, size_t out_sz) {
+    if (!source || !out || out_sz < 4) return 0;
+    out[0] = '\0';
+    LspDocument doc; memset(&doc, 0, sizeof(doc));
+    strncpy(doc.uri, "file:///test.lceron", LSP_MAX_URI_LEN - 1);
+    doc.arena        = arena_new(2 * 1024 * 1024);
+    doc.intern_arena = arena_new(512 * 1024);
+    doc.content_len  = strlen(source);
+    doc.content      = (char *)malloc(doc.content_len + 1);
+    memcpy(doc.content, source, doc.content_len + 1);
+    ErrorReporter reporter = reporter_new("test.lceron", doc.content, doc.content_len);
+    StringIntern intern = intern_new(&doc.intern_arena);
+    Lexer lexer = lexer_new("test.lceron", doc.content, doc.content_len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &doc.arena, &reporter);
+    doc.ast = parse_program(&parser);
+    char word[512];
+    int produced = 0;
+    if (lsp_get_word_at(doc.content, doc.content_len, line, col, word, sizeof(word))) {
+        const char *kw = lsp_keyword_description(word);
+        if (kw) {
+            snprintf(out, out_sz, "**%s** -- %s", word, kw);
+            produced = 1;
+        }
+        if (!produced && doc.ast) {
+            AstNode *decl = lsp_find_decl(doc.ast, word);
+            if (decl) {
+                if (decl->kind == AST_FN) {
+                    char sig[2048]; lsp_build_fn_signature(decl, sig, sizeof(sig));
+                    snprintf(out, out_sz, "```limceron\n%s\n```", sig);
+                } else if (decl->kind == AST_LET) {
+                    if (decl->type_expr && decl->type_expr->kind == AST_TYPE_NAMED && decl->type_expr->name) {
+                        snprintf(out, out_sz, "```limceron\nlet %s: %s\n```",
+                                 decl->name, decl->type_expr->name);
+                    } else {
+                        snprintf(out, out_sz,
+                                 "```limceron\nlet %s\n```\ntype info pending L9 close",
+                                 decl->name);
+                    }
+                } else if (decl->name) {
+                    snprintf(out, out_sz, "%s `%s`", ast_kind_name(decl->kind), decl->name);
+                }
+                produced = out[0] != '\0';
+            }
+        }
+        if (!produced) {
+            for (int i = 0; lsp_builtins[i]; i++) {
+                if (strcmp(word, lsp_builtins[i]) == 0) {
+                    snprintf(out, out_sz, "**%s** -- builtin function", word);
+                    produced = 1;
+                    break;
+                }
+            }
+        }
+    }
+    free(doc.content); arena_free(&doc.arena); arena_free(&doc.intern_arena);
+    return produced;
+}
+
+int lsp_test_completion_for_source(const char *source, long line, long character,
+                                    char *out, size_t out_sz) {
+    if (!source || !out || out_sz < 2) return 0;
+    out[0] = '\0';
+    LspDocument doc; memset(&doc, 0, sizeof(doc));
+    strncpy(doc.uri, "file:///test.lceron", LSP_MAX_URI_LEN - 1);
+    doc.arena        = arena_new(2 * 1024 * 1024);
+    doc.intern_arena = arena_new(512 * 1024);
+    doc.content_len  = strlen(source);
+    doc.content      = (char *)malloc(doc.content_len + 1);
+    memcpy(doc.content, source, doc.content_len + 1);
+    ErrorReporter reporter = reporter_new("test.lceron", doc.content, doc.content_len);
+    StringIntern intern = intern_new(&doc.intern_arena);
+    Lexer lexer = lexer_new("test.lceron", doc.content, doc.content_len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &doc.arena, &reporter);
+    doc.ast = parse_program(&parser);
+    int off = 0;
+    int is_member = 0, is_enum_var = 0;
+    char recv[128]; recv[0] = '\0';
+    if (doc.content && character > 0) {
+        const char *src2 = doc.content;
+        long cl = 0, cc = 0;
+        const char *p = src2;
+        while (*p && (cl < line || (cl == line && cc < character - 1))) {
+            if (*p == '\n') { cl++; cc = 0; } else { cc++; }
+            p++;
+        }
+        if (*p == '.') is_member = 1;
+        else if (*p == ':' && p > src2 && *(p - 1) == ':') is_enum_var = 1;
+        const char *q = p;
+        if (is_enum_var && q > src2 && *(q - 1) == ':') q--;
+        if (q > src2 && (*q == '.' || *q == ':')) q--;
+        const char *end = q + 1;
+        while (q > src2 && (isalnum((unsigned char)*q) || *q == '_' || *q == '-')) q--;
+        if (!isalnum((unsigned char)*q) && *q != '_' && *q != '-') q++;
+        size_t rlen = (size_t)(end - q);
+        if (rlen > 0 && rlen < sizeof(recv)) { memcpy(recv, q, rlen); recv[rlen] = '\0'; }
+    }
+    int handled = 0;
+    if (is_enum_var && recv[0]) {
+        for (int i = 0; lsp_enum_table_tbl[i].type_name; i++) {
+            if (strcmp(recv, lsp_enum_table_tbl[i].type_name) != 0) continue;
+            const char **vars = lsp_enum_table_tbl[i].variants;
+            for (int j = 0; vars[j]; j++) {
+                if (off > 0) out[off++] = ',';
+                off += snprintf(out + off, out_sz - (size_t)off,
+                                "{\"label\":\"%s\",\"kind\":20,\"detail\":\"variant\"}", vars[j]);
+                if ((size_t)off >= out_sz - 256) break;
+            }
+            handled = 1; break;
+        }
+    }
+    if (!handled && is_member && recv[0]) {
+        for (int i = 0; lsp_host_modules_tbl[i].module; i++) {
+            if (strcmp(recv, lsp_host_modules_tbl[i].module) != 0) continue;
+            const char **mems = lsp_host_modules_tbl[i].members;
+            for (int j = 0; mems[j]; j++) {
+                if (off > 0) out[off++] = ',';
+                off += snprintf(out + off, out_sz - (size_t)off,
+                                "{\"label\":\"%s\",\"kind\":3,\"detail\":\"host:%s\"}",
+                                mems[j], recv);
+                if ((size_t)off >= out_sz - 256) break;
+            }
+            handled = 1; break;
+        }
+    }
+    if (!handled && !is_member) {
+        for (int i = 0; lsp_keywords[i]; i++) {
+            if (off > 0) out[off++] = ',';
+            off += snprintf(out + off, out_sz - (size_t)off,
+                            "{\"label\":\"%s\",\"kind\":14,\"detail\":\"keyword\"}",
+                            lsp_keywords[i]);
+            if ((size_t)off >= out_sz - 256) break;
+        }
+        for (int i = 0; lsp_builtins[i] && (size_t)off < out_sz - 256; i++) {
+            if (off > 0) out[off++] = ',';
+            off += snprintf(out + off, out_sz - (size_t)off,
+                            "{\"label\":\"%s\",\"kind\":3,\"detail\":\"builtin\"}",
+                            lsp_builtins[i]);
+        }
+        if (doc.ast) {
+            off = lsp_collect_scope_identifiers(doc.ast, (uint32_t)(line + 1),
+                                                out, out_sz, off);
+        }
+    }
+    free(doc.content); arena_free(&doc.arena); arena_free(&doc.intern_arena);
+    return off;
+}
 int cmd_lsp(void) {
     /* LSP communicates over stdin/stdout. Log to stderr. */
     fprintf(stderr, "limceron-lsp: starting (version %s)\n", LCN_VERSION);
@@ -1072,6 +1323,9 @@ int cmd_lsp(void) {
         }
         else if (strcmp(method, "textDocument/didChange") == 0) {
             if (params) lsp_handle_did_change(params);
+        }
+        else if (strcmp(method, "textDocument/didSave") == 0) {
+            if (params) lsp_handle_did_save(params);
         }
         else if (strcmp(method, "textDocument/didClose") == 0) {
             if (params) lsp_handle_did_close(params);

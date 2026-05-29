@@ -125,6 +125,13 @@ int lcn_wit_resolve_host_error(const char *enum_name,
                                const char *variant_name,
                                int64_t *out_value);
 
+/* L6: look up an enum in the process-wide shared HostError contract.
+ * Returns NULL if the canonical errors file is unavailable or the
+ * enum name does not match. Used by the L6 match exhaustiveness pass
+ * to enumerate every variant of `host-error` for "missing variant"
+ * diagnostics. */
+const LcnWitEnum *lcn_wit_shared_enum(const char *enum_name);
+
 #ifdef __cplusplus
 }
 #endif

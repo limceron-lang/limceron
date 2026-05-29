@@ -886,4 +886,14 @@ void         lsp_send_message(const char *json);
 const char  *lsp_json_get_string(const char *json, const char *key, char *buf, size_t bufsz);
 long         lsp_json_get_int(const char *json, const char *key);
 
+/* L10 test entry points: drive the LSP request handlers against an
+ * in-memory source string and return the textual payload that would
+ * have been sent over the wire. Used by test/test_lsp.c. */
+int lsp_test_diagnostics_for_source(const char *uri, const char *source,
+                                     char *out, size_t out_sz);
+int lsp_test_hover_for_source(const char *source, long line, long col,
+                               char *out, size_t out_sz);
+int lsp_test_completion_for_source(const char *source, long line, long character,
+                                    char *out, size_t out_sz);
+
 #endif /* LCN_H */

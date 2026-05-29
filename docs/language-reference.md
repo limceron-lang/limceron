@@ -681,6 +681,136 @@ Multiple agents per file is permitted at the parser level; stage0's
 WASM emit path supports a single agent per module. The first agent
 with a scalar `entropy_budget` declaration wins for that field.
 
+## Modules (L8)
+
+L8 (2026-05-13) ships multi-file modules with module-relative `use`,
+module-scoped symbol mangling, and DFS cycle detection at the
+loader. There is no separate package manifest — a "module" is just a
+`.lceron` file in the same source tree as the entry point.
+
+### `use` syntax
+
+Module-level `use` declarations appear at the top of a file, BEFORE
+any `fn` / `agent` / `struct` / `capability` block:
+
+```limceron
+use helpers              // resolves ./helpers.lceron
+use util.math            // resolves ./util/math.lceron
+use stdlib::math         // L7 stdlib stub still accepted, treated as ./stdlib/math.lceron
+```
+
+The dotted form (`use util.math`) walks subdirectories — `.` becomes
+`/` for path resolution. The L7 stub `::` form is still accepted for
+backward compatibility with samples written against the pre-L8
+syntax; the colons normalise to dots before resolution.
+
+L8 limitation: the path after `use` must start with an identifier
+(no leading digit). A sibling file named `12_lib.lceron` cannot be
+imported as `use 12_lib;` — rename it (e.g. `lib.lceron`) or wrap
+the import in a directory (`use widgets.lib;` against
+`widgets/12_lib.lceron`... still won't work for the same reason).
+
+### File resolution
+
+| `use` form           | Resolved path                                |
+|----------------------|----------------------------------------------|
+| `use helpers`        | `<entry_dir>/helpers.lceron`                 |
+| `use util.math`      | `<entry_dir>/util/math.lceron`               |
+| `use std.io`         | `<stdlib_dir>/io.lceron` (stdlib shortcut)   |
+| `use stdlib::math`   | `<entry_dir>/stdlib/math.lceron` (L7 stub)   |
+
+The loader tries `.lceron` first, then `.lceron.md`. A `use` that
+matches neither prints a single-line warning and continues; an empty
+loader path is never a hard error (matches the legacy L1b
+behaviour). A `use` that resolves to a file currently on the
+resolution stack is **always** a hard error
+(`ERR_CIRCULAR_IMPORT`); see Cycle detection below.
+
+### Visibility
+
+| Form          | Default visibility | Explicit form |
+|---------------|--------------------|---------------|
+| `fn name() …` | **public**         | `pub fn name() …` |
+| `struct T …`  | private            | `pub struct T …`  |
+| `enum E …`    | private            | `pub enum E …`    |
+| `const K …`   | private            | `pub const K …`   |
+
+Top-level `fn`s are public by default — this matches the L8 spec
+(*"All top-level `fn`s in a module are public by default"*) and
+makes the common helper-module pattern (`fn greet(name)`) work with
+zero ceremony. The `pub` keyword is still accepted and treated as
+the explicit-public form; it has no semantic effect on `fn`s but is
+required for every other kind to cross the module boundary.
+
+### Module-scoped mangling
+
+To keep the global IR / C symbol space collision-free when two
+sibling modules each declare a `fn` with the same name, L8 extends
+the pre-existing `lcn___<kebab>_<fn>` agent-method mangling to
+top-level fns:
+
+| Source location                         | Emitted symbol             |
+|-----------------------------------------|----------------------------|
+| Main translation unit, `fn greet(...)`  | `lcn_greet`                |
+| `helpers.lceron`, `fn greet(...)`       | `lcn___helpers_greet`      |
+| `agent Foo { fn greet(...) }` (in main) | `lcn___foo_greet`          |
+
+The module stem is the file's basename minus `.lceron` (or
+`.lceron.md`); hyphens collapse to underscores so the stem is
+always a legal WASM / C symbol component. The main file's free fns
+intentionally retain the bare `lcn_<fn>` form so existing
+single-file callers and the WASM `main` export logic keep working
+unchanged.
+
+### Cross-module calls
+
+Once `use helpers;` is in scope, any `fn` from `helpers.lceron` is
+callable via the qualified-method shape:
+
+```limceron
+use helpers
+fn build_label(name: string) -> string {
+    helpers.greet(name)            // resolves to lcn___helpers_greet
+}
+```
+
+Parsing produces an `AST_METHOD_CALL` node with the module stem on
+the LHS and the fn name in `->name`; the IR-gen and C-codegen
+passes intercept that shape, look up the (stem, name) pair in their
+respective module-fn registries, and route the call to the mangled
+symbol. No inter-module wasm imports are emitted — every merged fn
+lives in the same `.wasm` (or the same C translation unit).
+
+### Cycle detection
+
+The loader runs a DFS over `use` graph. Each file is pushed onto an
+ancestor stack when its imports are about to be processed, and
+popped on return. A `use` that resolves to a file already on the
+stack triggers `ERR_CIRCULAR_IMPORT`:
+
+```
+  import: ERR_CIRCULAR_IMPORT — cycle detected at '/tmp/lcn_l8_cycle/a.lceron'
+    cycle path:
+        /tmp/lcn_l8_cycle/a.lceron
+        -> /tmp/lcn_l8_cycle/b.lceron
+      -> /tmp/lcn_l8_cycle/a.lceron   (cycle)
+  Imports: aborting build (1 circular import error(s))
+```
+
+A *diamond* import (file C reached via both B and the entry) is NOT
+a cycle — the second visit silently skips the merge step because
+the visited set has already absorbed C's decls. Only paths that
+land back on an ancestor count.
+
+### Not yet supported (deferred past L8)
+
+- Wildcard imports (`use helpers::*;`)
+- Re-exports (`pub use helpers::format_name;`)
+- Selective imports (`use helpers::{a, b};`) — full module import only
+- Module-level `const` declarations crossing module boundaries
+- `./` / `../` relative path syntax in `use` — use the dotted form
+  (`use util.math`) for subdirectory imports
+
 ## HostError sentinel space
 
 | Const | Value | Meaning |
@@ -745,9 +875,31 @@ backends remain available for embedded and single-tenant edge.
 | `examples/wasm/capabilities/02_restricted_fetch.lceron` | parameterised capability. |
 | `examples/wasm/json/01_parse_and_field.lceron` | `vdag:json` host call. |
 | `examples/wasm/poc/10_stdlib.lceron` | L7 stdlib: `math.clamp` + `time.now` + `string.contains`. |
+| `examples/wasm/poc/12_multifile.lceron` | L8 multi-file: `use multifile_lib;` + cross-module `multifile_lib.format_prompt(...)`. |
+| `examples/language/multifile/main.lceron` | L8 fixture for `make test-multifile`: imports `helpers.lceron`. |
+
+## Tooling
+
+L10 introduces a language server + a VSCode extension scaffold.
+
+| Tool | Source | Notes |
+|---|---|---|
+| `limceron-stage0 lsp` | `src/lsp.c` | Embedded LSP subcommand. JSON-RPC 2.0 over stdio. |
+| `build/limceron-lsp` | `make lsp` | Standalone LSP binary (alias around `cmd_lsp`). |
+| VSCode extension | `editor/vscode/` | Syntax highlighting + language client. Not published to the marketplace. |
+
+The LSP supports diagnostics-on-save, hover, go-to-definition, and
+completion (keywords, builtins, scope identifiers, host modules,
+enum variants). The wasm backend additionally emits `vdag.sourcemap`
++ minimal DWARF custom sections so a wazero trap maps back to a
+Limceron source position. See [docs/lsp.md](lsp.md) for the full
+capabilities matrix, editor setup (VSCode + Neovim + Emacs) and
+troubleshooting.
 
 ## Cross-references
 
+- [docs/lsp.md](lsp.md) — L10 LSP + source-map chain.
+- [editor/vscode/README.md](../editor/vscode/README.md) — VSCode extension scaffold.
 - [ADR-0001](adr/0001-wasm-target.md) — wasm target.
 - [ADR-0002](adr/0002-result-as-negative-i64-union.md) — Result repr.
 - [ADR-0003](adr/0003-entropy-budget-runtime-fence.md) — L11.

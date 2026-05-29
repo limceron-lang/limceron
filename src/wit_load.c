@@ -556,3 +556,18 @@ int lcn_wit_resolve_host_error(const char *enum_name,
     *out_value = v->value;
     return 1;
 }
+
+/* L6: enum-table accessor used by the L6 typecheck exhaustiveness
+ * pass. Triggers the same lazy load as lcn_wit_resolve_host_error
+ * so callers don't have to plumb a contract pointer through the AST
+ * walker. */
+const LcnWitEnum *lcn_wit_shared_enum(const char *enum_name) {
+    if (!enum_name) return NULL;
+    if (!g_host_err_loaded) {
+        char path[1024];
+        const char *p = lcn_wit_default_errors_path(path, sizeof(path), NULL);
+        if (p) (void)lcn_wit_load_errors(&g_host_err_contract, p);
+        g_host_err_loaded = 1;
+    }
+    return lcn_wit_lookup_enum(&g_host_err_contract, enum_name);
+}
