@@ -1,20 +1,28 @@
-// multifile/main.lceron — placeholder fixture for `make test-multifile`.
+// multifile/main.lceron — L8 fixture: real cross-file `use` import.
 //
-// Multi-file `use ...` cross-module imports are L8-deferred per
-// ROADMAP.md. Until that phase lands, this fixture exists only so
-// the test-multifile Makefile target can compile a real source
-// file rather than failing with "cannot open file". When L8 ships,
-// promote this to a real multi-file example (split into
-// main.lceron + helpers.lceron with a working `use helpers;`).
+// Demonstrates the L8 module system landed 2026-05-13:
+//
+//   * `use helpers;` resolves `helpers.lceron` relative to this file's
+//     directory. The loader merges helpers.lceron's public fns into the
+//     same compilation unit and tags each with the `helpers` module stem
+//     so their C / WASM symbols mangle to `lcn___helpers_<fn>`.
+//   * `helpers.greet(name)` parses as AST_METHOD_CALL (left=ident
+//     `helpers`, name=`greet`) and routes to that mangled symbol at
+//     codegen time. No inter-module wasm import is emitted — all merged
+//     fns share the single output translation unit.
+//
+// The historical placeholder (single-file with `agent Demo`) lived here
+// until L8 shipped; promoted now per ROADMAP.md §L8.
 
-agent Demo {
-    budget: { max_tokens: 1000, max_cost: 0.01, max_duration: 30 }
+use helpers;
 
-    fn double(x: int) -> int {
-        x * 2
-    }
+fn build_label(prefix: string, name: string) -> string {
+    // Cross-module direct call. `helpers` is the module stem (basename
+    // of helpers.lceron) and `greet` is its public fn. The C and WASM
+    // back-ends both resolve this to `lcn___helpers_greet(...)`.
+    helpers.greet(name)
+}
 
-    fn run() -> int {
-        double(21)
-    }
+fn main() {
+    let _ = build_label("hi", "world")
 }

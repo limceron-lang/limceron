@@ -497,6 +497,19 @@ typedef struct {
      * first agent declaring `fn main` wins; later agents emit only the
      * mangled form and a stderr warning. */
     bool        has_unmangled_main;
+
+    /* L8: module-scoped fn registry. Each entry maps a (module_stem,
+     * fn_name) pair to its mangled IR symbol. Populated by the program-
+     * level walk so that calls of the form `helpers.greet(x)` (parsed as
+     * AST_METHOD_CALL with the module name on the LHS) can route to the
+     * cross-file mangled symbol. */
+    struct {
+        const char *module_stem;  /* e.g. "helpers" */
+        const char *fn_name;      /* e.g. "greet" */
+        const char *ir_symbol;    /* e.g. "lcn___helpers_greet" */
+        IrType      ret_type;
+    } module_fn_registry[256];
+    int module_fn_reg_count;
 } IrGenContext;
 
 static void irgen_scope_init(IrGenScope *s) {
@@ -662,6 +675,21 @@ static IrType irgen_infer_type(AstNode *expr) {
 /* Determine the actual type of a generated SSA value */
 static IrType irgen_value_type(IrGenContext *ctx, int val_id) {
     if (val_id < 0) return IR_TYPE_VOID;
+    /* L8: function parameters have a value-id but no defining
+     * instruction in any BB (they're produced at function entry).
+     * Look them up against the parameter table first so a caller
+     * asking for the type of e.g. a `string` param does not get
+     * the IR_TYPE_I64 fallback -- which would mis-route an
+     * interpolation segment through `string.from_int` and break
+     * the WASM type checker at the host-call boundary. */
+    if (ctx->current_fn) {
+        int i;
+        for (i = 0; i < ctx->current_fn->param_count; i++) {
+            if (ctx->current_fn->param_value_ids[i] == val_id) {
+                return ctx->current_fn->param_types[i];
+            }
+        }
+    }
     IrBasicBlock *bb;
     for (bb = ctx->current_fn->entry; bb; bb = bb->next) {
         IrInst *inst;
@@ -765,6 +793,25 @@ static const char *irgen_lookup_agent_local(IrGenContext *ctx,
     return NULL;
 }
 
+/* L8: look up a fn imported from another module by (module_stem, fn_name).
+ * Returns the mangled IR symbol and writes the return type to *out_ret_type,
+ * or NULL when no cross-file binding matches. */
+static const char *irgen_lookup_module_fn(IrGenContext *ctx,
+                                           const char *module_stem,
+                                           const char *fn_name,
+                                           IrType *out_ret_type) {
+    if (!module_stem || !fn_name) return NULL;
+    int i;
+    for (i = 0; i < ctx->module_fn_reg_count; i++) {
+        if (strcmp(ctx->module_fn_registry[i].module_stem, module_stem) == 0 &&
+            strcmp(ctx->module_fn_registry[i].fn_name, fn_name) == 0) {
+            if (out_ret_type) *out_ret_type = ctx->module_fn_registry[i].ret_type;
+            return ctx->module_fn_registry[i].ir_symbol;
+        }
+    }
+    return NULL;
+}
+
 static int irgen_call(IrGenContext *ctx, AstNode *expr) {
     /* Get the callee name */
     const char *callee = NULL;
@@ -822,6 +869,7 @@ static int irgen_call(IrGenContext *ctx, AstNode *expr) {
  * default-no-op behaviour.
  * ============================================================ */
 
+/* L6 marker -- general match decision-tree lowering follows. */
 /* Return true if the qualified host-call name produces a Json handle
  * we should track across let-bindings. Verbs that decode a handle
  * into a primitive (string-value/int-value/bool-value/length/is-null
@@ -1005,6 +1053,37 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
 
     case AST_CALL:
         return irgen_call(ctx, expr);
+
+    case AST_METHOD_CALL: {
+        /* L8: `<module>.<fn>(args)` where <module> is the stem of an
+         * imported sibling file routes to the mangled IR symbol
+         * `lcn___<module>_<fn>` so cross-module calls become direct
+         * calls inside the same wasm compilation unit (no
+         * `(import ...)` declaration is emitted). The receiver must be
+         * a bare identifier and must resolve in the module-fn registry;
+         * everything else falls through to a no-op placeholder which
+         * matches the legacy pre-L8 behaviour for ordinary method-call
+         * shapes the IR back-end did not lower. */
+        if (expr->left && expr->left->kind == AST_IDENT && expr->left->name &&
+            expr->name) {
+            IrType ret_type = IR_TYPE_VOID;
+            const char *sym = irgen_lookup_module_fn(ctx, expr->left->name,
+                                                     expr->name, &ret_type);
+            if (sym) {
+                int args[16];
+                int arg_count = 0;
+                AstNode *arg_node;
+                for (arg_node = expr->params;
+                     arg_node && arg_count < 16; arg_node = arg_node->next) {
+                    args[arg_count++] = irgen_expr(ctx, arg_node);
+                }
+                return ir_emit_call(ctx->current_fn, ctx->mod, sym,
+                                    ret_type, args, arg_count);
+            }
+        }
+        if (expr->left) (void)irgen_expr(ctx, expr->left);
+        return ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+    }
 
     case AST_HOST_CALL: {
         /* Host-call lowering. The qualified name is stored in expr->name
@@ -1696,6 +1775,22 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
                     IrType call_ret = irgen_lookup_fn_ret(ctx, stmt->right->left->name);
                     if (call_ret != IR_TYPE_VOID) var_type = call_ret;
                 }
+                /* L8: cross-module method call -- the receiver is an
+                 * imported module stem, so the var type follows the
+                 * fn's declared return type recorded in the module-fn
+                 * registry. Without this, `let prompt = helpers.fmt(...)`
+                 * would default to i64 and trip the WASM type checker
+                 * at the next host call that consumes it. */
+                if (stmt->right->kind == AST_METHOD_CALL &&
+                    stmt->right->left &&
+                    stmt->right->left->kind == AST_IDENT &&
+                    stmt->right->left->name && stmt->right->name) {
+                    IrType mod_ret = IR_TYPE_VOID;
+                    if (irgen_lookup_module_fn(ctx, stmt->right->left->name,
+                                                stmt->right->name, &mod_ret)) {
+                        if (mod_ret != IR_TYPE_VOID) var_type = mod_ret;
+                    }
+                }
             } else {
                 var_type = IR_TYPE_I64; /* default */
             }
@@ -2157,13 +2252,27 @@ static void irgen_function(IrGenContext *ctx, AstNode *fn_ast) {
     /* Determine return type */
     IrType ret_type = ast_type_to_ir(fn_ast->type_expr);
 
-    /* Build function name: lcn_<name> */
+    /* L8: module-scoped mangling. If the loader stashed a module stem
+     * on `val.str_val` (because this top-level fn was merged in from a
+     * `use`d sibling file), build `lcn___<stem>_<name>` so two files
+     * can each declare e.g. `fn greet` without colliding at link time.
+     * The main translation unit's fns retain the bare `lcn_<name>`
+     * form so existing single-file callers and the WASM main-export
+     * logic continue to find them unchanged. */
+    const char *module_stem = fn_ast->val.str_val;
     char fn_name[256];
-    snprintf(fn_name, sizeof(fn_name), "lcn_%s", name);
+    if (module_stem && module_stem[0]) {
+        snprintf(fn_name, sizeof(fn_name), "lcn___%s_%s", module_stem, name);
+    } else {
+        snprintf(fn_name, sizeof(fn_name), "lcn_%s", name);
+    }
 
     IrFunction *fn = ir_function_new(ctx->mod, fn_name, ret_type);
 
-    /* Register for call resolution */
+    /* Register for call resolution. The module-fn registry is
+     * populated up-front by ir_gen_program's pre-walk so forward
+     * references between sibling modules resolve regardless of source
+     * order. */
     irgen_register_fn(ctx, name, ret_type);
 
     /* Add parameters */
@@ -2429,12 +2538,36 @@ IrModule *ir_gen_program(AstNode *program, Arena *arena) {
     ctx.mod = mod;
     irgen_scope_init(&ctx.scope);
 
-    /* First pass: register all function names for forward references */
+    /* First pass: register all function names for forward references.
+     *
+     * L8: top-level fns merged in from a `use`d sibling file carry a
+     * module stem in `val.str_val`. Pre-register them in the module-fn
+     * registry so a cross-module call (e.g. `helpers.greet(name)`) can
+     * resolve to `lcn___helpers_greet` regardless of source order. The
+     * unqualified-name registration (used by the agent-local fallback
+     * path) stays as before; the module-tagged version simply layers
+     * on top so authors can spell the call either way. */
     AstNode *decl;
     for (decl = program->params; decl; decl = decl->next) {
         if (decl->kind == AST_FN && decl->name) {
             IrType ret_type = ast_type_to_ir(decl->type_expr);
             irgen_register_fn(&ctx, decl->name, ret_type);
+
+            const char *module_stem = decl->val.str_val;
+            if (module_stem && module_stem[0] &&
+                ctx.module_fn_reg_count < 256) {
+                char mangled[256];
+                snprintf(mangled, sizeof(mangled), "lcn___%s_%s",
+                         module_stem, decl->name);
+                int idx = ctx.module_fn_reg_count++;
+                ctx.module_fn_registry[idx].module_stem =
+                    arena_strdup(ctx.mod->arena, module_stem);
+                ctx.module_fn_registry[idx].fn_name =
+                    arena_strdup(ctx.mod->arena, decl->name);
+                ctx.module_fn_registry[idx].ir_symbol =
+                    arena_strdup(ctx.mod->arena, mangled);
+                ctx.module_fn_registry[idx].ret_type = ret_type;
+            }
         }
     }
 

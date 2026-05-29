@@ -1,0 +1,22 @@
+// multifile_lib.lceron — sibling module imported by 12_multifile.lceron
+// per L8's `use <name>;` cross-file convention.
+//
+// L8 limitation: the parser only accepts an `identifier` token after
+// `use`, so the module stem must start with a letter. The natural
+// `examples/wasm/poc/<NN>_<name>.lceron` convention used elsewhere in
+// this directory cannot apply to a sibling that ships purely as an
+// L8 import target -- if the file were named "12_multifile_lib.lceron"
+// the importer's `use 12_multifile_lib;` would fail to lex (digits
+// can't lead an identifier). Hence the unprefixed `multifile_lib.lceron`.
+//
+// All top-level fns here are public by default (no `pub` required);
+// their wasm exports mangle to `lcn___multifile_lib_<fn>` so they
+// cannot collide with the importer's own free fns or with any other
+// imported sibling.
+
+fn format_prompt(role: string, context: string) -> string {
+    // String interpolation (L4) keeps the helper portable -- emits a
+    // single host-call-free vdag:string.concat chain. The result is a
+    // plain string the importer can feed straight into llm.classify.
+    "[${role}] please classify: ${context}"
+}

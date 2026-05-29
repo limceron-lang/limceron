@@ -114,12 +114,25 @@ static void use_path_to_filepath(const char *use_path, const char *base_dir,
     out[off] = '\0';
 }
 
-/* Track which files have been imported (cycle detection). */
+/* Track which files have been imported (cycle detection).
+ *
+ * L8 (2026-05-13): we track two layers:
+ *
+ *   - `paths` / `count`         — files we have *ever* visited; used so
+ *                                  diamond imports load each file once.
+ *   - `stack` / `stack_count`   — files currently *on the DFS path*; an
+ *                                  import that resolves to a path already
+ *                                  on this stack is a true cycle and we
+ *                                  raise ERR_CIRCULAR_IMPORT loudly.
+ */
 #define MAX_IMPORT_PATHS 64
 
 typedef struct {
     char paths[MAX_IMPORT_PATHS][512];
     int count;
+    char stack[MAX_IMPORT_PATHS][512];
+    int stack_count;
+    int errors;
 } ImportTracker;
 
 static bool import_visited(ImportTracker *tracker, const char *path) {
@@ -135,6 +148,53 @@ static void import_mark_visited(ImportTracker *tracker, const char *path) {
         tracker->paths[tracker->count][511] = '\0';
         tracker->count++;
     }
+}
+
+/* DFS stack helpers — used purely for true-cycle detection. */
+static bool import_on_stack(ImportTracker *tracker, const char *path) {
+    for (int i = 0; i < tracker->stack_count; i++) {
+        if (strcmp(tracker->stack[i], path) == 0) return true;
+    }
+    return false;
+}
+
+static void import_stack_push(ImportTracker *tracker, const char *path) {
+    if (tracker->stack_count < MAX_IMPORT_PATHS) {
+        strncpy(tracker->stack[tracker->stack_count], path, 511);
+        tracker->stack[tracker->stack_count][511] = '\0';
+        tracker->stack_count++;
+    }
+}
+
+static void import_stack_pop(ImportTracker *tracker) {
+    if (tracker->stack_count > 0) tracker->stack_count--;
+}
+
+/* L8: compute the kebab-friendly module stem from a file path.
+ *   "./examples/multifile/helpers.lceron"     -> "helpers"
+ *   "/x/y/util/math.lceron.md"                -> "math"
+ * Hyphens and dots collapse to underscores so the result is a legal
+ * C/WASM symbol component. Writes at most cap-1 chars + NUL. */
+static void module_stem_from_path(const char *path, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!path) return;
+
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? slash + 1 : path;
+    size_t n = strlen(base);
+
+    /* Strip ".lceron.md" or ".lceron" suffix. */
+    if (n >= 10 && strcmp(base + n - 10, ".lceron.md") == 0) n -= 10;
+    else if (n >= 7 && strcmp(base + n - 7, ".lceron") == 0) n -= 7;
+
+    size_t out_off = 0;
+    for (size_t i = 0; i < n && out_off + 1 < cap; i++) {
+        char c = base[i];
+        if (c == '-' || c == '.') c = '_';
+        out[out_off++] = c;
+    }
+    out[out_off] = '\0';
 }
 
 /* Track which declarations have been seen (deduplication). */
@@ -169,7 +229,18 @@ static void decl_mark_seen(DeclTracker *tracker, AstKind kind, const char *name)
 /* Resolve all `use` imports recursively.
  * target  = top-level program whose params list receives merged declarations.
  * scan    = program currently being scanned for use statements (may differ during recursion).
- * Returns the number of files successfully resolved. */
+ * Returns the number of files successfully resolved.
+ *
+ * L8 (2026-05-13):
+ *   - Cycle detection raises ERR_CIRCULAR_IMPORT when a `use` resolves to a
+ *     file currently on the resolution stack (e.g. A uses B uses A). This is
+ *     distinct from a *diamond* import (A uses B; A uses C; B uses C; C is
+ *     just loaded once silently).
+ *   - Top-level decls imported from a sibling file have their module stem
+ *     stashed in `imp->val.str_val` so the IR-gen / C-codegen passes can
+ *     mangle their symbol as `lcn___<module_stem>_<fn_name>` and keep the
+ *     global symbol space collision-free across modules.
+ */
 static int resolve_imports(AstNode *target, AstNode *scan, const char *base_dir,
                             const char *stdlib_dir,
                             Arena *source_arena, Arena *ast_arena, Arena *intern_arena,
@@ -203,14 +274,30 @@ static int resolve_imports(AstNode *target, AstNode *scan, const char *base_dir,
             }
         }
 
-        /* Cycle check */
+        /* L8: TRUE cycle — file is currently on the DFS stack. */
+        if (import_on_stack(imports, full_path)) {
+            fprintf(stderr,
+                "  import: ERR_CIRCULAR_IMPORT — cycle detected at '%s'\n",
+                full_path);
+            fprintf(stderr, "    cycle path:\n");
+            for (int i = 0; i < imports->stack_count; i++) {
+                fprintf(stderr, "      %s%s\n",
+                        i == 0 ? "  " : "  -> ", imports->stack[i]);
+            }
+            fprintf(stderr, "      -> %s   (cycle)\n", full_path);
+            imports->errors++;
+            continue;
+        }
+
+        /* Diamond / second-encounter: silently skip — already merged once. */
         if (import_visited(imports, full_path)) continue;
         import_mark_visited(imports, full_path);
+        import_stack_push(imports, full_path);
 
         /* Read and parse the imported file */
         size_t len;
         char *source = read_source_file(source_arena, full_path, &len);
-        if (!source) continue;
+        if (!source) { import_stack_pop(imports); continue; }
 
         ErrorReporter file_reporter = reporter_new(full_path, source, len);
         bool had_error = false;
@@ -219,11 +306,19 @@ static int resolve_imports(AstNode *target, AstNode *scan, const char *base_dir,
                                           &file_reporter, &had_error);
         if (had_error || !imported) {
             fprintf(stderr, "  import: %s (parse error, skipping)\n", d->name);
+            import_stack_pop(imports);
             continue;
         }
 
         fprintf(stderr, "  import: %s -> %s (%d declarations)\n",
                 d->name, full_path, ast_list_len(imported->params));
+
+        /* Compute the module stem ("helpers" for "helpers.lceron"), arena-
+         * dup so it outlives the local buffer; this tag is what L8's
+         * module-scoped mangling consults at IR-gen / C-codegen time. */
+        char stem_buf[128];
+        module_stem_from_path(full_path, stem_buf, sizeof(stem_buf));
+        const char *module_stem = arena_strdup(ast_arena, stem_buf);
 
         /* Recurse: resolve imports in the imported file first (depth-first).
          * Always merge into `target` (the top-level program). */
@@ -247,9 +342,22 @@ static int resolve_imports(AstNode *target, AstNode *scan, const char *base_dir,
                 continue;
             }
 
-            /* Check for duplicates */
+            /* Check for duplicates. Cross-module fns intentionally allow
+             * the same simple name (the module-scoped mangler keeps the
+             * IR/C symbol unique), so a duplicate fn from a sibling
+             * module is tagged with its module stem and appended; the
+             * back-end will emit it as `lcn___<stem>_<fn>`. */
             if (imp->name && decl_seen(decls, imp->kind, imp->name)) {
-                /* Silent skip for safe kinds (budget, enum, capability, struct, guard) */
+                if (imp->kind == AST_FN) {
+                    if (!imp->val.str_val) imp->val.str_val = module_stem;
+                    imp->next = NULL;
+                    if (tail) { tail->next = imp; tail = imp; }
+                    else { target->params = imp; tail = imp; }
+                    imp = next_imp;
+                    continue;
+                }
+                /* Silent skip for safe kinds (budget, enum, capability,
+                 * struct, guard); noisy for the rest. */
                 if (imp->kind != AST_BUDGET && imp->kind != AST_ENUM &&
                     imp->kind != AST_CAPABILITY && imp->kind != AST_STRUCT &&
                     imp->kind != AST_GUARD && imp->kind != AST_GUARDSET) {
@@ -260,6 +368,14 @@ static int resolve_imports(AstNode *target, AstNode *scan, const char *base_dir,
                 continue;
             }
 
+            /* L8: tag imported fns with their module stem so the back-end
+             * mangler can produce `lcn___<stem>_<fn>` and keep the symbol
+             * space collision-free across files. Non-fn decls keep their
+             * existing global semantics. */
+            if (imp->kind == AST_FN && !imp->val.str_val) {
+                imp->val.str_val = module_stem;
+            }
+
             /* Register and append */
             if (imp->name) decl_mark_seen(decls, imp->kind, imp->name);
             imp->next = NULL;
@@ -268,6 +384,8 @@ static int resolve_imports(AstNode *target, AstNode *scan, const char *base_dir,
 
             imp = next_imp;
         }
+
+        import_stack_pop(imports);
     }
 
     return files_resolved;
@@ -510,7 +628,11 @@ static int cmd_emit(const char *filename, const char *output_path) {
         ImportTracker import_tracker = {0};
         DeclTracker decl_tracker = {0};
 
+        /* L8: mark + stack-push the entry file so a sibling that
+         * imports back into it is reported as ERR_CIRCULAR_IMPORT
+         * rather than silently re-visited. */
         import_mark_visited(&import_tracker, filename);
+        import_stack_push(&import_tracker, filename);
 
         /* Seed tracker with main program's own declarations */
         {
@@ -525,6 +647,7 @@ static int cmd_emit(const char *filename, const char *output_path) {
                                         stdlib_dir,
                                         &source_arena, &ast_arena, &intern_arena,
                                         &import_tracker, &decl_tracker);
+        import_stack_pop(&import_tracker);
         if (resolved > 0) {
             fprintf(stderr, "  Imports: resolved %d file(s), %d total declarations\n",
                     resolved, ast_list_len(program->params));
@@ -630,8 +753,13 @@ static int cmd_build(const char *input, const char *output, const char *argv0,
         ImportTracker import_tracker = {0};
         DeclTracker decl_tracker = {0};
 
-        /* Mark the main file as visited */
+        /* L8: mark + stack-push the main file so a sibling that
+         * imports back into it is reported as ERR_CIRCULAR_IMPORT
+         * rather than silently re-visited. The stack must hold the
+         * same path the loader will compute when it sees
+         * `use <main_stem>;` in a child module. */
         import_mark_visited(&import_tracker, input);
+        import_stack_push(&import_tracker, input);
 
         /* Seed tracker with main program's own declarations */
         {
@@ -646,9 +774,18 @@ static int cmd_build(const char *input, const char *output, const char *argv0,
                                         stdlib_dir,
                                         &source_arena, &ast_arena, &intern_arena,
                                         &import_tracker, &decl_tracker);
+        import_stack_pop(&import_tracker);
         if (resolved > 0) {
             fprintf(stderr, "  Imports: resolved %d file(s), %d total declarations\n",
                     resolved, ast_list_len(program->params));
+        }
+        if (import_tracker.errors > 0) {
+            fprintf(stderr, "  Imports: aborting build (%d circular import error(s))\n",
+                    import_tracker.errors);
+            arena_free(&source_arena);
+            arena_free(&intern_arena);
+            arena_free(&ast_arena);
+            return 1;
         }
 
         /* 2c. Resolve package dependencies (limceron.toml) */

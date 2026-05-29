@@ -304,6 +304,18 @@ typedef struct {
     /* Health probe: collected from AST_HEALTH node */
     bool        has_health;
     int         health_port;        /* port for /healthz and /readyz endpoints */
+
+    /* L8: module registry for cross-file `use` imports. Populated up-front
+     * from each top-level fn whose `val.str_val` was tagged by the loader
+     * (in main.c::resolve_imports). Lets AST_METHOD_CALL detect a call of
+     * the form `<module>.<fn>(args)` and route to the module-mangled C
+     * symbol `lcn___<module>_<fn>` instead of falling through to the
+     * struct-method / driver / mcp shapes. */
+    struct {
+        const char *stem;           /* e.g. "helpers" */
+        const char *fn_name;        /* e.g. "greet" */
+    } module_fns[256];
+    int         module_fn_count;
 } CodeGen;
 
 static void cg_grow(CodeGen *g, size_t need) {
@@ -3308,6 +3320,32 @@ static void cg_expr(CodeGen *g, AstNode *expr) {
         break;
 
     case AST_METHOD_CALL: {
+        /* L8: cross-module call `<stem>.<fn>(args)` → `lcn___<stem>_<fn>(args)`.
+         * Intercepts BEFORE every existing dispatch shape (metrics,
+         * mcp alias, driver alias, model alias, channel ops, struct
+         * method) so the module-mangled path never gets accidentally
+         * caught by a fallback. The stem must be a bare identifier
+         * that matches a fn merged in from an imported sibling file
+         * (recorded during the pre-registration pass above). */
+        if (expr->left && expr->left->kind == AST_IDENT && expr->left->name &&
+            expr->name) {
+            int mi;
+            for (mi = 0; mi < g->module_fn_count; mi++) {
+                if (strcmp(g->module_fns[mi].stem, expr->left->name) == 0 &&
+                    strcmp(g->module_fns[mi].fn_name, expr->name) == 0) {
+                    cg_fmt(g, "lcn___%s_%s(", expr->left->name, expr->name);
+                    AstNode *arg = expr->params;
+                    while (arg) {
+                        cg_expr(g, arg);
+                        if (arg->next) cg_str(g, ", ");
+                        arg = arg->next;
+                    }
+                    cg_str(g, ")");
+                    goto method_done;
+                }
+            }
+        }
+
         /* Metrics histogram observe: metrics.field.observe(val) */
         if (g->has_metrics && expr->name && strcmp(expr->name, "observe") == 0 &&
             expr->left && expr->left->kind == AST_FIELD_ACCESS &&
@@ -6552,7 +6590,18 @@ static void cg_fn(CodeGen *g, AstNode *fn) {
 
     cg_str(g, "static ");
     cg_type(g, fn->type_expr);
-    cg_fmt(g, " lcn_%s(", fn->name ? fn->name : "anon");
+    /* L8: top-level fns merged from a `use`d sibling file emit as
+     * `lcn___<stem>_<fn>` so two modules can each declare a fn with the
+     * same name without colliding at the C symbol level. Bodies in the
+     * MAIN file keep the bare `lcn_<fn>` shape so existing single-file
+     * call-site lowering (`lcn_<callee>(...)`) keeps resolving without
+     * any additional aliasing layer. */
+    if (fn->val.str_val && fn->val.str_val[0]) {
+        cg_fmt(g, " lcn___%s_%s(", fn->val.str_val,
+               fn->name ? fn->name : "anon");
+    } else {
+        cg_fmt(g, " lcn_%s(", fn->name ? fn->name : "anon");
+    }
 
     AstNode *p = fn->params;
     if (!p) cg_str(g, "void");
@@ -10043,6 +10092,18 @@ static char *codegen_internal_ex(AstNode *program, const char *source_file, Aren
             cg_register_fn_ret(&g, decl->name, arena_strdup(arena, ctype));
             (void)raw;
         }
+        /* L8: top-level fn merged in from a `use`d sibling file. The
+         * loader stashes the module stem on `val.str_val`; record it so
+         * AST_METHOD_CALL can rewrite `helpers.greet(x)` to
+         * `lcn___helpers_greet(x)` and the fn definition itself is
+         * emitted under the same mangled C symbol. */
+        if (decl->kind == AST_FN && decl->name &&
+            decl->val.str_val && decl->val.str_val[0] &&
+            g.module_fn_count < 256) {
+            g.module_fns[g.module_fn_count].stem = decl->val.str_val;
+            g.module_fns[g.module_fn_count].fn_name = decl->name;
+            g.module_fn_count++;
+        }
     }
 
     /* 3. Walk declarations in order, grouped by type */
@@ -10190,14 +10251,23 @@ static char *codegen_internal_ex(AstNode *program, const char *source_file, Aren
             cg_extern_fn(&g, decl);
     }
 
-    /* Pass 5e: forward declarations for all user functions (enables mutual recursion) */
+    /* Pass 5e: forward declarations for all user functions (enables mutual recursion).
+     * L8: respect the module-scoped mangler — a fn carrying a `val.str_val`
+     * module stem must forward-declare under the same `lcn___<stem>_<fn>`
+     * symbol that cg_fn will emit for its body, or the C compiler hits
+     * "static declaration follows non-static" and "implicit declaration"
+     * errors when call-sites resolve through the mangled name. */
     for (decl = program->params; decl; decl = decl->next) {
         if (decl->kind == AST_FN && decl->name
             && !is_codegen_builtin(decl->name)
             && !(decl->is_unsafe && !decl->left)) {
             cg_str(&g, "static ");
             cg_type(&g, decl->type_expr);
-            cg_fmt(&g, " lcn_%s(", decl->name);
+            if (decl->val.str_val && decl->val.str_val[0]) {
+                cg_fmt(&g, " lcn___%s_%s(", decl->val.str_val, decl->name);
+            } else {
+                cg_fmt(&g, " lcn_%s(", decl->name);
+            }
             AstNode *fp = decl->params;
             if (!fp) cg_str(&g, "void");
             while (fp) {

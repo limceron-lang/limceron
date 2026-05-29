@@ -5254,6 +5254,13 @@ static void check_ownership(AstNode *program, ErrorReporter *reporter,
  * any declaration that lacks `pub` is private to its module.
  * Accessing a non-pub declaration from another module is a
  * hard error that blocks compilation.
+ *
+ * L8 (2026-05-13): top-level `fn`s default to PUBLIC. The bare `fn`
+ * form is the implicit public shape; `pub fn` is the explicit form
+ * and is accepted but optional. Other declaration kinds (struct,
+ * enum, const, ...) still need an explicit `pub` to cross module
+ * boundaries. This matches the L8 spec ("All top-level `fn`s in a
+ * module are public by default").
  * ============================================================ */
 
 static int check_module_visibility(AstNode *program,
@@ -5279,6 +5286,11 @@ static int check_module_visibility(AstNode *program,
         /* Skip kinds that don't support pub annotation meaningfully */
         if (decl->kind == AST_USE || decl->kind == AST_MODULE ||
             decl->kind == AST_IMPL || decl->kind == AST_LET) continue;
+
+        /* L8 (2026-05-13): top-level fns default to PUBLIC. The bare
+         * `fn` form is the implicit public shape; `pub fn` is the
+         * explicit form and is accepted but optional. */
+        if (decl->kind == AST_FN) continue;
 
         /* If the declaration is not pub, error — private symbols
          * cannot be accessed from another module */
