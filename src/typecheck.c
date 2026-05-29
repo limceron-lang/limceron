@@ -16,6 +16,14 @@
 #include "lcn.h"
 #include "wit_load.h"
 
+/* L9 Pass 10 entry point. Defined in src/l9_infer.c; not (yet) exposed
+ * in lcn.h to keep the inference IR's helper structs (LcnUnifyTable,
+ * L9SymbolTable) implementation-private. The first argument is the
+ * pipeline's `SymbolTable *` viewed as opaque -- the L9 engine keeps a
+ * structurally identical mirror and casts it back. */
+extern void lcn_l9_infer_types(void *symtab, AstNode *program,
+                               ErrorReporter *reporter, Arena *arena);
+
 /* ============================================================
  * Configuration
  * ============================================================ */
@@ -5533,6 +5541,17 @@ bool typecheck_program(AstNode *program, ErrorReporter *reporter,
     int own_start = reporter->count;
     check_ownership(program, reporter, arena, false);
     int own_warnings = reporter->count - own_start;
+
+    /* Pass 10 (L9): bidirectional type inference. Synth ⇑ on the RHS
+     * of every let; check ⇓ against function-return type boundaries;
+     * coerce int → float where allowed. Engine lives in
+     * src/l9_infer.c. The L9 SymbolTable layout deliberately mirrors
+     * the typecheck pipeline's SymbolTable (see comment at the top of
+     * src/l9_infer.c), so the cast through void* is safe. Returns no
+     * status: failures are surfaced as enforced errors via the
+     * shared reporter and picked up by the enforced-error tally
+     * below. */
+    lcn_l9_infer_types(&st, program, reporter, arena);
 
     /* Total errors minus advisory warnings = enforced errors */
     int total_errors = reporter->count;

@@ -160,8 +160,13 @@ the annotation conflicts with the initialiser.
 Stage0 performs **bidirectional type inference** scoped to each `fn`
 body. Synthesis (⇑) deduces a type from an expression; checking (⇓)
 compares a synthesised type against an expected one. Implementation:
-`src/l9_infer.c`, exposed as `lcn_l9_infer_types` and exercised under
-the `l9_*` test group.
+`src/l9_infer.c`, exposed as `lcn_l9_infer_types`. The walker runs as
+**Pass 10** of `typecheck_program` (after ownership), so every
+`limceron build` / `limceron run` / `limceron emit` invocation
+exercises it and rejects mismatches at the source location instead of
+deferring them to IR-gen or to the wasm linker. The five `l9_infer_*`
+tests in `test/test_runner.c` drive the engine directly; the two
+`l9_pipeline_*` tests drive it via the typecheck pipeline.
 
 ### Synthesis rules
 
@@ -219,8 +224,12 @@ parameters (`fn id<T>(x: T) -> T`) are deferred to L9b.
 
 ### Diagnostics
 
-Two conflicts are reported by the L9 pass:
+Three conflicts are reported by the L9 pass:
 
+- *`cannot unify <A> and <B> in 'let <name>'`*: an explicit
+  annotation on the binding (`let x: int = "x"`) conflicts with the
+  synthesised type of the initialiser. Either remove the annotation
+  or change the initialiser.
 - *`cannot unify <A> and <B> -- `if` branches disagree*: the two
   branches of an `if` expression infer to incompatible primitives.
   Either coerce one side (`a as float`) or restructure the branches.
@@ -229,9 +238,10 @@ Two conflicts are reported by the L9 pass:
   declared return type. Either change the body or change the return
   annotation -- function boundaries are not inferred.
 
-Both diagnostics print the unified-or-not types as `int`, `float`,
-`bool`, `string`, `()`, or `T#N` (an unresolved type variable). Opaque
-types (`Result`, `Json`, `MyStruct`, ...) are printed by name.
+All three diagnostics print the unified-or-not types as `int`,
+`float`, `bool`, `string`, `()`, or `T#N` (an unresolved type
+variable). Opaque types (`Result`, `Json`, `MyStruct`, ...) are
+printed by name.
 
 ## Operators
 

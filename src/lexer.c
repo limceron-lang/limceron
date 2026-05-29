@@ -193,7 +193,19 @@ static void emit_diagnostic(ErrorReporter *r, SourceLoc loc,
 
     CompileError *e = &r->errors[r->count++];
     e->loc = loc;
-    e->message = message;
+    /* Copy the message into the per-slot buffer so callers that pass a
+     * stack-allocated buffer (e.g. report_error_fmt's local `buf`) do
+     * not leave us with a dangling pointer once they return. */
+    if (message) {
+        size_t n = strlen(message);
+        if (n >= sizeof(e->message_buf)) n = sizeof(e->message_buf) - 1;
+        memcpy(e->message_buf, message, n);
+        e->message_buf[n] = '\0';
+        e->message = e->message_buf;
+    } else {
+        e->message_buf[0] = '\0';
+        e->message = e->message_buf;
+    }
     e->hint = hint;
     e->is_warning = is_warning;
     e->underline_len = underline_len;

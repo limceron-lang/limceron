@@ -289,6 +289,15 @@ typedef struct {
     const char *hint;
     bool        is_warning;
     uint32_t    underline_len;  /* length of ^^^ underline (0 = single ^) */
+    /* Backing storage for `message` when it was produced by
+     * report_error_fmt / report_warning_fmt. Those helpers used to
+     * stash a stack-allocated buffer pointer into `message`, which
+     * dangled the moment the helper returned -- usually harmless
+     * because nothing else ran in between, but the L9 inference pass
+     * (Pass 10) trampled the area on every subsequent function and
+     * left earlier errors observably empty. The formatted message is
+     * now copied here and `message` aliases this slot. */
+    char        message_buf[512];
 } CompileError;
 
 typedef struct {

@@ -8220,6 +8220,81 @@ TEST(l9_infer_return_type_mismatch) {
     ASSERT(errors >= 1);
 }
 
+/* ------------------------------------------------------------ *
+ * L9 pipeline tests -- exercise the engine through the full
+ * `typecheck_program` flow. Before Pass 10 was wired in
+ * src/typecheck.c, `lcn_l9_infer_types` only ran when called
+ * directly (the tests above). These two tests confirm that the
+ * inference engine now fires as part of the main typecheck
+ * pipeline -- the path the `limceron build` CLI takes -- so a
+ * return-type mismatch in implicit-typed `let` code is surfaced
+ * before IR-gen instead of leaking to the wasm backend.
+ * ------------------------------------------------------------ */
+
+TEST(l9_pipeline_let_inferred_int) {
+    /* The let-bound RHS is `42`, an int literal; with Pass 10 wired
+     * the inferred type for `x` is int, which unifies with the
+     * declared return type. typecheck_program must accept. Before
+     * Pass 10 wiring this also passed (the implicit-typed let was
+     * already accepted by Pass 6), so the assertion here is that
+     * we did not REGRESS valid code by wiring the inference pass. */
+    const char *src =
+        "fn foo() -> int {\n"
+        "    let x = 42\n"
+        "    x\n"
+        "}\n";
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(src);
+    ErrorReporter reporter = reporter_new("<test>", src, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", src, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *prog = parse_program(&parser);
+    bool ok = typecheck_program(prog, &reporter, &test_arena);
+    ASSERT(ok);
+}
+
+TEST(l9_pipeline_return_type_mismatch) {
+    /* The return-type-mismatch case routed through `typecheck_program`.
+     * `x` infers to int, declared return is string, so the L9 walker
+     * must emit `cannot unify int and string in return of fn 'foo'`.
+     * Pre-Pass-10 wiring this would have silently passed Pass 6 and
+     * only failed deep in IR-gen / wasm emission. */
+    const char *src =
+        "fn foo() -> string {\n"
+        "    let x = 42\n"
+        "    x\n"
+        "}\n";
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(src);
+    ErrorReporter reporter = reporter_new("<test>", src, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", src, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *prog = parse_program(&parser);
+    bool ok = typecheck_program(prog, &reporter, &test_arena);
+
+    /* The pipeline must reject -- enforced error count > 0. */
+    ASSERT_FALSE(ok);
+
+    /* The diagnostic must come from Pass 10 (lcn_l9_infer_types).
+     * Match on the substring the engine emits in src/l9_infer.c. */
+    bool found = false;
+    int i;
+    for (i = 0; i < reporter.count; i++) {
+        if (!reporter.errors[i].is_warning &&
+            reporter.errors[i].message &&
+            strstr(reporter.errors[i].message,
+                   "in return of fn 'foo'") != NULL) {
+            found = true;
+            break;
+        }
+    }
+    ASSERT(found);
+}
+
 int main(void) {
     fprintf(stderr, "\n\033[1mLimceron Stage 0 — Test Suite\033[0m\n\n");
 
@@ -8809,6 +8884,8 @@ int main(void) {
     RUN_TEST(l9_infer_if_branches_must_unify);
     RUN_TEST(l9_infer_nested_calls);
     RUN_TEST(l9_infer_return_type_mismatch);
+    RUN_TEST(l9_pipeline_let_inferred_int);
+    RUN_TEST(l9_pipeline_return_type_mismatch);
 
     teardown();
 
