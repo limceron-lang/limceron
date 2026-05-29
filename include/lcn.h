@@ -721,6 +721,63 @@ char *read_source_file(Arena *a, const char *path, size_t *out_len);
  * Type Checker & Semantic Analysis
  * ============================================================ */
 
+/* ============================================================
+ * L9: Bidirectional Type Inference
+ *
+ * Each function body is its own unification scope. Synthesis (up)
+ * deduces an expression's type from the inside-out (operators,
+ * literals, callee return types). Checking (down) compares a
+ * synthesised type against an expected type and either succeeds,
+ * applies a coercion (int -> float), or raises a unification failure.
+ *
+ * Type variables (LCN_TYPE_VAR) are reserved for unresolved sites --
+ * every `let` whose RHS cannot be synthesised yields a fresh var, and
+ * the unification table later collapses it (or surfaces a "cannot
+ * unify A and B" diagnostic). Function boundaries (params + return)
+ * must still carry explicit annotations so the wasm/WIT signature
+ * stays stable -- they never become vars.
+ * ============================================================ */
+
+typedef enum {
+    LCN_LIT_NONE = 0,    /* unknown / not yet inferred */
+    LCN_LIT_UNIT,        /* () */
+    LCN_LIT_INT,
+    LCN_LIT_FLOAT,
+    LCN_LIT_BOOL,
+    LCN_LIT_STRING,
+    LCN_LIT_OPAQUE       /* user-defined / non-primitive (struct, enum, Result, ...) */
+} LcnLitKind;
+
+typedef enum {
+    LCN_TYPE_LIT,        /* concrete primitive */
+    LCN_TYPE_VAR,        /* unresolved unification variable */
+    LCN_TYPE_FUNC        /* params + return -- recorded for callee lookups */
+} LcnTypeKind;
+
+typedef struct LcnType LcnType;
+struct LcnType {
+    LcnTypeKind  kind;
+    LcnLitKind   lit;             /* LCN_TYPE_LIT */
+    const char  *opaque_name;     /* LCN_TYPE_LIT(OPAQUE) / LCN_TYPE_FUNC */
+    int          var_id;          /* LCN_TYPE_VAR */
+    LcnType     *func_ret;        /* LCN_TYPE_FUNC */
+};
+
+#define LCN_INFER_MAX_VARS 1024
+
+typedef struct {
+    LcnType *bindings[LCN_INFER_MAX_VARS];
+    int      count;
+    Arena   *arena;
+} LcnUnifyTable;
+
+LcnUnifyTable lcn_unify_table_new(Arena *arena);
+LcnType      *lcn_type_fresh_var(LcnUnifyTable *tbl);
+LcnType      *lcn_type_lit(Arena *arena, LcnLitKind lit);
+LcnType      *lcn_type_resolve(LcnUnifyTable *tbl, LcnType *t);
+bool          lcn_unify(LcnUnifyTable *tbl, LcnType *a, LcnType *b);
+const char   *lcn_type_to_string(LcnUnifyTable *tbl, Arena *arena, LcnType *t);
+
 /* Run all type-checking passes on a parsed program.
  * Returns true if no errors were found. */
 bool typecheck_program(AstNode *program, ErrorReporter *reporter, Arena *arena);

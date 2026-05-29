@@ -78,7 +78,8 @@ endif
 
 # Source files (order matters for dependencies)
 S0_SRCS    := $(S0_SRC)/arena.c $(S0_SRC)/lexer.c $(S0_SRC)/parser.c \
-              $(S0_SRC)/markdown.c $(S0_SRC)/typecheck.c $(S0_SRC)/codegen.c \
+              $(S0_SRC)/markdown.c $(S0_SRC)/typecheck.c \
+              $(S0_SRC)/l9_infer.c $(S0_SRC)/codegen.c \
               $(S0_SRC)/ir_gen.c $(S0_SRC)/ir_emit_arm64.c $(S0_SRC)/ir_emit_x86.c \
               $(S0_SRC)/ir_emit_wasm.c $(S0_SRC)/wit_emit.c $(S0_SRC)/wit_load.c \
               $(S0_SRC)/lsp.c $(S0_SRC)/package.c \
@@ -89,13 +90,16 @@ S0_OBJS    := $(patsubst $(S0_SRC)/%.c,build/stage0/%.o,$(S0_SRCS))
 S0_LIB_OBJS := $(filter-out build/stage0/main.o,$(S0_OBJS))
 
 # Test sources
-S0_TEST_SRC    := $(S0_TEST)/test_runner.c
-S0_TEST_IR_SRC := $(S0_TEST)/test_ir.c
+S0_TEST_SRC     := $(S0_TEST)/test_runner.c
+S0_TEST_IR_SRC  := $(S0_TEST)/test_ir.c
+S0_TEST_LSP_SRC := $(S0_TEST)/test_lsp.c
 
 # Output
-S0_BIN     := build/limceron-stage0
-TEST_BIN   := build/test-stage0
-TEST_IR_BIN := build/test-ir
+S0_BIN       := build/limceron-stage0
+S0_LSP_BIN   := build/limceron-lsp
+TEST_BIN     := build/test-stage0
+TEST_IR_BIN  := build/test-ir
+TEST_LSP_BIN := build/test-lsp
 
 # Stage 1 & 2
 S1_DIR     := stage1
@@ -110,10 +114,10 @@ BUILD_DIR  := build
 # ============================================================
 
 .PHONY: all bootstrap stage0 stage1 stage1-build stage2 stage2-build verify clean install test test-stage0 \
-        test-ir test-stage1 test-parity test-multifile test-bootstrap lex parse emit build-lceron run runtime dashboard \
-        poc-wasm
+        test-ir test-lsp test-stage1 test-parity test-multifile test-bootstrap lex parse emit build-lceron run runtime dashboard \
+        poc-wasm lsp
 
-all: stage0
+all: stage0 lsp
 
 # Full bootstrap: Stage 0 (C) -> Stage 1 (self-hosted) -> Stage 2 (self-compiled) -> verify
 bootstrap: stage0 stage1-build stage2-build test-bootstrap
@@ -150,7 +154,7 @@ build/runtime/sqlite3.o: $(RT_DIR)/sqlite3.c | build/runtime
 
 # -- Tests --
 
-test: test-stage0 test-ir test-multifile
+test: test-stage0 test-ir test-lsp test-multifile
 
 test-stage0: $(TEST_BIN)
 	@./$(TEST_BIN)
@@ -167,6 +171,29 @@ $(TEST_IR_BIN): $(S0_TEST_IR_SRC) $(S0_LIB_OBJS) $(S0_INC)/lcn.h $(S0_SRC)/ir.h 
 	$(CC) $(S0_CFLAGS) -I$(S0_TEST) -o $@ $(S0_TEST_IR_SRC) $(S0_LIB_OBJS) $(LDFLAGS)
 	@xattr -dr com.apple.quarantine $@ 2>/dev/null || true
 	@xattr -dr com.apple.provenance $@ 2>/dev/null || true
+
+# -- L10: LSP test suite + standalone LSP binary --
+
+test-lsp: $(TEST_LSP_BIN)
+	@./$(TEST_LSP_BIN)
+
+$(TEST_LSP_BIN): $(S0_TEST_LSP_SRC) $(S0_LIB_OBJS) $(S0_INC)/lcn.h $(S0_TEST)/test.h | $(BUILD_DIR)
+	$(CC) $(S0_CFLAGS) -I$(S0_TEST) -o $@ $(S0_TEST_LSP_SRC) $(S0_LIB_OBJS) $(LDFLAGS)
+	@xattr -dr com.apple.quarantine $@ 2>/dev/null || true
+	@xattr -dr com.apple.provenance $@ 2>/dev/null || true
+
+# `make lsp` builds the standalone limceron-lsp binary. The LSP code
+# ships inside limceron-stage0 (the `lsp` subcommand) so the standalone
+# is a tiny wrapper that drives cmd_lsp() directly.
+lsp: $(S0_LSP_BIN)
+	@echo "=== limceron-lsp ready: $(S0_LSP_BIN) ==="
+
+$(S0_LSP_BIN): $(S0_LIB_OBJS) $(S0_INC)/lcn.h | $(BUILD_DIR)
+	@printf '#include "lcn.h"\nint main(int argc, char **argv) { (void)argc; (void)argv; return cmd_lsp(); }\n' > build/lsp_main.c
+	$(CC) $(S0_CFLAGS) -o $@ build/lsp_main.c $(S0_LIB_OBJS) $(LDFLAGS)
+	@xattr -dr com.apple.quarantine $@ 2>/dev/null || true
+	@xattr -dr com.apple.provenance $@ 2>/dev/null || true
+	@rm -f build/lsp_main.c
 
 # -- Multi-file integration test --
 

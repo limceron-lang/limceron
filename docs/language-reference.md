@@ -149,6 +149,90 @@ y = y + 1
 
 `let mut` is required for assignment. Type inferred from initialiser.
 
+An optional annotation is still accepted (`let x: int = 42`) for cases
+where the author wants the binding to read as a contract — but it is no
+longer required for stage0 to infer the type. See §Type Inference (L9)
+below for the synthesis / checking rules and the diagnostics raised when
+the annotation conflicts with the initialiser.
+
+## Type Inference (L9)
+
+Stage0 performs **bidirectional type inference** scoped to each `fn`
+body. Synthesis (⇑) deduces a type from an expression; checking (⇓)
+compares a synthesised type against an expected one. Implementation:
+`src/l9_infer.c`, exposed as `lcn_l9_infer_types` and exercised under
+the `l9_*` test group.
+
+### Synthesis rules
+
+| Form | Inferred type |
+|---|---|
+| Integer literal (`42`, `0xff`) | `int` |
+| Float literal (`1.5`) | `float` |
+| Boolean literal (`true`, `false`) | `bool` |
+| String literal (`"x"`) and interpolated string | `string` |
+| `f(...)` -- top-level fn / tool call | callee's declared return type |
+| `a + b`, `a * b`, ... | max of operand types (`int + float` -> `float`) |
+| `a + b` when either side is `string` | `string` (concat) |
+| `a == b`, `a < b`, `a && b`, ... | `bool` |
+| `!x` | `bool` |
+| `if c { a } else { b }` | unified type of both branches |
+| `expr as T` | `T` |
+
+Anything the synthesiser cannot pin down (calls to undeclared
+identifiers, generic references, struct field access, `Result`, `Json`,
+...) becomes a fresh **type variable**. Type variables live in the
+function's `LcnUnifyTable` and are resolved on demand by `lcn_unify`.
+
+### Checking rules
+
+When a context expects a specific type -- e.g. the function's declared
+return type, or the LHS of a `let x: T = ...` -- the inferred RHS is
+checked against the expected type. The check succeeds when:
+
+- both sides resolve to the same primitive (`int == int`), or
+- one side is `int` and the other is `float` (single-step coercion in
+  either direction), or
+- one or both sides are still a type variable (it gets bound to the
+  other side), or
+- one or both sides are opaque (user-defined / non-primitive) -- the
+  pass is deliberately conservative for v1 and accepts these.
+
+`bool -> string` requires an explicit `as string` cast; the same holds
+for `int -> string`. The cast is the only way to bridge non-numeric
+primitives.
+
+### Where annotations are still required
+
+Function boundaries keep their explicit annotations -- the
+wasm/WIT signature is derived from them, so they cannot be inferred
+without breaking the host contract:
+
+```limceron
+fn classify(text: string) -> int { ... }   // params + return REQUIRED
+```
+
+The return type may be omitted only when the function returns unit
+(`()`). Top-level `const` / `let` declarations still require an
+annotation (they participate in cross-file imports). Generic
+parameters (`fn id<T>(x: T) -> T`) are deferred to L9b.
+
+### Diagnostics
+
+Two conflicts are reported by the L9 pass:
+
+- *`cannot unify <A> and <B> -- `if` branches disagree*: the two
+  branches of an `if` expression infer to incompatible primitives.
+  Either coerce one side (`a as float`) or restructure the branches.
+- *`cannot unify <A> and <B> in return of fn '<name>'`*: the tail
+  expression of the body infers to a primitive that does not match the
+  declared return type. Either change the body or change the return
+  annotation -- function boundaries are not inferred.
+
+Both diagnostics print the unified-or-not types as `int`, `float`,
+`bool`, `string`, `()`, or `T#N` (an unresolved type variable). Opaque
+types (`Result`, `Json`, `MyStruct`, ...) are printed by name.
+
 ## Operators
 
 Arithmetic: `+`, `-`, `*`, `/`, `%`.

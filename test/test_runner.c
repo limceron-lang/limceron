@@ -4760,15 +4760,20 @@ TEST(typecheck_pub_fn_accessible) {
 }
 
 TEST(typecheck_priv_fn_error) {
-    /* A private function from another module should fail typecheck */
+    /* L8 (2026-05-13): top-level fns are PUBLIC by default. The bare
+     * `fn` form (no `pub`) is the implicit public shape, so cross-module
+     * fn imports now type-check without an explicit `pub` keyword.
+     * Pre-L8 this asserted the opposite -- the test was flipped when
+     * the L8 multi-file modules feature landed. The `pub` form is still
+     * accepted as the explicit version. */
     bool ok = typecheck_with_foreign_decl(
         "fn helper() -> i32 { return 1 }\n"
         "fn main() -> i32 { return helper() }\n",
         "helper",        /* target to patch */
         "other.lceron",  /* pretend it's from another file */
-        false            /* NOT pub */
+        false            /* NOT pub -- now allowed under L8 */
     );
-    ASSERT_FALSE(ok);
+    ASSERT(ok);
 }
 
 TEST(typecheck_priv_same_module_ok) {
@@ -7806,6 +7811,283 @@ TEST(l7_typecheck_accepts_math_clamp_correct_arity) {
     ASSERT_EQ(typecheck_error_count(good), 0);
 }
 
+/* ============================================================
+ * L8: multi-file modules
+ *
+ * Covers the four guarantees the L8 spec lands:
+ *
+ *   1. Module-level `use helpers;` parses to AST_USE at the top of
+ *      `program->params` (no agent-scope wrapper).
+ *   2. Top-level fns from an imported sibling typecheck without `pub`
+ *      (public by default per L8).
+ *   3. A direct cycle (file A uses B uses A) is detected and the
+ *      loader raises ERR_CIRCULAR_IMPORT. This test uses a one-off
+ *      tmp directory because the loader walks the real filesystem.
+ *   4. Same fn name in two different modules mangles to distinct
+ *      symbols (`lcn___<stem_a>_<fn>` vs `lcn___<stem_b>_<fn>`) so
+ *      the IR / C symbol space stays collision-free.
+ * ============================================================ */
+
+TEST(l8_parse_module_level_use) {
+    /* Module-level `use helpers;` at the top of the file (NOT inside
+     * an agent / capability block). The historical L7 stub already
+     * accepted module-level `use`; this test pins the AST shape so
+     * future refactors don't accidentally re-scope it. */
+    bool err = false;
+    AstNode *p = parse_source("use helpers\nfn main() {}", &err);
+    ASSERT_FALSE(err);
+    ASSERT_NOT_NULL(p);
+    ASSERT_NOT_NULL(p->params);
+    ASSERT_EQ(p->params->kind, AST_USE);
+    ASSERT_STR_EQ(p->params->name, "helpers");
+}
+
+TEST(l8_typecheck_priv_fn_imported_ok) {
+    /* L8: a `fn` (no `pub`) imported from a sibling module typechecks
+     * because top-level fns default to public. This is the inverse of
+     * the legacy typecheck_priv_fn_error test (which was flipped to
+     * ASSERT(ok) in this same suite for the same reason). */
+    bool ok = typecheck_with_foreign_decl(
+        "fn helper() -> i32 { return 1 }\n"
+        "fn main() -> i32 { return helper() }\n",
+        "helper",
+        "helpers.lceron",
+        false);
+    ASSERT(ok);
+}
+
+TEST(l8_circular_import_detected) {
+    /* Write two .lceron files in /tmp that import each other and
+     * invoke the stage0 compiler. Compilation MUST mention
+     * ERR_CIRCULAR_IMPORT on stderr; we capture the run via popen so
+     * the test framework's red/green output isn't polluted. */
+    const char *dir = "/tmp/lcn_l8_cycle";
+    /* Best-effort -- ignore mkdir failure if dir already exists. */
+    (void)system("rm -rf /tmp/lcn_l8_cycle && mkdir -p /tmp/lcn_l8_cycle");
+
+    FILE *fa = fopen("/tmp/lcn_l8_cycle/a.lceron", "w");
+    ASSERT_NOT_NULL(fa);
+    fputs("use b\nfn from_a() -> int { 1 }\nfn main() {}\n", fa);
+    fclose(fa);
+
+    FILE *fb = fopen("/tmp/lcn_l8_cycle/b.lceron", "w");
+    ASSERT_NOT_NULL(fb);
+    fputs("use a\nfn from_b() -> int { 2 }\n", fb);
+    fclose(fb);
+
+    /* Stage0 prints "ERR_CIRCULAR_IMPORT" on stderr when it sees a
+     * file already on the resolution stack. We just need the textual
+     * presence to confirm the cycle path was reported. */
+    FILE *p = popen("./build/limceron-stage0 build "
+                     "/tmp/lcn_l8_cycle/a.lceron "
+                     "-o /tmp/lcn_l8_cycle/a.out 2>&1", "r");
+    ASSERT_NOT_NULL(p);
+    char line[1024];
+    bool saw_cycle = false;
+    while (fgets(line, sizeof(line), p)) {
+        if (strstr(line, "ERR_CIRCULAR_IMPORT")) { saw_cycle = true; break; }
+    }
+    /* Drain remaining output so pclose doesn't block on SIGPIPE. */
+    while (fgets(line, sizeof(line), p)) { /* discard */ }
+    pclose(p);
+    (void)dir;
+    ASSERT(saw_cycle);
+}
+
+TEST(l8_mangling_two_modules_same_fn_name) {
+    /* Verify the mangling rule end-to-end via the codegen pipeline.
+     * We don't have a public IR-symbol enumeration API but the
+     * emitted C source carries the mangled names verbatim, so we
+     * shell out to the compiler in `emit` mode and grep for the two
+     * expected `lcn___<stem>_greet` symbols. */
+    const char *dir = "/tmp/lcn_l8_dupfn";
+    (void)system("rm -rf /tmp/lcn_l8_dupfn && mkdir -p /tmp/lcn_l8_dupfn");
+
+    FILE *fmain = fopen("/tmp/lcn_l8_dupfn/main.lceron", "w");
+    ASSERT_NOT_NULL(fmain);
+    fputs("use alpha\nuse beta\n"
+          "fn main() { let _ = alpha.greet(\"x\"); let _ = beta.greet(\"y\") }\n",
+          fmain);
+    fclose(fmain);
+
+    FILE *fa = fopen("/tmp/lcn_l8_dupfn/alpha.lceron", "w");
+    ASSERT_NOT_NULL(fa);
+    fputs("fn greet(name: string) -> string { \"A\" }\n", fa);
+    fclose(fa);
+
+    FILE *fb = fopen("/tmp/lcn_l8_dupfn/beta.lceron", "w");
+    ASSERT_NOT_NULL(fb);
+    fputs("fn greet(name: string) -> string { \"B\" }\n", fb);
+    fclose(fb);
+
+    FILE *p = popen("./build/limceron-stage0 emit "
+                     "/tmp/lcn_l8_dupfn/main.lceron 2>/dev/null", "r");
+    ASSERT_NOT_NULL(p);
+    char line[2048];
+    bool saw_alpha = false, saw_beta = false;
+    while (fgets(line, sizeof(line), p)) {
+        if (strstr(line, "lcn___alpha_greet")) saw_alpha = true;
+        if (strstr(line, "lcn___beta_greet"))  saw_beta  = true;
+    }
+    pclose(p);
+    (void)dir;
+    ASSERT(saw_alpha);
+    ASSERT(saw_beta);
+}
+
+/* ============================================================
+ * L9 (bidirectional type inference) tests
+ *
+ * The L9 inference engine (LcnUnifyTable + lcn_unify + the walker in
+ * src/l9_infer.c) is exercised directly via `lcn_l9_infer_types`.
+ * Each test parses a snippet, hands the AST + a fresh symbol table to
+ * the inference pass, and inspects the reporter for the expected
+ * diagnostic.
+ * ============================================================ */
+
+typedef enum {
+    L9T_SYM_FN,
+    L9T_SYM_AGENT,
+    L9T_SYM_TOOL,
+    L9T_SYM_CAPABILITY,
+    L9T_SYM_GUARD,
+    L9T_SYM_GUARDSET,
+    L9T_SYM_BUDGET,
+    L9T_SYM_TAINT,
+    L9T_SYM_STRUCT,
+    L9T_SYM_ENUM,
+    L9T_SYM_TRAIT,
+    L9T_SYM_INTERFACE,
+    L9T_SYM_CONST,
+    L9T_SYM_SUPERVISOR,
+    L9T_SYM_SKILL,
+    L9T_SYM_PROMPT,
+    L9T_SYM_MESH,
+    L9T_SYM_MEMORY,
+    L9T_SYM_CHANNEL,
+    L9T_SYM_ROUTER,
+    L9T_SYM_STRATEGY,
+    L9T_SYM_LET,
+    L9T_SYM_TYPE_ALIAS
+} L9TSymKind;
+
+typedef struct {
+    const char *name;
+    int         kind;
+    AstNode    *node;
+    SourceLoc   loc;
+} L9TSymbol;
+
+typedef struct {
+    L9TSymbol entries[4096];
+    int       count;
+} L9TSymbolTable;
+
+extern void lcn_l9_infer_types(void *symtab, AstNode *program,
+                               ErrorReporter *reporter, Arena *arena);
+
+static int l9_run_infer(const char *source, char *first_msg, size_t msg_cap) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+
+    size_t len = strlen(source);
+    ErrorReporter reporter = reporter_new("<test>", source, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", source, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *program = parse_program(&parser);
+    if (parser.had_error) return -1;
+
+    L9TSymbolTable st;
+    memset(&st, 0, sizeof(st));
+    for (AstNode *d = program->params; d; d = d->next) {
+        if (d->kind == AST_FN && d->name && st.count < 4096) {
+            st.entries[st.count].name = d->name;
+            st.entries[st.count].kind = (int)L9T_SYM_FN;
+            st.entries[st.count].node = d;
+            st.entries[st.count].loc  = d->loc;
+            st.count++;
+        }
+    }
+
+    lcn_l9_infer_types(&st, program, &reporter, &test_arena);
+
+    int errors = 0;
+    int i;
+    for (i = 0; i < reporter.count; i++) {
+        if (!reporter.errors[i].is_warning) {
+            if (errors == 0 && first_msg && msg_cap > 0 &&
+                reporter.errors[i].message) {
+                size_t n = strlen(reporter.errors[i].message);
+                if (n >= msg_cap) n = msg_cap - 1;
+                memcpy(first_msg, reporter.errors[i].message, n);
+                first_msg[n] = '\0';
+            }
+            errors++;
+        }
+    }
+    return errors;
+}
+
+TEST(l9_infer_int_literal) {
+    int errors = l9_run_infer(
+        "fn main() -> int {\n"
+        "    let x = 42\n"
+        "    x\n"
+        "}\n",
+        NULL, 0);
+    ASSERT_EQ(errors, 0);
+}
+
+TEST(l9_infer_from_callee_return) {
+    int errors = l9_run_infer(
+        "fn some_int_fn() -> int { 7 }\n"
+        "fn main() -> int {\n"
+        "    let x = some_int_fn()\n"
+        "    x\n"
+        "}\n",
+        NULL, 0);
+    ASSERT_EQ(errors, 0);
+}
+
+TEST(l9_infer_if_branches_must_unify) {
+    /* Both branches must agree -- int vs string -> unification failure.
+     * (We only assert the error count; the stored message buffer in
+     * ErrorReporter is currently shallow-aliased by report_error_fmt
+     * and can be observed as garbage after multiple emissions.) */
+    int errors = l9_run_infer(
+        "fn main() -> int {\n"
+        "    let x = if true { 1 } else { \"a\" }\n"
+        "    42\n"
+        "}\n",
+        NULL, 0);
+    ASSERT(errors >= 1);
+}
+
+TEST(l9_infer_nested_calls) {
+    int errors = l9_run_infer(
+        "fn bar(n: int) -> int { n }\n"
+        "fn foo(n: int) -> int { n }\n"
+        "fn main() -> int {\n"
+        "    let x = foo(bar(42))\n"
+        "    x\n"
+        "}\n",
+        NULL, 0);
+    ASSERT_EQ(errors, 0);
+}
+
+TEST(l9_infer_return_type_mismatch) {
+    /* fn f() -> string { let x = 42; x } -- x infers to int, fn
+     * declares string -> tail (⇓) check raises unification failure. */
+    int errors = l9_run_infer(
+        "fn f() -> string {\n"
+        "    let x = 42\n"
+        "    x\n"
+        "}\n",
+        NULL, 0);
+    ASSERT(errors >= 1);
+}
+
 int main(void) {
     fprintf(stderr, "\n\033[1mLimceron Stage 0 — Test Suite\033[0m\n\n");
 
@@ -8368,6 +8650,19 @@ int main(void) {
     RUN_TEST(l7_parser_use_stdlib_path_accepted);
     RUN_TEST(l7_typecheck_rejects_math_clamp_wrong_arity);
     RUN_TEST(l7_typecheck_accepts_math_clamp_correct_arity);
+
+    fprintf(stderr, "\n── L8: multi-file modules ──\n");
+    RUN_TEST(l8_parse_module_level_use);
+    RUN_TEST(l8_typecheck_priv_fn_imported_ok);
+    RUN_TEST(l8_circular_import_detected);
+    RUN_TEST(l8_mangling_two_modules_same_fn_name);
+
+    fprintf(stderr, "\n── L9: bidirectional type inference ──\n");
+    RUN_TEST(l9_infer_int_literal);
+    RUN_TEST(l9_infer_from_callee_return);
+    RUN_TEST(l9_infer_if_branches_must_unify);
+    RUN_TEST(l9_infer_nested_calls);
+    RUN_TEST(l9_infer_return_type_mismatch);
 
     teardown();
 
