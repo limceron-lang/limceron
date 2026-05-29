@@ -570,6 +570,65 @@ static AstNode *parse_attributes(Parser *p) {
 
 static AstNode *parse_pattern(Parser *p) {
     SourceLoc loc = p->current.loc;
+    /* L6-MARKER-PARSER: extended pattern grammar (wildcards with
+     * binding, kind-tagged literal patterns, qualified host-error
+     * variants). See ROADMAP.md L6 row. */
+
+    /* L6: `_<name>` -- wildcard with binding. Strip the leading `_`
+     * so the downstream catch-all lowering treats it as a plain
+     * ident binding. */
+    if (parser_check(p, TOK_IDENT) && p->current.value.str_val &&
+        p->current.value.str_val[0] == '_' &&
+        p->current.value.str_val[1] != '\0') {
+        const char *raw = p->current.value.str_val;
+        const char *bind = raw + 1;
+        parser_advance(p);
+        if (!parser_check(p, TOK_COLON_COLON) &&
+            !parser_check(p, TOK_DOT)         &&
+            !parser_check(p, TOK_LPAREN)      &&
+            !parser_check(p, TOK_LBRACE)      &&
+            !parser_check(p, TOK_COLON)) {
+            AstNode *n = ast_new(p->arena, AST_PAT_IDENT, loc);
+            n->name = bind;
+            return n;
+        }
+        /* Fall-through: synthesise the underscore-prefixed PAT_IDENT
+         * and continue along the qualified-path branch below. */
+        AstNode *n = ast_new(p->arena, AST_PAT_IDENT, loc);
+        n->name = raw;
+        while (parser_check(p, TOK_DOT) ||
+               parser_check(p, TOK_COLON_COLON)) {
+            bool was_cc = parser_check(p, TOK_COLON_COLON);
+            parser_advance(p);
+            if (parser_check(p, TOK_IDENT)) {
+                const char *next = parser_advance(p).value.str_val;
+                size_t len1 = strlen(n->name);
+                size_t len2 = strlen(next);
+                size_t seplen = was_cc ? 2 : 1;
+                char *qn = (char *)arena_alloc(p->arena,
+                                               len1 + seplen + len2 + 1);
+                memcpy(qn, n->name, len1);
+                if (was_cc) { qn[len1] = ':'; qn[len1 + 1] = ':'; }
+                else        { qn[len1] = '.'; }
+                memcpy(qn + len1 + seplen, next, len2);
+                qn[len1 + seplen + len2] = '\0';
+                n->name = qn;
+            }
+        }
+        if (parser_match(p, TOK_LPAREN)) {
+            n->kind = AST_PAT_ENUM;
+            AstNode *fields = NULL;
+            while (!parser_check(p, TOK_RPAREN) &&
+                   !parser_check(p, TOK_EOF)) {
+                AstNode *f = parse_pattern(p);
+                fields = ast_append(fields, f);
+                if (!parser_match(p, TOK_COMMA)) break;
+            }
+            parser_expect(p, TOK_RPAREN, "after enum pattern");
+            n->params = fields;
+        }
+        return n;
+    }
 
     /* _ wildcard */
     if (parser_check(p, TOK_IDENT) && p->current.value.str_val &&
@@ -578,11 +637,12 @@ static AstNode *parse_pattern(Parser *p) {
         return ast_new(p->arena, AST_PAT_WILDCARD, loc);
     }
 
-    /* Literal patterns */
+    /* Literal patterns. L6: stamp pat->name with a canonical kind
+     * tag so downstream passes discriminate `false` from `0`. */
     if (parser_check(p, TOK_INT_LIT)) {
         AstNode *n = ast_new(p->arena, AST_PAT_LITERAL, loc);
         n->val.int_val = parser_advance(p).value.int_val;
-        /* Range pattern: 1..=9 or 1..9 */
+        n->name = "int";
         if (parser_check(p, TOK_DOT_DOT) || parser_check(p, TOK_DOT_DOT_EQ)) {
             bool inclusive = parser_check(p, TOK_DOT_DOT_EQ);
             parser_advance(p);
@@ -597,20 +657,25 @@ static AstNode *parse_pattern(Parser *p) {
     if (parser_check(p, TOK_STRING_LIT)) {
         AstNode *n = ast_new(p->arena, AST_PAT_LITERAL, loc);
         n->val.str_val = parser_advance(p).value.str_val;
+        n->name = "str";
         return n;
     }
     if (parser_match(p, TOK_TRUE)) {
         AstNode *n = ast_new(p->arena, AST_PAT_LITERAL, loc);
         n->val.bool_val = true;
+        n->name = "true";
         return n;
     }
     if (parser_match(p, TOK_FALSE)) {
         AstNode *n = ast_new(p->arena, AST_PAT_LITERAL, loc);
         n->val.bool_val = false;
+        n->name = "false";
         return n;
     }
     if (parser_match(p, TOK_NONE)) {
-        return ast_new(p->arena, AST_PAT_LITERAL, loc);
+        AstNode *n = ast_new(p->arena, AST_PAT_LITERAL, loc);
+        n->name = "none";
+        return n;
     }
 
     /* Tuple pattern: (a, b, c) */

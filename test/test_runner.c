@@ -7551,6 +7551,138 @@ TEST(l5_typecheck_host_error_kebab_form_accepted) {
 }
 
 /* ============================================================
+ * L6 surface tests -- general pattern matching: wildcards,
+ * literal patterns, host-error variants, guards, exhaustiveness
+ * and reachability. IR tests live in test/test_ir.c.
+ * ============================================================ */
+
+TEST(l6_parser_underscore_wildcard) {
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x { _ -> 0 }\n"
+        "}\n", &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(m->params->left->kind, AST_PAT_WILDCARD);
+}
+
+TEST(l6_parser_underscore_binding_strips_leading_underscore) {
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x { _v -> v }\n"
+        "}\n", &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    AstNode *pat = m->params->left;
+    ASSERT_EQ(pat->kind, AST_PAT_IDENT);
+    ASSERT_EQ(strcmp(pat->name, "v"), 0);
+}
+
+TEST(l6_parser_literal_int_pattern_tagged_int) {
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x { 42 -> 1   _ -> 0 }\n"
+        "}\n", &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    AstNode *pat = m->params->left;
+    ASSERT_EQ(pat->kind, AST_PAT_LITERAL);
+    ASSERT_EQ(strcmp(pat->name, "int"), 0);
+    ASSERT_EQ(pat->val.int_val, 42);
+}
+
+TEST(l6_parser_guard_attaches_to_arm_params) {
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x { n if n > 100 -> 1   n -> 0 }\n"
+        "}\n", &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    AstNode *first = m->params;
+    ASSERT_EQ(first->left->kind, AST_PAT_IDENT);
+    ASSERT_NOT_NULL(first->params);
+}
+
+TEST(l6_parser_nested_enum_pattern_with_literal_payload) {
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(r: int) -> int {\n"
+        "    match r {\n"
+        "        Result::Ok(0) -> 999\n"
+        "        Result::Ok(v) -> v\n"
+        "        Result::Err(e) -> e\n"
+        "    }\n"
+        "}\n", &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    AstNode *pat0 = m->params->left;
+    ASSERT_EQ(pat0->kind, AST_PAT_ENUM);
+    ASSERT_EQ(pat0->params->kind, AST_PAT_LITERAL);
+    ASSERT_EQ(strcmp(pat0->params->name, "int"), 0);
+}
+
+TEST(l6_typecheck_bool_match_both_arms_passes) {
+    const char *src =
+        "fn pick(b: bool) -> int {\n"
+        "    match b { true -> 1   false -> 0 }\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l6_typecheck_bool_match_missing_false_raises) {
+    const char *src =
+        "fn pick(b: bool) -> int {\n"
+        "    match b { true -> 1 }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l6_typecheck_int_match_without_wildcard_raises) {
+    const char *src =
+        "fn pick(x: int) -> int {\n"
+        "    match x { 0 -> 1   1 -> 2 }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l6_typecheck_int_match_with_wildcard_passes) {
+    const char *src =
+        "fn pick(x: int) -> int {\n"
+        "    match x { 0 -> 1   1 -> 2   _ -> 99 }\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l6_typecheck_result_with_wildcard_satisfies_exhaustiveness) {
+    const char *src =
+        "fn pick(r: int) -> int {\n"
+        "    match r { Result::Ok(v) -> v   _ -> 0 }\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l6_typecheck_unreachable_arm_after_catchall_raises) {
+    const char *src =
+        "fn pick(x: int) -> int {\n"
+        "    match x { _ -> 1   2 -> 2 }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_MATCH_UNREACHABLE_ARM"));
+}
+
+TEST(l6_typecheck_guarded_catchall_does_not_satisfy_exhaustiveness) {
+    const char *src =
+        "fn pick(x: int) -> int {\n"
+        "    match x { 0 -> 1   n if n > 0 -> 2 }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+/* ============================================================
  * L4: string interpolation -- ${var} syntax
  * ============================================================ */
 
@@ -8631,6 +8763,20 @@ int main(void) {
     RUN_TEST(l5_typecheck_host_error_unknown_variant_raises);
     RUN_TEST(l5_typecheck_host_error_known_variant_accepted);
     RUN_TEST(l5_typecheck_host_error_kebab_form_accepted);
+
+    fprintf(stderr, "\n── L6: pattern matching -- wildcards, literals, guards, nested ──\n");
+    RUN_TEST(l6_parser_underscore_wildcard);
+    RUN_TEST(l6_parser_underscore_binding_strips_leading_underscore);
+    RUN_TEST(l6_parser_literal_int_pattern_tagged_int);
+    RUN_TEST(l6_parser_guard_attaches_to_arm_params);
+    RUN_TEST(l6_parser_nested_enum_pattern_with_literal_payload);
+    RUN_TEST(l6_typecheck_bool_match_both_arms_passes);
+    RUN_TEST(l6_typecheck_bool_match_missing_false_raises);
+    RUN_TEST(l6_typecheck_int_match_without_wildcard_raises);
+    RUN_TEST(l6_typecheck_int_match_with_wildcard_passes);
+    RUN_TEST(l6_typecheck_result_with_wildcard_satisfies_exhaustiveness);
+    RUN_TEST(l6_typecheck_unreachable_arm_after_catchall_raises);
+    RUN_TEST(l6_typecheck_guarded_catchall_does_not_satisfy_exhaustiveness);
 
     fprintf(stderr, "\n── L4: string interpolation -- ${var} ──\n");
     RUN_TEST(l4_lex_plain_string_stays_string_lit);

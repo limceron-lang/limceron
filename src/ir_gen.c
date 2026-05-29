@@ -870,6 +870,279 @@ static int irgen_call(IrGenContext *ctx, AstNode *expr) {
  * ============================================================ */
 
 /* L6 marker -- general match decision-tree lowering follows. */
+static bool l6_pat_ident_is_qualified(const AstNode *pat) {
+    if (!pat || pat->kind != AST_PAT_IDENT || !pat->name) return false;
+    for (const char *q = pat->name; q[0] && q[1]; q++) {
+        if (q[0] == ':' && q[1] == ':') return true;
+    }
+    return false;
+}
+
+static int irgen_lower_arm_body_l6(IrGenContext *ctx, AstNode *arm,
+                                   int subj, IrBasicBlock *merge_bb,
+                                   IrBasicBlock **out_pred) {
+    int val = -1;
+    *out_pred = NULL;
+    irgen_scope_push(&ctx->scope);
+    AstNode *pat = arm->left;
+    const char *bind = NULL;
+    if (pat) {
+        if (pat->kind == AST_PAT_IDENT && pat->name &&
+            !l6_pat_ident_is_qualified(pat))
+            bind = pat->name;
+        else if (pat->kind == AST_PAT_ENUM && pat->params &&
+                 pat->params->kind == AST_PAT_IDENT && pat->params->name)
+            bind = pat->params->name;
+    }
+    if (bind) {
+        int slot = ir_emit_alloca(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+        ir_emit_store(ctx->current_fn, ctx->mod, subj, slot);
+        irgen_scope_add(&ctx->scope, bind, slot, IR_TYPE_I64);
+    }
+    AstNode *body = arm->right;
+    if (body && body->kind == AST_BLOCK) {
+        AstNode *tail = NULL;
+        for (AstNode *s = body->params; s; s = s->next)
+            if (!s->next && s->kind == AST_EXPR_STMT && s->left) tail = s;
+        for (AstNode *s = body->params; s; s = s->next) {
+            if (s == tail) val = irgen_expr(ctx, s->left);
+            else           irgen_stmt(ctx, s);
+        }
+    } else if (body) {
+        val = irgen_expr(ctx, body);
+    }
+    {
+        IrBasicBlock *cur = ctx->current_fn->current_bb;
+        IrInst *last = cur ? cur->last : NULL;
+        if (!last || (last->op != IR_RET && last->op != IR_JMP &&
+                      last->op != IR_BR)) {
+            ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
+            *out_pred = ctx->current_fn->current_bb;
+        }
+    }
+    irgen_scope_pop(&ctx->scope);
+    return val;
+}
+
+static int irgen_match_decision_tree(IrGenContext *ctx, AstNode *expr) {
+    int arm_count = 0;
+    for (AstNode *a = expr->params; a; a = a->next, arm_count++) {
+        if (a->kind != AST_MATCH_ARM || !a->left) return -1;
+        AstNode *pat = a->left;
+        switch (pat->kind) {
+        case AST_PAT_WILDCARD:
+            break;
+        case AST_PAT_IDENT:
+            if (l6_pat_ident_is_qualified(pat)) {
+                const char *head_end = pat->name;
+                for (const char *q = pat->name; *q; q++) {
+                    if (q[0] == ':' && q[1] == ':') { head_end = q; break; }
+                }
+                size_t hlen = (size_t)(head_end - pat->name);
+                if (hlen != 10 ||
+                    (memcmp(pat->name, "host_error", 10) != 0 &&
+                     memcmp(pat->name, "host-error", 10) != 0)) {
+                    return -1;
+                }
+            }
+            break;
+        case AST_PAT_LITERAL:
+            if (pat->name && strcmp(pat->name, "str") == 0)  return -1;
+            if (pat->name && strcmp(pat->name, "none") == 0) return -1;
+            break;
+        case AST_PAT_ENUM: {
+            if (!pat->name) return -1;
+            const char *head_end = pat->name;
+            for (const char *q = pat->name; *q; q++) {
+                if (q[0] == ':' && q[1] == ':') { head_end = q; break; }
+                else if (q[0] == '.')           { head_end = q; break; }
+            }
+            size_t hlen = (size_t)(head_end - pat->name);
+            if (hlen == 10 &&
+                (memcmp(pat->name, "host_error", 10) == 0 ||
+                 memcmp(pat->name, "host-error", 10) == 0)) {
+                break;
+            }
+            return -1;
+        }
+        default:
+            return -1;
+        }
+    }
+    if (arm_count == 0) return -1;
+
+    int subj = irgen_expr(ctx, expr->left);
+    if (subj < 0) return -1;
+    IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
+
+    IrBasicBlock *merge_bb = ir_bb_new(ctx->current_fn, ctx->mod,
+                                       "match.merge");
+
+    enum { L6_MATCH_MAX_ARMS = 32 };
+    if (arm_count > L6_MATCH_MAX_ARMS) return -1;
+    IrBasicBlock *arm_pred_bb[L6_MATCH_MAX_ARMS] = {0};
+    IrBasicBlock *arm_body_bb[L6_MATCH_MAX_ARMS] = {0};
+    IrBasicBlock *arm_next_bb[L6_MATCH_MAX_ARMS] = {0};
+    int           arm_val[L6_MATCH_MAX_ARMS];
+    IrBasicBlock *arm_pred[L6_MATCH_MAX_ARMS];
+    int i;
+    for (i = 0; i < arm_count; i++) {
+        char lp[32], lb[32], ln[32];
+        snprintf(lp, sizeof(lp), "match.arm%d", i);
+        snprintf(lb, sizeof(lb), "match.arm%d.body", i);
+        snprintf(ln, sizeof(ln), "match.arm%d.next", i);
+        arm_pred_bb[i] = ir_bb_new(ctx->current_fn, ctx->mod, lp);
+        arm_body_bb[i] = ir_bb_new(ctx->current_fn, ctx->mod, lb);
+        arm_next_bb[i] = ir_bb_new(ctx->current_fn, ctx->mod, ln);
+        arm_val[i] = -1;
+        arm_pred[i] = NULL;
+    }
+    ir_set_current_bb(ctx->current_fn, pre_bb);
+    ir_emit_jmp(ctx->current_fn, ctx->mod, arm_pred_bb[0]->id);
+
+    AstNode *arm = expr->params;
+    for (i = 0; i < arm_count && arm; i++, arm = arm->next) {
+        AstNode *pat = arm->left;
+        bool guarded = (arm->params != NULL);
+
+        ir_set_current_bb(ctx->current_fn, arm_pred_bb[i]);
+        int pred_val = -1;
+        bool is_catchall = false;
+        if (pat->kind == AST_PAT_WILDCARD ||
+            (pat->kind == AST_PAT_IDENT &&
+             !l6_pat_ident_is_qualified(pat))) {
+            is_catchall = true;
+        } else if (pat->kind == AST_PAT_IDENT &&
+                   l6_pat_ident_is_qualified(pat)) {
+            const char *sep = NULL;
+            for (const char *q = pat->name; q[0] && q[1]; q++) {
+                if (q[0] == ':' && q[1] == ':') { sep = q; break; }
+            }
+            if (!sep) return -1;
+            int64_t sentinel = 0;
+            if (!lcn_wit_resolve_host_error("host-error", sep + 2,
+                                            &sentinel))
+                return -1;
+            int lit = ir_emit_const_int(ctx->current_fn, ctx->mod,
+                                        sentinel);
+            pred_val = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                     IR_CMP_EQ, IR_TYPE_BOOL,
+                                     subj, lit);
+        } else if (pat->kind == AST_PAT_LITERAL && pat->name) {
+            if (strcmp(pat->name, "int") == 0) {
+                int lit = ir_emit_const_int(ctx->current_fn, ctx->mod,
+                                            pat->val.int_val);
+                pred_val = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_EQ, IR_TYPE_BOOL,
+                                         subj, lit);
+            } else if (strcmp(pat->name, "true") == 0) {
+                int one = ir_emit_const_int(ctx->current_fn, ctx->mod, 1);
+                pred_val = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_EQ, IR_TYPE_BOOL,
+                                         subj, one);
+            } else if (strcmp(pat->name, "false") == 0) {
+                int zero = ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+                pred_val = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_EQ, IR_TYPE_BOOL,
+                                         subj, zero);
+            } else {
+                return -1;
+            }
+        } else if (pat->kind == AST_PAT_ENUM && pat->name) {
+            const char *sep = NULL;
+            for (const char *q = pat->name; q[0] && q[1]; q++) {
+                if (q[0] == ':' && q[1] == ':') { sep = q; break; }
+            }
+            if (!sep) return -1;
+            int64_t sentinel = 0;
+            if (!lcn_wit_resolve_host_error("host-error", sep + 2,
+                                            &sentinel))
+                return -1;
+            int lit = ir_emit_const_int(ctx->current_fn, ctx->mod,
+                                        sentinel);
+            pred_val = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                     IR_CMP_EQ, IR_TYPE_BOOL,
+                                     subj, lit);
+        } else {
+            return -1;
+        }
+
+        if (is_catchall) {
+            if (guarded) {
+                irgen_scope_push(&ctx->scope);
+                if (pat->kind == AST_PAT_IDENT && pat->name) {
+                    int slot = ir_emit_alloca(ctx->current_fn, ctx->mod,
+                                              IR_TYPE_I64);
+                    ir_emit_store(ctx->current_fn, ctx->mod, subj, slot);
+                    irgen_scope_add(&ctx->scope, pat->name,
+                                    slot, IR_TYPE_I64);
+                }
+                int g = irgen_expr(ctx, arm->params);
+                irgen_scope_pop(&ctx->scope);
+                if (g < 0) return -1;
+                ir_emit_br(ctx->current_fn, ctx->mod, g,
+                           arm_body_bb[i]->id, arm_next_bb[i]->id);
+            } else {
+                ir_emit_jmp(ctx->current_fn, ctx->mod,
+                            arm_body_bb[i]->id);
+            }
+        } else {
+            if (guarded) {
+                char lg[32];
+                snprintf(lg, sizeof(lg), "match.arm%d.guard", i);
+                IrBasicBlock *guard_bb = ir_bb_new(ctx->current_fn,
+                                                   ctx->mod, lg);
+                ir_emit_br(ctx->current_fn, ctx->mod, pred_val,
+                           guard_bb->id, arm_next_bb[i]->id);
+                ir_set_current_bb(ctx->current_fn, guard_bb);
+                irgen_scope_push(&ctx->scope);
+                if (pat->kind == AST_PAT_ENUM && pat->params &&
+                    pat->params->kind == AST_PAT_IDENT &&
+                    pat->params->name) {
+                    int slot = ir_emit_alloca(ctx->current_fn, ctx->mod,
+                                              IR_TYPE_I64);
+                    ir_emit_store(ctx->current_fn, ctx->mod, subj, slot);
+                    irgen_scope_add(&ctx->scope, pat->params->name,
+                                    slot, IR_TYPE_I64);
+                }
+                int g = irgen_expr(ctx, arm->params);
+                irgen_scope_pop(&ctx->scope);
+                if (g < 0) return -1;
+                ir_emit_br(ctx->current_fn, ctx->mod, g,
+                           arm_body_bb[i]->id, arm_next_bb[i]->id);
+            } else {
+                ir_emit_br(ctx->current_fn, ctx->mod, pred_val,
+                           arm_body_bb[i]->id, arm_next_bb[i]->id);
+            }
+        }
+
+        ir_set_current_bb(ctx->current_fn, arm_body_bb[i]);
+        arm_val[i] = irgen_lower_arm_body_l6(ctx, arm, subj, merge_bb,
+                                             &arm_pred[i]);
+
+        ir_set_current_bb(ctx->current_fn, arm_next_bb[i]);
+        if (i + 1 < arm_count) {
+            ir_emit_jmp(ctx->current_fn, ctx->mod,
+                        arm_pred_bb[i + 1]->id);
+        } else {
+            ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
+        }
+    }
+
+    ir_set_current_bb(ctx->current_fn, merge_bb);
+    int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+    IrInst *phi_inst = merge_bb->last;
+    if (phi_inst && phi_inst->op == IR_PHI && phi_inst->id == phi) {
+        for (i = 0; i < arm_count; i++) {
+            if (arm_val[i] >= 0 && arm_pred[i]) {
+                ir_phi_add_incoming(phi_inst, arm_val[i],
+                                    arm_pred[i]->id);
+            }
+        }
+    }
+    return phi;
+}
+
 /* Return true if the qualified host-call name produces a Json handle
  * we should track across let-bindings. Verbs that decode a handle
  * into a primitive (string-value/int-value/bool-value/length/is-null
@@ -1660,7 +1933,9 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
             if (strcmp(tail, "Ok")  == 0) arm_ok  = a;
             if (strcmp(tail, "Err") == 0) arm_err = a;
         }
-        if (arm_count != 2 || !arm_ok || !arm_err) return -1;
+        if (!(arm_count == 2 && arm_ok && arm_err)) {
+            return irgen_match_decision_tree(ctx, expr);
+        }
 
         int subj = irgen_expr(ctx, expr->left);
         if (subj < 0) return -1;

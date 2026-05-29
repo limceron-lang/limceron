@@ -1306,6 +1306,127 @@ TEST(ir_gen_host_error_in_try_catch_end_to_end) {
 }
 
 /* ============================================================
+ * L6: general match decision-tree IR-gen tests.
+ * Verifies the decision-tree shape (one BB per arm + merge PHI),
+ * literal-arm cmp_eq predicates, guards, and host-error dispatch.
+ * ============================================================ */
+
+TEST(l6_ir_gen_int_literal_match_decision_tree) {
+    IrModule *mod = ir_from_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x {\n"
+        "        0 -> 100\n"
+        "        1 -> 200\n"
+        "        _ -> 999\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    int pred_blocks = 0, body_blocks = 0, next_blocks = 0;
+    bool found_merge = false;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        if (!bb->label) continue;
+        if (strncmp(bb->label, "match.arm", 9) == 0) {
+            if      (strstr(bb->label, ".body")) body_blocks++;
+            else if (strstr(bb->label, ".next")) next_blocks++;
+            else                                  pred_blocks++;
+        }
+        if (strcmp(bb->label, "match.merge") == 0) found_merge = true;
+    }
+    ASSERT_EQ(pred_blocks, 3);
+    ASSERT_EQ(body_blocks, 3);
+    ASSERT_EQ(next_blocks, 3);
+    ASSERT(found_merge);
+}
+
+TEST(l6_ir_gen_literal_arm_emits_cmp_eq) {
+    IrModule *mod = ir_from_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x {\n"
+        "        0 -> 1\n"
+        "        1 -> 2\n"
+        "        _ -> 9\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    ASSERT(count_opcode(fn, IR_CMP_EQ) >= 2);
+}
+
+TEST(l6_ir_gen_merge_phi_joins_all_arm_values) {
+    IrModule *mod = ir_from_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x {\n"
+        "        0 -> 100\n"
+        "        1 -> 200\n"
+        "        _ -> 999\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    int merge_phi_count = -1;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        if (!bb->label || strcmp(bb->label, "match.merge") != 0) continue;
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_PHI) merge_phi_count = i->phi_count;
+        }
+    }
+    ASSERT_EQ(merge_phi_count, 3);
+}
+
+TEST(l6_ir_gen_guarded_arm_phi_joins_two_arms) {
+    IrModule *mod = ir_from_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x {\n"
+        "        n if n > 100 -> 999\n"
+        "        n            -> n\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    int merge_phi_count = -1;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        if (!bb->label || strcmp(bb->label, "match.merge") != 0) continue;
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_PHI) merge_phi_count = i->phi_count;
+        }
+    }
+    ASSERT_EQ(merge_phi_count, 2);
+}
+
+TEST(l6_ir_gen_host_error_match_resolves_sentinels) {
+    IrModule *mod = ir_from_source(
+        "fn pick(e: int) -> int {\n"
+        "    match e {\n"
+        "        host_error::quota_exceeded       -> 1\n"
+        "        host_error::cost_budget_exceeded -> 2\n"
+        "        _                                -> 0\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    bool found_neg3 = false, found_neg4 = false;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_CONST_INT && i->imm_int == -3) found_neg3 = true;
+            if (i->op == IR_CONST_INT && i->imm_int == -4) found_neg4 = true;
+        }
+    }
+    ASSERT(found_neg3);
+    ASSERT(found_neg4);
+}
+
+/* ============================================================
  * L4: String interpolation IR-gen tests
  *
  * `"...${expr}..."` lowers to a left-folded chain of
@@ -3137,6 +3258,13 @@ int main(void) {
     RUN_TEST(ir_gen_match_result_cmp_lt_against_zero);
     RUN_TEST(ir_gen_host_error_resolves_to_negative_sentinel);
     RUN_TEST(ir_gen_host_error_in_try_catch_end_to_end);
+
+    fprintf(stderr, "\n-- L6: general match decision tree --\n");
+    RUN_TEST(l6_ir_gen_int_literal_match_decision_tree);
+    RUN_TEST(l6_ir_gen_literal_arm_emits_cmp_eq);
+    RUN_TEST(l6_ir_gen_merge_phi_joins_all_arm_values);
+    RUN_TEST(l6_ir_gen_guarded_arm_phi_joins_two_arms);
+    RUN_TEST(l6_ir_gen_host_error_match_resolves_sentinels);
 
     fprintf(stderr, "\n-- L4: string interpolation --\n");
     RUN_TEST(l4_ir_gen_simple_interp_emits_concat_chain);

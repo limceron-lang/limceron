@@ -3040,42 +3040,187 @@ static void check_expr(SymbolTable *st, AstNode *expr,
     case AST_MATCH:
         check_expr(st, expr->left, reporter, arena);
         {
-            /* L5: exhaustiveness check for `match Result { ... }`. We treat
-             * the match as Result-shaped if any arm pattern's variant tail
-             * is `Ok` or `Err`. In that case both arms must be present
-             * (wildcard / catch-all patterns are L6 work -- see
-             * ROADMAP.md L6 row). Single-arm match raises
-             * ERR_MATCH_INEXHAUSTIVE. */
+            /* L6-MARKER-TYPECHECK: full match exhaustiveness +
+             * reachability check.
+             *
+             * Catch-all arms (AST_PAT_WILDCARD or unguarded
+             * AST_PAT_IDENT without `::`) subsume every value.
+             * Recognised shapes: Result family, host-error enum,
+             * bool literal arms, open literal types (int/string).
+             * Arms after an unguarded catch-all are reported as
+             * ERR_MATCH_UNREACHABLE_ARM. */
             bool saw_ok = false, saw_err = false, looks_resultish = false;
+            bool saw_catchall = false;
+            bool saw_true = false, saw_false = false, looks_boolish = false;
+            bool saw_int_lit = false, saw_str_lit = false;
+            bool looks_host_err = false;
+            char host_err_seen[LCN_WIT_MAX_VARIANTS][LCN_WIT_MAX_NAME];
+            int  host_err_seen_count = 0;
+            int  arm_idx_l6 = 0;
             AstNode *first_arm = expr->params;
-            for (AstNode *arm = expr->params; arm; arm = arm->next) {
+            for (AstNode *arm = expr->params; arm; arm = arm->next, arm_idx_l6++) {
                 if (arm->kind != AST_MATCH_ARM || !arm->left) continue;
                 AstNode *pat = arm->left;
-                if (pat->kind != AST_PAT_ENUM || !pat->name) continue;
-                const char *name = pat->name;
-                const char *tail = name;
-                for (const char *q = name; *q; q++) {
-                    if (q[0] == ':' && q[1] == ':') { tail = q + 2; q++; }
-                    else if (q[0] == '.')           { tail = q + 1; }
+                bool guarded = (arm->params != NULL);
+                if (saw_catchall) {
+                    report_error_fmt(
+                        reporter, arm->loc,
+                        "remove the dead arm",
+                        "ERR_MATCH_UNREACHABLE_ARM: arm #%d follows "
+                        "an unguarded catch-all and can never run",
+                        arm_idx_l6 + 1);
                 }
-                if (strcmp(tail, "Ok")  == 0) { saw_ok  = true; looks_resultish = true; }
-                if (strcmp(tail, "Err") == 0) { saw_err = true; looks_resultish = true; }
+                /* L6: a PAT_IDENT containing `::` is a qualified
+                 * variant reference, NOT a binding catch-all. */
+                bool is_qualified_ident = false;
+                if (pat->kind == AST_PAT_IDENT && pat->name) {
+                    for (const char *q = pat->name; q[0] && q[1]; q++) {
+                        if (q[0] == ':' && q[1] == ':') {
+                            is_qualified_ident = true; break;
+                        }
+                    }
+                }
+                if (pat->kind == AST_PAT_WILDCARD ||
+                    (pat->kind == AST_PAT_IDENT && !is_qualified_ident)) {
+                    if (!guarded && !saw_catchall) saw_catchall = true;
+                    continue;
+                }
+                if (is_qualified_ident ||
+                    (pat->kind == AST_PAT_ENUM && pat->name)) {
+                    const char *name = pat->name;
+                    const char *tail = name;
+                    const char *head_end = name;
+                    for (const char *q = name; *q; q++) {
+                        if (q[0] == ':' && q[1] == ':') {
+                            tail = q + 2; head_end = q; q++;
+                        } else if (q[0] == '.') {
+                            tail = q + 1; head_end = q;
+                        }
+                    }
+                    if (strcmp(tail, "Ok") == 0) {
+                        saw_ok = true; looks_resultish = true;
+                    } else if (strcmp(tail, "Err") == 0) {
+                        saw_err = true; looks_resultish = true;
+                    }
+                    size_t hlen = (size_t)(head_end - name);
+                    if (hlen == 10 &&
+                        (memcmp(name, "host_error", 10) == 0 ||
+                         memcmp(name, "host-error", 10) == 0)) {
+                        looks_host_err = true;
+                        if (!guarded &&
+                            host_err_seen_count < LCN_WIT_MAX_VARIANTS) {
+                            size_t tl = strlen(tail);
+                            if (tl >= LCN_WIT_MAX_NAME)
+                                tl = LCN_WIT_MAX_NAME - 1;
+                            memcpy(host_err_seen[host_err_seen_count],
+                                   tail, tl);
+                            host_err_seen[host_err_seen_count][tl] = '\0';
+                            host_err_seen_count++;
+                        }
+                    }
+                    continue;
+                }
+                if (pat->kind == AST_PAT_LITERAL) {
+                    if (pat->name) {
+                        if (strcmp(pat->name, "true") == 0) {
+                            saw_true = true; looks_boolish = true;
+                        } else if (strcmp(pat->name, "false") == 0) {
+                            saw_false = true; looks_boolish = true;
+                        } else if (strcmp(pat->name, "int") == 0) {
+                            saw_int_lit = true;
+                        } else if (strcmp(pat->name, "str") == 0) {
+                            saw_str_lit = true;
+                        }
+                    } else if (pat->val.str_val) {
+                        saw_str_lit = true;
+                    } else {
+                        saw_int_lit = true;
+                    }
+                }
             }
-            if (looks_resultish && (!saw_ok || !saw_err)) {
+            if (looks_resultish && !saw_catchall && (!saw_ok || !saw_err)) {
                 report_error_fmt(
                     reporter,
                     first_arm ? first_arm->loc : expr->loc,
-                    "add the missing arm (wildcard patterns are L6)",
+                    "add the missing arm or a `_` catch-all",
                     "ERR_MATCH_INEXHAUSTIVE: match over Result requires "
                     "both Ok(_) and Err(_) arms (saw %s%s)",
                     saw_ok  ? "Ok "  : "",
                     saw_err ? "Err " : "");
+            } else if (looks_host_err && !saw_catchall) {
+                const LcnWitEnum *e = lcn_wit_shared_enum("host-error");
+                if (e) {
+                    char missing[256] = {0};
+                    size_t mlen = 0;
+                    int missing_count = 0;
+                    int i;
+                    for (i = 0; i < e->variant_count; i++) {
+                        const char *vname = e->variants[i].name;
+                        bool found = false;
+                        int j;
+                        for (j = 0; j < host_err_seen_count; j++) {
+                            const char *a = host_err_seen[j];
+                            const char *b = vname;
+                            bool eq = true;
+                            while (*a && *b) {
+                                char ca = (*a == '_') ? '-' : *a;
+                                char cb = (*b == '_') ? '-' : *b;
+                                if (ca != cb) { eq = false; break; }
+                                a++; b++;
+                            }
+                            if (eq && *a == '\0' && *b == '\0') {
+                                found = true; break;
+                            }
+                        }
+                        if (!found) {
+                            missing_count++;
+                            if (mlen < sizeof(missing) - 32) {
+                                int n = snprintf(missing + mlen,
+                                                 sizeof(missing) - mlen,
+                                                 "%s%s",
+                                                 mlen ? ", " : "",
+                                                 vname);
+                                if (n > 0) mlen += (size_t)n;
+                            }
+                        }
+                    }
+                    if (missing_count > 0) {
+                        report_error_fmt(
+                            reporter,
+                            first_arm ? first_arm->loc : expr->loc,
+                            "add the missing variant(s) or a `_` catch-all",
+                            "ERR_MATCH_INEXHAUSTIVE: match over "
+                            "host-error is missing %d variant(s): %s",
+                            missing_count, missing);
+                    }
+                }
+            } else if (looks_boolish && !saw_catchall &&
+                       (!saw_true || !saw_false)) {
+                report_error_fmt(
+                    reporter,
+                    first_arm ? first_arm->loc : expr->loc,
+                    "add the missing bool arm or a `_` catch-all",
+                    "ERR_MATCH_INEXHAUSTIVE: match over bool requires "
+                    "both true and false arms (saw %s%s)",
+                    saw_true  ? "true "  : "",
+                    saw_false ? "false " : "");
+            } else if (!saw_catchall && !looks_resultish && !looks_host_err &&
+                       !looks_boolish && (saw_int_lit || saw_str_lit)) {
+                report_error_fmt(
+                    reporter,
+                    first_arm ? first_arm->loc : expr->loc,
+                    "add a `_` catch-all arm",
+                    "ERR_MATCH_INEXHAUSTIVE: literal match over %s "
+                    "must end with a wildcard arm",
+                    saw_str_lit ? "string" : "int");
             }
         }
         {
             AstNode *arm = expr->params;
             while (arm) {
                 if (arm->kind == AST_MATCH_ARM) {
+                    if (arm->params)
+                        check_expr(st, arm->params, reporter, arena);
                     check_stmt(st, arm->right, reporter, arena);
                 }
                 arm = arm->next;

@@ -495,9 +495,10 @@ fn classify_or_default(r: int) -> int {
 
 The L5 typechecker enforces exhaustiveness on Result-shaped matches:
 both `Result::Ok(_)` and `Result::Err(_)` arms must be present.
-A single-arm match raises `ERR_MATCH_INEXHAUSTIVE`. Wildcard /
-catch-all patterns (`_ -> ...`) are L6 territory and are NOT
-recognised as a substitute for the missing arm today.
+A single-arm match raises `ERR_MATCH_INEXHAUSTIVE`. L6 relaxes this:
+a wildcard / catch-all arm (`_ -> ...`) now satisfies exhaustiveness
+on a Result-shaped match -- see the "Pattern matching" section
+below.
 
 The lowering mirrors `try/catch`: one `cmp_lt %r, 0` split, two
 arm blocks (`match.ok`, `match.err`), and a join block
@@ -547,6 +548,99 @@ propagator catches it; an enclosing `try/catch` recovers it; a
 the wasm module on its own -- traps are reserved for the L11/L13
 budget fences (which themselves return -9 / -10 through the same
 encoding).
+
+## Pattern matching (L6)
+
+L6 extends `match` from the L5 two-arm Result form to a general
+decision tree. The supported pattern surface is:
+
+| Pattern | Example | Notes |
+|---|---|---|
+| Wildcard | `_` | Matches anything. No binding. |
+| Wildcard with binding | `_v` | Matches anything, binds to `v` (leading `_` stripped). |
+| Identifier binding | `n` | Matches anything, binds to `n`. |
+| Integer literal | `0`, `42` | Tagged with `pat->name = "int"`. |
+| Bool literal | `true`, `false` | Tagged with `pat->name = "true" / "false"`. |
+| String literal | `"start"` | Tagged with `pat->name = "str"`. C transpiler only -- IR backend defers. |
+| Tagged-union | `host_error::quota_exceeded` | Resolved to the negative sentinel from `vdag.errors.wit`. |
+| Nested enum | `Result::Ok(0)` | Outer enum + nested payload pattern. |
+| Guarded | `n if n > 100 -> ...` | Predicate `if <expr>` after a binding pattern. |
+
+### Exhaustiveness
+
+The typechecker enforces exhaustiveness depending on the scrutinee
+shape inferred from the arm patterns:
+
+- **Result family** (any arm spelled `Result::Ok` / `Result::Err`):
+  both arms required OR a `_` catch-all.
+- **host-error enum** (heads `host_error::` / `host-error::`):
+  every variant from `vdag.errors.wit` required OR a `_` catch-all.
+  The diagnostic lists the missing variants.
+- **Bool** (any arm spelled `true` or `false`): both arms required
+  OR a `_` catch-all.
+- **Open literal types** (`int` / `string`): a `_` catch-all is
+  mandatory -- the value space cannot be enumerated.
+
+The bare error is `ERR_MATCH_INEXHAUSTIVE` with the kind-specific
+hint (the missing Result arm, the missing host-error variants, the
+missing bool arm, or "add a `_` catch-all").
+
+### Reachability
+
+An arm after an unguarded catch-all is dead -- the L6 pass raises
+`ERR_MATCH_UNREACHABLE_ARM` with the offending arm number. Arms
+after a *guarded* catch-all (`n if <pred> -> ...`) are NOT flagged:
+the guard may fail at runtime, so a subsequent fallback is the
+intended shape.
+
+### Guards
+
+```limceron
+fn classify(x: int) -> int {
+    match x {
+        n if n > 100 -> 999    // guarded: extra runtime predicate
+        n            -> n      // unguarded fallback
+    }
+}
+```
+
+A guarded arm fires only when both the pattern matches AND the
+guard expression returns `true`. The lowering emits the guard inside
+a sub-block; the conditional branch jumps to the body on `true` or
+to the next arm on `false`.
+
+### Lowering shape
+
+The IR backend lowers an N-arm match to a chain of predicate blocks
+joined by a single `match.merge` PHI:
+
+```
+pre:           %v = <subject>
+               jmp @match.arm0
+
+match.arm0:    %p0 = cmp_eq %v, <pat0>     ; (no predicate for catch-all)
+               br %p0, @match.arm0.body, @match.arm0.next
+match.arm0.body:
+               <arm body lowered ; tail -> val0>
+               jmp @match.merge
+match.arm0.next:
+               jmp @match.arm1
+...
+match.merge:
+               %r = phi [val0, pred0] [val1, pred1] ...
+```
+
+Each non-catch-all literal arm contributes a `cmp_eq` predicate.
+Tagged-union arms (`host_error::<v>`) resolve to a `cmp_eq` against
+the negative sentinel. The L5 two-arm `Ok` / `Err` shape still
+lowers via the `cmp_lt %v, 0` short-circuit -- the L6 general path
+kicks in for any non-Result-shaped match.
+
+### Deferred from L6
+
+- Range patterns (`1..=10`) -- parsed since L2, no IR-gen support.
+- Struct / tuple destructuring patterns.
+- `Option<T>` patterns -- gated on generic ADTs (L9).
 
 ## Host calls
 
@@ -852,12 +946,11 @@ backends remain available for embedded and single-tenant edge.
 ## What v1 does NOT support yet
 
 - Generic `Result<T, E>` for `T != i64` — needs tagged-union repr.
-- `match` over Result variants — covered by if-let-style via
-  `try/catch` instead.
-- Inclusive `..=` or reverse ranges.
 - Closures / higher-order functions.
 - `struct` / `enum` declarations beyond the implicit `Result`.
-- Pattern matching beyond `try/catch` binding.
+- Range patterns (`1..=10`) in `match` arms — parsed but no IR-gen.
+- Struct / tuple destructuring patterns in `match` arms.
+- `Option<T>` patterns — gated on generic ADTs (L9).
 
 ## Worked examples
 

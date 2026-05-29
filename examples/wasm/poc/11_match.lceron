@@ -1,0 +1,50 @@
+// 11_match.lceron -- L6 pattern matching showcase.
+//
+// Classifies an LLM response code returned from a host call using
+// the full L6 pattern-matching surface:
+//
+//   * wildcard / catch-all patterns (`_`)
+//   * integer literal patterns (`0`, `1`, `200`)
+//   * tagged-union patterns against the host-error enum
+//     (`host_error::quota_exceeded`, etc.)
+//   * a binding pattern with a guard (`n if n > 100`)
+//
+// The match returns a small integer category code that the agent
+// caller propagates to its dashboard. The lowering ends in a
+// `match.merge` PHI block (see ir_gen.c), so every arm contributes
+// a single SSA value to the result.
+
+agent response_classifier {
+    capabilities: [llm.classify]
+    budget: { max_tokens: 1000, max_cost: 0.10 }
+
+    // classify_response classifies an integer response code into a
+    // small set of category codes. Exhaustive over int because the
+    // last arm is a wildcard catch-all.
+    fn classify_response(code: int) -> int {
+        match code {
+            // Literal patterns: known success-status returns.
+            200 -> 0    // OK
+            201 -> 1    // Created
+            204 -> 2    // No Content
+
+            // Tagged-union patterns: host-error sentinels resolved
+            // against include/vdag.errors.wit.
+            host_error::quota_exceeded         -> 90
+            host_error::cost_budget_exceeded   -> 91
+            host_error::network_not_allowed    -> 92
+
+            // Guarded binding pattern: any value >= 400 is treated
+            // as a client / server error.
+            n if n >= 400 -> 80
+
+            // Wildcard catch-all: everything else falls through here.
+            _ -> 99
+        }
+    }
+
+    fn run() -> int {
+        let code = llm.classify("classify intent: 'hello world'")
+        classify_response(code)
+    }
+}
