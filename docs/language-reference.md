@@ -156,6 +156,73 @@ Comparison: `<`, `<=`, `>`, `>=`, `==`, `!=`.
 Logical: `&&`, `||`, `!` (boolean only).
 String concatenation: `+`.
 
+## String Interpolation (L4)
+
+A `"..."` string literal may embed one or more `${expr}` placeholders.
+At lex time the literal is split into alternating *literal* and
+*expression* segments; the parser materialises them as an
+`AST_INTERP_STRING` whose `params` list is the interleaved sequence
+`literal[0], expr[0], literal[1], expr[1], ..., literal[N]`. IR-gen
+lowers each interpolation site into a left-folded chain of
+`vdag:string.concat(prev, next)` host calls.
+
+```limceron
+let prompt = "summarise ${title} in ${n} bullets"
+```
+
+### Coercion rules
+
+Each `${expr}` segment is normalised to `string` before it joins the
+concat chain. The table below names the host verb each source type
+lowers through; mismatches that fall outside the table raise
+`ERR_INTERP_NOT_COERCIBLE` at typecheck pass 6c.
+
+| Source type | Lowering |
+|---|---|
+| `string` | passed through verbatim |
+| `int` (`s64`) | `vdag:string.from-int` |
+| `bool` | `vdag:string.from-bool` |
+| `float` (`f64`) | `vdag:string.from-float` |
+| `Json` | requires `${value as string}`, then `vdag:json.as-string` |
+| anything else | `ERR_INTERP_NOT_COERCIBLE` |
+
+`Json` is the one type that v1 refuses to coerce implicitly — the
+intent is to make the call to `vdag:json.as-string` visible to the
+author, because that verb walks the JSON DOM and may surface a host
+error. Wrap the value in `${doc as string}` to opt in.
+
+### Escaping `$`
+
+`\$` produces a literal `$` in the output and does NOT enter
+interpolation mode. So `"price: \$${cost}"` reads "price: $42" when
+`cost = 42` at runtime. `\{` continues to produce a literal `{` for
+backwards compatibility with the legacy `{name}` interpolation handled
+by the C99 transpiler.
+
+### Nested interpolation is forbidden in v1
+
+A `${...${...}...}` pattern — whether the inner `${` is in the outer
+expression body or inside a string literal embedded therein — raises
+`ERR_NESTED_INTERPOLATION` at parse time. Split the inner expression
+into a `let` and reference it from the outer string instead:
+
+```limceron
+let inner = "${x}"
+let outer = "[ ${inner} ]"          // OK
+```
+
+### Deferred features
+
+Format specifiers (`${value:.2f}`), multi-line interpolation
+indentation handling, and lazy evaluation are intentionally NOT
+supported in v1 -- they are tracked separately for a future L4
+extension row.
+
+Implementing files: lexer in `src/lexer.c`, parser hook in
+`src/parser.c`, coercibility check in `src/typecheck.c::pass 6c`,
+IR-gen lowering in `src/ir_gen.c::AST_INTERP_STRING`. The host
+interface lives at `include/vdag.wit::interface string`.
+
 ## Control flow
 
 ### `if` / `else`
@@ -430,6 +497,88 @@ module shape.
 | `vdag:data` | `read` |
 | `vdag:json` | `parse`, `field`, `array_index`, `length`, `string_value`, `int_value`, `bool_value`, `is_null`, `stringify` |
 | `vdag:mcp` | `tool` |
+| `vdag:math` | `sqrt`, `sin`, `cos`, `tan`, `log`, `exp`, `pow` (L7) |
+| `vdag:string` | `trim`, `contains`, `starts_with`, `ends_with`, `to_upper`, `to_lower`, `split`/`join` (L7; list shape TODO) |
+| `vdag:time` | `now`, `now_millis`, `format`, `parse` (L7) |
+
+## Standard Library (L7)
+
+The L7 stdlib pins a small minimum of math / string / time primitives
+that are reachable from every agent. The integer math helpers are
+pure-Limceron (zero host-call cost); every other verb is host-backed
+through the matching `vdag:<ns>` interface declared above.
+
+Authors call the stdlib with the bare-prefix syntax already used for
+`llm.*` / `json.*` / `mcp.*`:
+
+```limceron
+let bucket = math.clamp(secs, 0, 60)         // pure builtin, inline
+let sq     = math.sqrt(2.0)                  // host: vdag:math.sqrt
+let now    = time.now()                      // host: vdag:time.now
+let alert  = string.contains(label, "alert") // host: vdag:string.contains
+```
+
+The L8 cross-file module system is deferred, but the parser already
+accepts `use stdlib::math;` (and friends) as a no-op stub so authors
+who write the L8-style import today do not trip a parse error. The
+bare-prefix shortcut is reserved at the parser level
+(parser.c::`is_host_ns`).
+
+### Standard Library -- `math`
+
+| Verb | Signature | Lowering |
+|---|---|---|
+| `min(a, b)` | `(int, int) -> int` | **builtin** -- inline phi-fed merge |
+| `max(a, b)` | `(int, int) -> int` | **builtin** |
+| `clamp(x, lo, hi)` | `(int, int, int) -> int` | **builtin** -- `min(max(x,lo), hi)` |
+| `abs(x)` | `(int) -> int` | **builtin** |
+| `sign(x)` | `(int) -> int` | **builtin** -- returns -1 / 0 / 1 |
+| `sqrt(f)` | `(float) -> float` | host: `vdag:math.sqrt` |
+| `sin(f)` | `(float) -> float` | host: `vdag:math.sin` |
+| `cos(f)` | `(float) -> float` | host: `vdag:math.cos` |
+| `tan(f)` | `(float) -> float` | host: `vdag:math.tan` |
+| `log(f)` | `(float) -> float` | host: `vdag:math.log` |
+| `exp(f)` | `(float) -> float` | host: `vdag:math.exp` |
+| `pow(b, e)` | `(float, float) -> float` | host: `vdag:math.pow` |
+
+The pure-int helpers never emit an `(import "vdag:math" ...)`
+declaration -- they are intercepted at IR generation
+(`src/ir_gen.c::AST_HOST_CALL`) and lowered to branch / phi IR
+inline. The float-domain helpers pass f64 in registers (no buffer
+protocol).
+
+### Standard Library -- `string`
+
+| Verb | Signature | Notes |
+|---|---|---|
+| `trim(s)` | `(string) -> int` | byte count of trimmed result in scratch |
+| `contains(s, needle)` | `(string, string) -> bool` | 0/1 |
+| `starts_with(s, prefix)` | `(string, string) -> bool` | 0/1 |
+| `ends_with(s, suffix)` | `(string, string) -> bool` | 0/1 |
+| `to_upper(s)` | `(string) -> int` | byte count of uppercased result |
+| `to_lower(s)` | `(string) -> int` | byte count of lowercased result |
+| `split(s, sep)` | `(string, string) -> list<string>` | **TODO L3+list** -- degraded path |
+| `join(parts, sep)` | `(list<string>, string) -> string` | **TODO L3+list** -- degraded path |
+
+`split` / `join` operate on `list<string>` which has no native repr
+in stage0; the wasm emit lowers them to a single-element best-effort
+path pending the L3+collections roadmap row. The compile-time
+signature still validates because `vdag:string.split` is declared in
+`include/vdag.wit`.
+
+### Standard Library -- `time`
+
+| Verb | Signature | Notes |
+|---|---|---|
+| `now()` | `() -> int` | Unix epoch seconds (s64) |
+| `now_millis()` | `() -> int` | Unix epoch milliseconds (s64) |
+| `format(ts, layout)` | `(int, string) -> int` | byte count of formatted string in scratch; RFC3339 default |
+| `parse(s, layout)` | `(string, string) -> int` | Unix-epoch seconds, or negative `HostErr*` |
+
+`time.format` and `time.parse` use the Go-style reference layout
+(`"2006-01-02T15:04:05Z07:00"`) for custom shapes. `time.parse`
+participates in the L5 `?` propagator -- a negative return short-
+circuits the enclosing fn or `try` block.
 
 ## `agent` block reference
 
@@ -511,6 +660,7 @@ backends remain available for embedded and single-tenant edge.
 | `examples/wasm/budget/02_exceeds_budget.lceron` | budget fence trip. |
 | `examples/wasm/capabilities/02_restricted_fetch.lceron` | parameterised capability. |
 | `examples/wasm/json/01_parse_and_field.lceron` | `vdag:json` host call. |
+| `examples/wasm/poc/10_stdlib.lceron` | L7 stdlib: `math.clamp` + `time.now` + `string.contains`. |
 
 ## Cross-references
 

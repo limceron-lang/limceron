@@ -1,0 +1,44 @@
+// 09_interpolation.lceron -- L4 PoC: ${var} string interpolation.
+//
+// Builds a prompt template using `"...${expr}..."` syntax, then
+// dispatches it through `llm.classify`. The interpolation lowers
+// into a chain of `vdag:string.concat` calls with the appropriate
+// per-type coercion (`string.from_int` for the bullet count) so
+// the final prompt is a normal `string` argument to the host.
+//
+// Coercion rules enforced by typecheck pass 6c:
+//   - `int|bool|float|string` are implicitly coercible.
+//   - `Json` values require an explicit `${value as string}` cast
+//     (delegated to `vdag:json.as-string`); a bare `${doc}` where
+//     doc:Json is a compile error (ERR_INTERP_NOT_COERCIBLE).
+//   - Nested interpolation (`${...${...}...}`) is forbidden in v1
+//     and raises ERR_NESTED_INTERPOLATION at parse time.
+//
+// Escaping: `\$` produces a literal `$` so the author can write
+// `\$${cost}` and have the prompt read "$<cost>" verbatim.
+
+agent PromptBuilder {
+    capabilities: [llm.classify,
+                   string.concat, string.from_int,
+                   string.from_bool, string.from_float]
+    budget: { max_tokens: 200, max_cost: 0.02 }
+
+    fn main() -> int {
+        let title = "Q3 financial report"
+        let n     = 5
+
+        // Built-in string + int coercion. The lowering becomes:
+        //   string.concat("summarise ", title)
+        //     -> string.concat(_, " in ")
+        //     -> string.concat(_, string.from_int(n))
+        //     -> string.concat(_, " bullets")
+        let prompt = "summarise ${title} in ${n} bullets"
+
+        // The escaped `\$` survives as a literal dollar sign next to
+        // the interpolated value, so the prompt below reads
+        // "estimated cost: $5".
+        let _hint = "estimated cost: \$${n}"
+
+        llm.classify(prompt)?
+    }
+}

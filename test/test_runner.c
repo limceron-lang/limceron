@@ -7545,6 +7545,267 @@ TEST(l5_typecheck_host_error_kebab_form_accepted) {
     ASSERT(!typecheck_emits_error(src, "ERR_HOST_ERROR_UNKNOWN_VARIANT"));
 }
 
+/* ============================================================
+ * L4: string interpolation -- ${var} syntax
+ * ============================================================ */
+
+TEST(l4_lex_plain_string_stays_string_lit) {
+    /* No `${...}` placeholder -> still TOK_STRING_LIT, no
+     * AST_INTERP_STRING node. This protects every existing test
+     * fixture that lexes plain string literals. */
+    int count;
+    Token *tokens = lex_all("\"hello world\"", &count);
+    ASSERT_EQ(tokens[0].kind, TOK_STRING_LIT);
+    ASSERT_EQ(strcmp(tokens[0].value.str_val, "hello world"), 0);
+}
+
+TEST(l4_lex_interpolation_emits_interp_token) {
+    /* `"hello ${name}"` -> single TOK_INTERP_STRING carrying an
+     * InterpString payload with 1 placeholder + 2 literal segments
+     * ("hello " and "" -- the trailing literal is always present
+     * even when empty). */
+    int count;
+    Token *tokens = lex_all("\"hello ${name}\"", &count);
+    ASSERT_EQ(tokens[0].kind, TOK_INTERP_STRING);
+    InterpString *is = tokens[0].value.interp;
+    ASSERT_NOT_NULL(is);
+    ASSERT_EQ(is->count, 1);
+    ASSERT_EQ(strcmp(is->literals[0], "hello "), 0);
+    ASSERT_EQ(strcmp(is->literals[1], ""), 0);
+    ASSERT_EQ(strcmp(is->expr_src[0], "name"), 0);
+    ASSERT_FALSE(is->nested_detected);
+}
+
+TEST(l4_lex_escape_dollar_stays_literal) {
+    /* `\$` produces a literal `$` and does NOT trip interpolation.
+     * `price: \$${cost}` therefore tokens to one TOK_INTERP_STRING
+     * whose literal[0] is "price: $" and whose first ${} captures
+     * `cost`. */
+    int count;
+    Token *tokens = lex_all("\"price: \\$${cost}\"", &count);
+    ASSERT_EQ(tokens[0].kind, TOK_INTERP_STRING);
+    InterpString *is = tokens[0].value.interp;
+    ASSERT_NOT_NULL(is);
+    ASSERT_EQ(is->count, 1);
+    ASSERT_EQ(strcmp(is->literals[0], "price: $"), 0);
+    ASSERT_EQ(strcmp(is->expr_src[0], "cost"), 0);
+}
+
+TEST(l4_lex_detects_nested_interpolation) {
+    /* `${"${x}"}` -- a nested `${` inside an embedded string -- must
+     * set the InterpString's nested_detected flag so the parser
+     * can raise ERR_NESTED_INTERPOLATION. */
+    int count;
+    Token *tokens = lex_all("\"${\"${x}\"}\"", &count);
+    ASSERT_EQ(tokens[0].kind, TOK_INTERP_STRING);
+    InterpString *is = tokens[0].value.interp;
+    ASSERT_NOT_NULL(is);
+    ASSERT(is->nested_detected);
+}
+
+TEST(l4_parser_builds_interp_string_ast) {
+    /* `"hello ${name}"` -> AST_INTERP_STRING whose `params` is a
+     * 3-node list: AST_STRING_LIT("hello "), AST_IDENT("name"),
+     * AST_STRING_LIT(""). Parts are emitted in source order so the
+     * IR-gen pass can fold them into a left-associative concat. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn build() -> string {\n"
+        "    let name = \"world\"\n"
+        "    \"hello ${name}\"\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *is = find_first_kind(p, AST_INTERP_STRING);
+    ASSERT_NOT_NULL(is);
+    ASSERT_EQ(ast_list_len(is->params), 3);
+    AstNode *part0 = is->params;
+    AstNode *part1 = part0->next;
+    AstNode *part2 = part1->next;
+    ASSERT_EQ(part0->kind, AST_STRING_LIT);
+    ASSERT_EQ(strcmp(part0->val.str_val, "hello "), 0);
+    ASSERT_EQ(part1->kind, AST_IDENT);
+    ASSERT_EQ(strcmp(part1->name, "name"), 0);
+    ASSERT_EQ(part2->kind, AST_STRING_LIT);
+    ASSERT_EQ(strcmp(part2->val.str_val, ""), 0);
+}
+
+TEST(l4_parser_nested_interpolation_raises) {
+    /* `"${\"${x}\"}"` -- a `${` inside the string-literal embedded
+     * in an outer `${...}` -- must raise ERR_NESTED_INTERPOLATION at
+     * parse time (the lexer flags it; the parser surfaces it). */
+    const char *src =
+        "fn build() -> int {\n"
+        "    let x = 1\n"
+        "    let _ = \"${\"${x}\"}\"\n"
+        "    0\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_NESTED_INTERPOLATION"));
+}
+
+TEST(l4_typecheck_json_without_cast_raises) {
+    /* A `${doc}` placeholder where `doc: Json` is the bound type
+     * must raise ERR_INTERP_NOT_COERCIBLE -- the author has to spell
+     * out `${doc as string}` so the lowering goes through
+     * `vdag:json.as-string` instead of the implicit
+     * `vdag:string.from_*` path. */
+    const char *src =
+        "agent A {\n"
+        "    capabilities: [json.parse, json.as_string]\n"
+        "    budget: { max_tokens: 1, max_cost: 0.0 }\n"
+        "    fn main() -> string {\n"
+        "        let doc: Json = json.parse(\"{}\")?\n"
+        "        \"value=${doc}\"\n"
+        "    }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_INTERP_NOT_COERCIBLE"));
+}
+
+TEST(l4_typecheck_json_with_cast_accepted) {
+    /* The same shape with `${doc as string}` must NOT raise
+     * ERR_INTERP_NOT_COERCIBLE -- negative control. */
+    const char *src =
+        "agent A {\n"
+        "    capabilities: [json.parse, json.as_string]\n"
+        "    budget: { max_tokens: 1, max_cost: 0.0 }\n"
+        "    fn main() -> string {\n"
+        "        let doc: Json = json.parse(\"{}\")?\n"
+        "        \"value=${doc as string}\"\n"
+        "    }\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_INTERP_NOT_COERCIBLE"));
+}
+
+TEST(l4_typecheck_int_implicit_coercion_ok) {
+    /* int / bool / float / string slip through with no cast --
+     * each lowers to the matching `vdag:string.from_*` host call. */
+    const char *src =
+        "fn build(n: int) -> string {\n"
+        "    \"count=${n}\"\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_INTERP_NOT_COERCIBLE"));
+}
+
+/* ============================================================
+ * L7: stdlib minimum -- math + string + time
+ * ============================================================ */
+
+TEST(l7_parser_math_clamp_call) {
+    /* `math.clamp(x, lo, hi)` parses to a host-call-shaped AST node
+     * whose qualified name is "math.clamp" and which carries three
+     * arg expressions. The IR-gen pass intercepts this name and
+     * lowers it inline as a pure-int builtin -- the parser shape
+     * itself stays uniform with every other `<ns>.<verb>(...)` call. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn f() -> int {\n"
+        "    math.clamp(5, 0, 10)\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *hc = find_first_kind(p, AST_HOST_CALL);
+    ASSERT_NOT_NULL(hc);
+    ASSERT_NOT_NULL(hc->name);
+    ASSERT_EQ(strcmp(hc->name, "math.clamp"), 0);
+    ASSERT_EQ(ast_list_len(hc->params), 3);
+}
+
+TEST(l7_parser_string_contains_call) {
+    /* `string.contains(s, "x")` parses to AST_HOST_CALL with the
+     * qualified "string.contains" name and two arg expressions. The
+     * front-end treats `string` as a reserved host namespace prefix
+     * (parser.c::parse_expr). */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn f(s: string) -> bool {\n"
+        "    string.contains(s, \"x\")\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *hc = find_first_kind(p, AST_HOST_CALL);
+    ASSERT_NOT_NULL(hc);
+    ASSERT_EQ(strcmp(hc->name, "string.contains"), 0);
+    ASSERT_EQ(ast_list_len(hc->params), 2);
+}
+
+TEST(l7_parser_time_now_call) {
+    /* `time.now()` is zero-arg but still flows through AST_HOST_CALL
+     * so the wasm backend can register the import slot. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn f() -> int {\n"
+        "    time.now()\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *hc = find_first_kind(p, AST_HOST_CALL);
+    ASSERT_NOT_NULL(hc);
+    ASSERT_EQ(strcmp(hc->name, "time.now"), 0);
+    ASSERT_EQ(ast_list_len(hc->params), 0);
+}
+
+TEST(l7_parser_use_stdlib_path_accepted) {
+    /* The L8 module system is deferred, but the parser must at least
+     * accept `use stdlib::math;` (the `::` separator commonly used in
+     * doc/L8 examples) without erroring. The path is normalised onto
+     * the existing dotted form so downstream passes keep working. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "use stdlib::math;\n"
+        "fn f() -> int { 0 }\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *u = find_first_kind(p, AST_USE);
+    ASSERT_NOT_NULL(u);
+}
+
+/* Run typecheck for `src` and return the number of non-warning errors
+ * raised. Use this helper when an exact error message string would be
+ * needed -- the global `report_error_fmt` writes its formatted message
+ * into a stack buffer (lexer.c:261) whose contents may be clobbered by
+ * subsequent passes; the count itself stays stable. */
+static int typecheck_error_count(const char *src) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(src);
+    ErrorReporter reporter = reporter_new("<test>", src, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", src, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *prog = parse_program(&parser);
+    (void)typecheck_program(prog, &reporter, &test_arena);
+    int n = 0;
+    int i;
+    for (i = 0; i < reporter.count; i++) {
+        if (!reporter.errors[i].is_warning) n++;
+    }
+    return n;
+}
+
+TEST(l7_typecheck_rejects_math_clamp_wrong_arity) {
+    /* Calling a stdlib fn with the wrong argument count must trip
+     * the host-call signature check (ERR_HOST_CALL_SIGNATURE_MISMATCH)
+     * -- the canonical contract entry in include/vdag.wit declares
+     * math.clamp as a 3-arg fn. We compare error counts because the
+     * formatted error string lives in a stack buffer the subsequent
+     * typecheck passes may clobber. */
+    const char *bad =
+        "fn f() -> int {\n"
+        "    math.clamp(5)\n"
+        "}\n";
+    ASSERT(typecheck_error_count(bad) >= 1);
+}
+
+TEST(l7_typecheck_accepts_math_clamp_correct_arity) {
+    /* Negative control: the correct 3-arg shape must NOT raise any
+     * errors (warnings are allowed). */
+    const char *good =
+        "fn f() -> int {\n"
+        "    math.clamp(5, 0, 10)\n"
+        "}\n";
+    ASSERT_EQ(typecheck_error_count(good), 0);
+}
+
 int main(void) {
     fprintf(stderr, "\n\033[1mLimceron Stage 0 — Test Suite\033[0m\n\n");
 
@@ -8088,6 +8349,25 @@ int main(void) {
     RUN_TEST(l5_typecheck_host_error_unknown_variant_raises);
     RUN_TEST(l5_typecheck_host_error_known_variant_accepted);
     RUN_TEST(l5_typecheck_host_error_kebab_form_accepted);
+
+    fprintf(stderr, "\n── L4: string interpolation -- ${var} ──\n");
+    RUN_TEST(l4_lex_plain_string_stays_string_lit);
+    RUN_TEST(l4_lex_interpolation_emits_interp_token);
+    RUN_TEST(l4_lex_escape_dollar_stays_literal);
+    RUN_TEST(l4_lex_detects_nested_interpolation);
+    RUN_TEST(l4_parser_builds_interp_string_ast);
+    RUN_TEST(l4_parser_nested_interpolation_raises);
+    RUN_TEST(l4_typecheck_json_without_cast_raises);
+    RUN_TEST(l4_typecheck_json_with_cast_accepted);
+    RUN_TEST(l4_typecheck_int_implicit_coercion_ok);
+
+    fprintf(stderr, "\n── L7: stdlib minimum (math + string + time) ──\n");
+    RUN_TEST(l7_parser_math_clamp_call);
+    RUN_TEST(l7_parser_string_contains_call);
+    RUN_TEST(l7_parser_time_now_call);
+    RUN_TEST(l7_parser_use_stdlib_path_accepted);
+    RUN_TEST(l7_typecheck_rejects_math_clamp_wrong_arity);
+    RUN_TEST(l7_typecheck_accepts_math_clamp_correct_arity);
 
     teardown();
 

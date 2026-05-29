@@ -931,6 +931,60 @@ static void emit_host_imports(EmitCtx *ctx) {
             param_list = "(param i32 i32 i32 i32) (result i32)";
         } else if (strcmp(s->qualified, "json.array_len") == 0) {
             param_list = "(param i32) (result i32)";
+
+        /* L4: string-interpolation surface. `concat` takes two
+         * (ptr,len) string pairs and writes a fresh string into the
+         * scratch slot, returning a pointer to the length-prefixed
+         * result. `from_int|from_bool|from_float` take a single scalar
+         * and write its lexical encoding. `length` reports the byte
+         * count of a string for use by callers sizing scratch slots. */
+        } else if (strcmp(s->qualified, "string.concat") == 0) {
+            param_list = "(param i32 i32 i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "string.from_int") == 0) {
+            param_list = "(param i64 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "string.from_bool") == 0) {
+            param_list = "(param i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "string.from_float") == 0) {
+            param_list = "(param f64 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "string.length") == 0) {
+            param_list = "(param i32 i32) (result i32)";
+
+        /* L7: stdlib `math` interface -- float-domain math, pure WASM
+         * f64 in / f64 out. No buffer-protocol overhead. */
+        } else if (strcmp(s->qualified, "math.sqrt") == 0 ||
+                   strcmp(s->qualified, "math.sin")  == 0 ||
+                   strcmp(s->qualified, "math.cos")  == 0 ||
+                   strcmp(s->qualified, "math.tan")  == 0 ||
+                   strcmp(s->qualified, "math.log")  == 0 ||
+                   strcmp(s->qualified, "math.exp")  == 0) {
+            param_list = "(param f64) (result f64)";
+        } else if (strcmp(s->qualified, "math.pow") == 0) {
+            param_list = "(param f64 f64) (result f64)";
+
+        /* L7: stdlib `string` interface -- byte-count-into-scratch for
+         * mutating verbs, predicate (0/1) for boolean ones. */
+        } else if (strcmp(s->qualified, "string.trim") == 0 ||
+                   strcmp(s->qualified, "string.to_upper") == 0 ||
+                   strcmp(s->qualified, "string.to_lower") == 0) {
+            param_list = "(param i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "string.contains") == 0 ||
+                   strcmp(s->qualified, "string.starts_with") == 0 ||
+                   strcmp(s->qualified, "string.ends_with") == 0) {
+            param_list = "(param i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "string.split") == 0 ||
+                   strcmp(s->qualified, "string.join") == 0) {
+            /* TODO L3+list: degraded shape; host returns the first
+             * element / a single joined string into the scratch slot. */
+            param_list = "(param i32 i32 i32 i32 i32 i32) (result i32)";
+
+        /* L7: stdlib `time` interface. */
+        } else if (strcmp(s->qualified, "time.now") == 0 ||
+                   strcmp(s->qualified, "time.now_millis") == 0) {
+            param_list = "(result i64)";
+        } else if (strcmp(s->qualified, "time.format") == 0) {
+            param_list = "(param i64 i32 i32 i32 i32) (result i32)";
+        } else if (strcmp(s->qualified, "time.parse") == 0) {
+            param_list = "(param i32 i32 i32 i32) (result i64)";
         } else {
             /* Unknown capability: emit a 4-arg/i32-result placeholder so
              * the wasm at least validates. wazero will fail to link the
@@ -1675,6 +1729,182 @@ static void emit_instruction(FnCtx *fctx, IrBasicBlock *bb, IrInst *inst) {
             fprintf(out, "      i64.extend_i32_s\n");
             emit_set_value(fctx, inst->id);
             break;
+
+        /* ── L4: string interpolation primitives ──────────────────
+         * concat / from_int / from_bool / from_float / length back
+         * the `"...${expr}..."` lowering. Inputs marshal through the
+         * buffer-protocol (ptr,len) pair convention; outputs land in
+         * the per-site scratch slot and the host returns a pointer to
+         * the length-prefixed result string. The IR slot is typed
+         * STRING (i32 in WASM), so the result lands directly without
+         * sign-extension. */
+        } else if (strcmp(qname, "string.concat") == 0 &&
+                   inst->call_arg_count >= 2) {
+            int a_arg = inst->call_args[0];
+            int b_arg = inst->call_args[1];
+            emit_get_value(fctx, a_arg);
+            emit_get_value(fctx, a_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            emit_get_value(fctx, b_arg);
+            emit_get_value(fctx, b_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "string.from_int") == 0 &&
+                   inst->call_arg_count >= 1) {
+            int v_arg = inst->call_args[0];
+            emit_get_value(fctx, v_arg);
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "string.from_bool") == 0 &&
+                   inst->call_arg_count >= 1) {
+            int v_arg = inst->call_args[0];
+            emit_get_value(fctx, v_arg);
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "string.from_float") == 0 &&
+                   inst->call_arg_count >= 1) {
+            int v_arg = inst->call_args[0];
+            emit_get_value(fctx, v_arg);
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "string.length") == 0 &&
+                   inst->call_arg_count >= 1) {
+            int s_arg = inst->call_args[0];
+            emit_get_value(fctx, s_arg);
+            emit_get_value(fctx, s_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+
+        /* ── L7: stdlib math (float-domain) ─────────────────────────
+         * Args arrive already typed as f64 (their SSA slot is
+         * IR_TYPE_F64 thanks to ir_emit_host_call); we just push them
+         * and call. Result stays f64 -- no sign-extend, no scratch
+         * slot, no buffer-protocol dance. */
+        } else if ((strcmp(qname, "math.sqrt") == 0 ||
+                    strcmp(qname, "math.sin")  == 0 ||
+                    strcmp(qname, "math.cos")  == 0 ||
+                    strcmp(qname, "math.tan")  == 0 ||
+                    strcmp(qname, "math.log")  == 0 ||
+                    strcmp(qname, "math.exp")  == 0) &&
+                   inst->call_arg_count >= 1) {
+            emit_get_value(fctx, inst->call_args[0]);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "math.pow") == 0 &&
+                   inst->call_arg_count >= 2) {
+            emit_get_value(fctx, inst->call_args[0]);
+            emit_get_value(fctx, inst->call_args[1]);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            emit_set_value(fctx, inst->id);
+            break;
+
+        /* ── L7: stdlib string ─────────────────────────────────────
+         * trim / to_upper / to_lower: (s_ptr, s_len, out_buf, out_max)
+         * -> bytes written into scratch.
+         * contains / starts_with / ends_with: (s, needle) -> 0/1.
+         * split / join are best-effort placeholders pending L3+list. */
+        } else if ((strcmp(qname, "string.trim") == 0 ||
+                    strcmp(qname, "string.to_upper") == 0 ||
+                    strcmp(qname, "string.to_lower") == 0) &&
+                   inst->call_arg_count >= 1) {
+            int s_arg = inst->call_args[0];
+            emit_get_value(fctx, s_arg);
+            emit_get_value(fctx, s_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if ((strcmp(qname, "string.contains") == 0 ||
+                    strcmp(qname, "string.starts_with") == 0 ||
+                    strcmp(qname, "string.ends_with") == 0) &&
+                   inst->call_arg_count >= 2) {
+            int s_arg = inst->call_args[0];
+            int n_arg = inst->call_args[1];
+            emit_get_value(fctx, s_arg);
+            emit_get_value(fctx, s_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            emit_get_value(fctx, n_arg);
+            emit_get_value(fctx, n_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            /* Result already i32 -- SSA slot is IR_TYPE_BOOL (i32),
+             * matching `fn foo() -> bool` returns. */
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if ((strcmp(qname, "string.split") == 0 ||
+                    strcmp(qname, "string.join") == 0) &&
+                   inst->call_arg_count >= 2) {
+            /* TODO L3+list: degraded path -- host returns the first
+             * element (split) or the bare join string into the scratch
+             * slot. The wasm at least validates. */
+            int a0 = inst->call_args[0];
+            int a1 = inst->call_args[1];
+            emit_get_value(fctx, a0);
+            emit_get_value(fctx, a0);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            emit_get_value(fctx, a1);
+            emit_get_value(fctx, a1);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+
+        /* ── L7: stdlib time ───────────────────────────────────────
+         * now / now_millis are zero-arg and return i64 directly. */
+        } else if ((strcmp(qname, "time.now") == 0 ||
+                    strcmp(qname, "time.now_millis") == 0)) {
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "time.format") == 0 &&
+                   inst->call_arg_count >= 2) {
+            int t_arg = inst->call_args[0];
+            int l_arg = inst->call_args[1];
+            emit_get_value(fctx, t_arg);
+            emit_get_value(fctx, l_arg);
+            emit_get_value(fctx, l_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      i32.const %d\n", out_buf);
+            fprintf(out, "      i32.const %d\n", WASM_HOST_OUTBUF_MAX);
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            fprintf(out, "      i64.extend_i32_s\n");
+            emit_set_value(fctx, inst->id);
+            break;
+        } else if (strcmp(qname, "time.parse") == 0 &&
+                   inst->call_arg_count >= 2) {
+            int s_arg = inst->call_args[0];
+            int l_arg = inst->call_args[1];
+            emit_get_value(fctx, s_arg);
+            emit_get_value(fctx, s_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            emit_get_value(fctx, l_arg);
+            emit_get_value(fctx, l_arg);
+            fprintf(out, "      i32.const 4\n      i32.sub\n      i32.load\n");
+            fprintf(out, "      call $hi_%s_%s\n", s->ns, s->fn);
+            emit_set_value(fctx, inst->id);
+            break;
+
         } else {
             /* Unknown / mismatched arity: emit best-effort (push each
              * arg as-is and trust the import declaration). */

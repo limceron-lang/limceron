@@ -59,11 +59,48 @@ typedef struct {
  * Tokens
  * ============================================================ */
 
+/* L4 (2026-05-13): interpolated string literal payload.
+ *
+ * The lexer collapses a quoted string with one or more `${...}`
+ * placeholders into a single TOK_INTERP_STRING whose payload is an
+ * `InterpString` allocated in the per-compile arena. We do NOT emit a
+ * sequence of START / EXPR_START / PART tokens: the parser only ever
+ * sees one token per quoted string, and the embedded expressions are
+ * re-lexed when the parser hits TOK_INTERP_STRING (so existing prefix
+ * / infix parse rules don't need to learn an "I'm inside an interp"
+ * mode).
+ *
+ * Shape: a string with N placeholders has N+1 literal segments. For
+ * `"hello ${name}!"` count=1, literals = {"hello ", "!"},
+ * expr_src = {"name"}. For a plain literal we keep TOK_STRING_LIT --
+ * TOK_INTERP_STRING is only used when count >= 1.
+ */
+#define LCN_INTERP_MAX_PARTS 32
+
+typedef struct {
+    int         count;
+    /* literals[i] is the text that PRECEDES expr_src[i]; literals[count]
+     * is the trailing text after the last placeholder. Empty segments
+     * are interned as "" (never NULL). */
+    const char *literals[LCN_INTERP_MAX_PARTS + 1];
+    const char *expr_src[LCN_INTERP_MAX_PARTS];
+    /* Source-relative location of each `${` so the re-parser can attach
+     * meaningful diagnostics back to the original site. */
+    uint32_t    expr_line[LCN_INTERP_MAX_PARTS];
+    uint32_t    expr_column[LCN_INTERP_MAX_PARTS];
+    uint32_t    expr_offset[LCN_INTERP_MAX_PARTS];
+    /* L4 forbids `${...${...}...}` in v1. Lex-time detection sets this
+     * flag; the parser raises ERR_NESTED_INTERPOLATION before trying to
+     * re-parse the offending segment. */
+    bool        nested_detected;
+} InterpString;
+
 typedef enum {
     /* Literals */
     TOK_INT_LIT,
     TOK_FLOAT_LIT,
     TOK_STRING_LIT,
+    TOK_INTERP_STRING,   /* L4: "...${expr}..." with embedded InterpString* */
     TOK_CHAR_LIT,
     TOK_IDENT,
 
@@ -221,9 +258,10 @@ typedef struct {
     TokenKind   kind;
     SourceLoc   loc;
     union {
-        int64_t     int_val;
-        double      float_val;
-        const char *str_val;
+        int64_t       int_val;
+        double        float_val;
+        const char   *str_val;
+        InterpString *interp;   /* L4: TOK_INTERP_STRING payload */
     } value;
     uint32_t    len;
 } Token;
@@ -342,6 +380,10 @@ typedef enum {
     AST_INT_LIT,
     AST_FLOAT_LIT,
     AST_STRING_LIT,
+    AST_INTERP_STRING,    /* L4: "...${expr}..." lowered to str.concat chain. params=
+                           *  alternating AST_STRING_LIT (literals) and arbitrary
+                           *  expression nodes. Always starts and ends with an
+                           *  AST_STRING_LIT (possibly empty). */
     AST_BOOL_LIT,
     AST_NONE_LIT,
     AST_IDENT,

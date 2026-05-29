@@ -102,6 +102,86 @@ interface mcp {
     call: func(tool: string, args: string) -> s64;
 }
 
+// vdag:string -- L4 (2026-05-13) lightweight string primitives that
+// back the `"...${expr}..."` interpolation lowering. The IR-gen pass
+// folds each interpolation site into a left-associative chain of
+// `string.concat(prev, next)` calls; non-string segments first route
+// through the matching `string.from-*` coercion verb before they are
+// concatenated. `length` is the inverse query, returning the byte
+// count of a string for callers that want to size scratch slots.
+//
+// Per-segment lowering rules are documented in
+// docs/language-reference.md §String Interpolation.
+//
+// TODO(runtime-side): Visual-DAG's internal/nodes/code/imports.go
+// must export the five verbs before .wasm modules using the L4
+// interpolation lowering will instantiate at wazero load time. Until
+// then the signature-mismatch check still passes (the names are
+// declared here), but the missing host stubs will trip linker
+// failures.
+interface string {
+    concat: func(a: string, b: string) -> string;
+    from-int: func(n: s64) -> string;
+    from-bool: func(b: bool) -> string;
+    from-float: func(f: float64) -> string;
+    length: func(s: string) -> s32;
+
+    // L7 (2026-05-13): stdlib string surface. Mutating verbs (trim,
+    // to-upper, to-lower) return the bytes written into the scratch
+    // slot per the buffer-protocol convention; boolean predicates
+    // (contains, starts-with, ends-with) return 0/1. split / join
+    // operate on list<string> which has no native repr in stage0;
+    // they are placeholders ("TODO L3+list") pending the
+    // L3+collections roadmap row.
+    trim: func(s: string) -> s64;
+    contains: func(s: string, needle: string) -> s64;
+    starts-with: func(s: string, prefix: string) -> s64;
+    ends-with: func(s: string, suffix: string) -> s64;
+    to-upper: func(s: string) -> s64;
+    to-lower: func(s: string) -> s64;
+    split: func(s: string, sep: string) -> s64;
+    join: func(parts: string, sep: string) -> s64;
+}
+
+// vdag:math -- L7 (2026-05-13) standard library math surface. The
+// float-domain verbs (sqrt, sin, cos, tan, log, exp, pow) are real
+// host imports dispatched through Visual-DAG's runtime. The integer
+// helpers (min, max, clamp, abs, sign) are listed here for contract
+// completeness only -- the front-end intercepts them at IR-gen
+// (src/ir_gen.c::AST_HOST_CALL) and lowers them inline as compiler
+// builtins, so `(import "vdag:math" "clamp" ...)` is never emitted.
+//
+// Each float verb takes/returns plain WASM f64s with no scratch
+// buffer (the values fit in registers).
+interface math {
+    sqrt: func(f: float64) -> float64;
+    sin: func(f: float64) -> float64;
+    cos: func(f: float64) -> float64;
+    tan: func(f: float64) -> float64;
+    log: func(f: float64) -> float64;
+    exp: func(f: float64) -> float64;
+    pow: func(base: float64, exponent: float64) -> float64;
+
+    // Pure-int helpers -- compiler builtins, NOT real host imports.
+    min: func(a: s64, b: s64) -> s64;
+    max: func(a: s64, b: s64) -> s64;
+    clamp: func(x: s64, lo: s64, hi: s64) -> s64;
+    abs: func(x: s64) -> s64;
+    sign: func(x: s64) -> s64;
+}
+
+// vdag:time -- L7 (2026-05-13) host-backed clock + RFC3339 formatting.
+// Returns s64 Unix-epoch values; format/parse marshal a layout string
+// into the scratch slot per the buffer-protocol convention from
+// imports.go. `parse` returns Result<s64, host-error> conceptually but
+// at the WASM ABI level it shares the s64-negative-sentinel encoding.
+interface time {
+    now: func() -> s64;
+    now-millis: func() -> s64;
+    format: func(ts: s64, layout: string) -> s64;
+    parse: func(s: string, layout: string) -> s64;
+}
+
 // vdag:state -- per-run scratch state (future). Listed here to
 // reserve the namespace prefix so that capability declarations
 // using `state.*` typecheck against a stable contract once the
@@ -137,4 +217,7 @@ world vdag-agent {
     import state;
     import entropy;
     import tool;
+    import string;
+    import math;
+    import time;
 }

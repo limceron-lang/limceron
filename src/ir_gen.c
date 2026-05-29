@@ -281,7 +281,45 @@ int ir_emit_call(IrFunction *fn, IrModule *mod, const char *callee,
 int ir_emit_host_call(IrFunction *fn, IrModule *mod,
                        const char *qualified_name,
                        int *args, int arg_count) {
-    IrInst *inst = ir_inst_new(fn, mod, IR_HOST_CALL, IR_TYPE_I64);
+    /* L4 (2026-05-13): the `vdag:string` interpolation primitives
+     * return a string handle (pointer to a length-prefixed bytestring
+     * in linear memory) rather than the default i64 byte-count or
+     * negative sentinel. Type-tagging the SSA slot keeps the wasm
+     * backend's local allocator declaring an i32 to match the host
+     * import signature.
+     *
+     * L7 (2026-05-13): the float-domain math host calls (math.sqrt,
+     * sin, cos, tan, log, exp, pow) return f64. The boolean string
+     * predicates (string.contains / starts_with / ends_with) return
+     * 0/1 and we tag them IR_TYPE_BOOL so a
+     * `fn foo() -> bool { string.contains(...) }` shape lines up
+     * with the WASM `(result i32)` Limceron emits for bool returns.
+     *
+     * Every other capability still bottoms out at i64 (positive
+     * bytes-written / negative HostErr* per ADR-0002). */
+    IrType result_type = IR_TYPE_I64;
+    if (qualified_name &&
+        (strcmp(qualified_name, "string.concat")     == 0 ||
+         strcmp(qualified_name, "string.from_int")   == 0 ||
+         strcmp(qualified_name, "string.from_bool")  == 0 ||
+         strcmp(qualified_name, "string.from_float") == 0)) {
+        result_type = IR_TYPE_STRING;
+    } else if (qualified_name &&
+               (strcmp(qualified_name, "math.sqrt") == 0 ||
+                strcmp(qualified_name, "math.sin")  == 0 ||
+                strcmp(qualified_name, "math.cos")  == 0 ||
+                strcmp(qualified_name, "math.tan")  == 0 ||
+                strcmp(qualified_name, "math.log")  == 0 ||
+                strcmp(qualified_name, "math.exp")  == 0 ||
+                strcmp(qualified_name, "math.pow")  == 0)) {
+        result_type = IR_TYPE_F64;
+    } else if (qualified_name &&
+               (strcmp(qualified_name, "string.contains")    == 0 ||
+                strcmp(qualified_name, "string.starts_with") == 0 ||
+                strcmp(qualified_name, "string.ends_with")   == 0)) {
+        result_type = IR_TYPE_BOOL;
+    }
+    IrInst *inst = ir_inst_new(fn, mod, IR_HOST_CALL, result_type);
     inst->fn_name = arena_strdup(mod->arena, qualified_name);
     int i;
     for (i = 0; i < arg_count && i < 16; i++)
@@ -596,6 +634,7 @@ static IrType irgen_infer_type(AstNode *expr) {
     case AST_INT_LIT:    return IR_TYPE_I64;
     case AST_FLOAT_LIT:  return IR_TYPE_F64;
     case AST_STRING_LIT: return IR_TYPE_STRING;
+    case AST_INTERP_STRING: return IR_TYPE_STRING;   /* L4 */
     case AST_BOOL_LIT:   return IR_TYPE_BOOL;
     case AST_NONE_LIT:   return IR_TYPE_PTR;
     case AST_BINARY: {
@@ -840,6 +879,72 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
         return ir_emit_const_string(ctx->current_fn, ctx->mod,
                                      expr->val.str_val ? expr->val.str_val : "");
 
+    /* L4: `"...${expr}..."` lowers to a left-folded chain of
+     * `vdag:string.concat(prev, next)` host calls. Each segment
+     * normalises to a string first:
+     *   - AST_STRING_LIT  -> emitted as-is (skipped if empty).
+     *   - i64-shaped expr -> `vdag:string.from_int(v)`
+     *   - bool-shaped     -> `vdag:string.from_bool(v)`
+     *   - f64-shaped      -> `vdag:string.from_float(v)`
+     *   - already-string  -> passed through verbatim.
+     *   - Json handle     -> `vdag:json.as_string(h)` (the L4
+     *                         typecheck pass requires the author
+     *                         to spell that cast explicitly, but
+     *                         we still emit it defensively in
+     *                         case the check is bypassed).
+     * The result is a single string-typed SSA value that callers
+     * can feed into a `let`, a return, or another concat. */
+    case AST_INTERP_STRING: {
+        AstNode *part = expr->params;
+        int acc = -1;
+        int idx = 0;
+        for (; part; part = part->next, idx++) {
+            int seg = -1;
+            if ((idx & 1) == 0) {
+                /* Literal segment (always AST_STRING_LIT by
+                 * construction). Skip empty segments to keep the
+                 * concat chain shorter. */
+                const char *s = part->val.str_val ? part->val.str_val : "";
+                if (s[0] == '\0' && acc != -1) continue;
+                seg = ir_emit_const_string(ctx->current_fn, ctx->mod, s);
+            } else {
+                int v = irgen_expr(ctx, part);
+                IrType vt = irgen_value_type(ctx, v);
+                if (expr_is_json(ctx, part)) {
+                    int args[1] = { v };
+                    seg = ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                            "json.as_string", args, 1);
+                } else if (vt == IR_TYPE_STRING) {
+                    seg = v;
+                } else if (vt == IR_TYPE_BOOL) {
+                    int args[1] = { v };
+                    seg = ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                            "string.from_bool", args, 1);
+                } else if (vt == IR_TYPE_F64) {
+                    int args[1] = { v };
+                    seg = ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                            "string.from_float", args, 1);
+                } else {
+                    int args[1] = { v };
+                    seg = ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                            "string.from_int", args, 1);
+                }
+            }
+            if (seg < 0) continue;
+            if (acc < 0) {
+                acc = seg;
+            } else {
+                int args[2] = { acc, seg };
+                acc = ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                        "string.concat", args, 2);
+            }
+        }
+        if (acc < 0) {
+            acc = ir_emit_const_string(ctx->current_fn, ctx->mod, "");
+        }
+        return acc;
+    }
+
     case AST_BOOL_LIT:
         return ir_emit_const_bool(ctx->current_fn, ctx->mod, expr->val.bool_val);
 
@@ -907,7 +1012,15 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
          * expr->params. We lower each argument expression to an SSA
          * value and emit IR_HOST_CALL; the WASM backend marshals each
          * arg according to the per-capability ABI documented in
-         * imports.go. */
+         * imports.go.
+         *
+         * L7: the pure-int helpers in stdlib/math (min, max, clamp,
+         * abs, sign) are intercepted BEFORE reaching ir_emit_host_call
+         * and lowered inline as compiler builtins -- no `(import
+         * "vdag:math" ...)` declaration is emitted because the body
+         * is a closed-form integer expression. This matches the spec
+         * pinned in stdlib/math.lceron and means an author writing
+         * `math.clamp(x, 0, 60)` pays zero host-call cost. */
         int args[16];
         int arg_count = 0;
         AstNode *arg_node;
@@ -916,6 +1029,167 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
             args[arg_count++] = irgen_expr(ctx, arg_node);
         }
         const char *qname = expr->name ? expr->name : "unknown.unknown";
+
+        /* ── L7: pure-int math builtins ─────────────────────────── */
+        if (qname && strncmp(qname, "math.", 5) == 0) {
+            const char *verb = qname + 5;
+
+            /* abs(x) = (x < 0) ? -x : x */
+            if (strcmp(verb, "abs") == 0 && arg_count == 1) {
+                int x = args[0];
+                int zero = ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+                int neg = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                        IR_SUB, IR_TYPE_I64, zero, x);
+                int cond = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_LT, IR_TYPE_BOOL, x, zero);
+                IrBasicBlock *thn = ir_bb_new(ctx->current_fn, ctx->mod, "abs.neg");
+                IrBasicBlock *els = ir_bb_new(ctx->current_fn, ctx->mod, "abs.pos");
+                IrBasicBlock *mrg = ir_bb_new(ctx->current_fn, ctx->mod, "abs.merge");
+                ir_emit_br(ctx->current_fn, ctx->mod, cond, thn->id, els->id);
+                ir_set_current_bb(ctx->current_fn, thn);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, els);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, mrg);
+                int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (mrg->last && mrg->last->op == IR_PHI && mrg->last->id == phi) {
+                    ir_phi_add_incoming(mrg->last, neg, thn->id);
+                    ir_phi_add_incoming(mrg->last, x,   els->id);
+                }
+                return phi;
+            }
+
+            /* min(a, b) = (a < b) ? a : b */
+            if (strcmp(verb, "min") == 0 && arg_count == 2) {
+                int a = args[0];
+                int b = args[1];
+                int cond = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_LT, IR_TYPE_BOOL, a, b);
+                IrBasicBlock *thn = ir_bb_new(ctx->current_fn, ctx->mod, "min.lt");
+                IrBasicBlock *els = ir_bb_new(ctx->current_fn, ctx->mod, "min.ge");
+                IrBasicBlock *mrg = ir_bb_new(ctx->current_fn, ctx->mod, "min.merge");
+                ir_emit_br(ctx->current_fn, ctx->mod, cond, thn->id, els->id);
+                ir_set_current_bb(ctx->current_fn, thn);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, els);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, mrg);
+                int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (mrg->last && mrg->last->op == IR_PHI && mrg->last->id == phi) {
+                    ir_phi_add_incoming(mrg->last, a, thn->id);
+                    ir_phi_add_incoming(mrg->last, b, els->id);
+                }
+                return phi;
+            }
+
+            /* max(a, b) = (a > b) ? a : b */
+            if (strcmp(verb, "max") == 0 && arg_count == 2) {
+                int a = args[0];
+                int b = args[1];
+                int cond = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_GT, IR_TYPE_BOOL, a, b);
+                IrBasicBlock *thn = ir_bb_new(ctx->current_fn, ctx->mod, "max.gt");
+                IrBasicBlock *els = ir_bb_new(ctx->current_fn, ctx->mod, "max.le");
+                IrBasicBlock *mrg = ir_bb_new(ctx->current_fn, ctx->mod, "max.merge");
+                ir_emit_br(ctx->current_fn, ctx->mod, cond, thn->id, els->id);
+                ir_set_current_bb(ctx->current_fn, thn);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, els);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, mrg);
+                int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (mrg->last && mrg->last->op == IR_PHI && mrg->last->id == phi) {
+                    ir_phi_add_incoming(mrg->last, a, thn->id);
+                    ir_phi_add_incoming(mrg->last, b, els->id);
+                }
+                return phi;
+            }
+
+            /* clamp(x, lo, hi) = min(max(x, lo), hi) */
+            if (strcmp(verb, "clamp") == 0 && arg_count == 3) {
+                int x  = args[0];
+                int lo = args[1];
+                int hi = args[2];
+                /* tmp = (x > lo) ? x : lo */
+                int c1 = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                       IR_CMP_GT, IR_TYPE_BOOL, x, lo);
+                IrBasicBlock *t1 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.gt");
+                IrBasicBlock *e1 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.le");
+                IrBasicBlock *m1 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.m1");
+                ir_emit_br(ctx->current_fn, ctx->mod, c1, t1->id, e1->id);
+                ir_set_current_bb(ctx->current_fn, t1);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, m1->id);
+                ir_set_current_bb(ctx->current_fn, e1);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, m1->id);
+                ir_set_current_bb(ctx->current_fn, m1);
+                int tmp = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (m1->last && m1->last->op == IR_PHI && m1->last->id == tmp) {
+                    ir_phi_add_incoming(m1->last, x,  t1->id);
+                    ir_phi_add_incoming(m1->last, lo, e1->id);
+                }
+                /* result = (tmp < hi) ? tmp : hi */
+                int c2 = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                       IR_CMP_LT, IR_TYPE_BOOL, tmp, hi);
+                IrBasicBlock *t2 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.lt");
+                IrBasicBlock *e2 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.ge");
+                IrBasicBlock *m2 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.m2");
+                ir_emit_br(ctx->current_fn, ctx->mod, c2, t2->id, e2->id);
+                ir_set_current_bb(ctx->current_fn, t2);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, m2->id);
+                ir_set_current_bb(ctx->current_fn, e2);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, m2->id);
+                ir_set_current_bb(ctx->current_fn, m2);
+                int out = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (m2->last && m2->last->op == IR_PHI && m2->last->id == out) {
+                    ir_phi_add_incoming(m2->last, tmp, t2->id);
+                    ir_phi_add_incoming(m2->last, hi,  e2->id);
+                }
+                return out;
+            }
+
+            /* sign(x) = (x > 0) ? 1 : ((x < 0) ? -1 : 0) */
+            if (strcmp(verb, "sign") == 0 && arg_count == 1) {
+                int x = args[0];
+                int zero = ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+                int one  = ir_emit_const_int(ctx->current_fn, ctx->mod, 1);
+                int neg1 = ir_emit_const_int(ctx->current_fn, ctx->mod, -1);
+                int cpos = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_GT, IR_TYPE_BOOL, x, zero);
+                IrBasicBlock *pb = ir_bb_new(ctx->current_fn, ctx->mod, "sign.pos");
+                IrBasicBlock *nb = ir_bb_new(ctx->current_fn, ctx->mod, "sign.npos");
+                IrBasicBlock *mb = ir_bb_new(ctx->current_fn, ctx->mod, "sign.mrg");
+                ir_emit_br(ctx->current_fn, ctx->mod, cpos, pb->id, nb->id);
+                ir_set_current_bb(ctx->current_fn, pb);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mb->id);
+                ir_set_current_bb(ctx->current_fn, nb);
+                int cneg = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_LT, IR_TYPE_BOOL, x, zero);
+                IrBasicBlock *nb_neg = ir_bb_new(ctx->current_fn, ctx->mod, "sign.neg");
+                IrBasicBlock *nb_zer = ir_bb_new(ctx->current_fn, ctx->mod, "sign.zer");
+                IrBasicBlock *nb_mrg = ir_bb_new(ctx->current_fn, ctx->mod, "sign.nm");
+                ir_emit_br(ctx->current_fn, ctx->mod, cneg, nb_neg->id, nb_zer->id);
+                ir_set_current_bb(ctx->current_fn, nb_neg);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, nb_mrg->id);
+                ir_set_current_bb(ctx->current_fn, nb_zer);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, nb_mrg->id);
+                ir_set_current_bb(ctx->current_fn, nb_mrg);
+                int inner = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (nb_mrg->last && nb_mrg->last->op == IR_PHI &&
+                    nb_mrg->last->id == inner) {
+                    ir_phi_add_incoming(nb_mrg->last, neg1, nb_neg->id);
+                    ir_phi_add_incoming(nb_mrg->last, zero, nb_zer->id);
+                }
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mb->id);
+                ir_set_current_bb(ctx->current_fn, mb);
+                int out = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (mb->last && mb->last->op == IR_PHI && mb->last->id == out) {
+                    ir_phi_add_incoming(mb->last, one,   pb->id);
+                    ir_phi_add_incoming(mb->last, inner, nb_mrg->id);
+                }
+                return out;
+            }
+        }
+
         return ir_emit_host_call(ctx->current_fn, ctx->mod, qname,
                                   args, arg_count);
     }

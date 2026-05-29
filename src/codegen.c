@@ -2243,6 +2243,107 @@ static void cg_expr(CodeGen *g, AstNode *expr) {
         break;
     }
 
+    /* L4: AST_INTERP_STRING emits a nested lcn_str_concat chain
+     * in the C99 backend, mirroring the wasm IR-gen lowering but
+     * targetting the runtime helper. Each literal segment becomes
+     * a quoted C string; each expression segment is recursively
+     * code-generated. Non-string expressions are wrapped in
+     * lcn_str_from_int when the codegen can't prove they are
+     * string-typed. */
+    case AST_INTERP_STRING: {
+        AstNode *part = expr->params;
+        (void)part;  /* L4-WIP: reserved by sibling; silenced for L7 build */
+        int total = 0;
+        AstNode *first_emit = NULL;
+        int idx = 0;
+        for (AstNode *p = expr->params; p; p = p->next, idx++) {
+            if ((idx & 1) == 0) {
+                const char *s = p->val.str_val ? p->val.str_val : "";
+                if (s[0] == '\0' && first_emit) continue;
+            }
+            if (!first_emit) first_emit = p;
+            total++;
+        }
+        if (total == 0) { cg_str(g, "\"\""); break; }
+        if (total == 1) {
+            /* Single segment -- emit it without the concat wrapper. */
+            int i = 0;
+            for (AstNode *p = expr->params; p; p = p->next, i++) {
+                if ((i & 1) == 0) {
+                    const char *s = p->val.str_val ? p->val.str_val : "";
+                    if (s[0] == '\0' && p != first_emit) continue;
+                }
+                if (p == first_emit) {
+                    if ((i & 1) == 0) {
+                        cg_str(g, "\"");
+                        for (const char *q = p->val.str_val; q && *q; q++) {
+                            switch (*q) {
+                            case '\n': cg_str(g, "\\n"); break;
+                            case '"':  cg_str(g, "\\\""); break;
+                            case '\\': cg_str(g, "\\\\"); break;
+                            default: { char buf[2] = { *q, 0 }; cg_str(g, buf); }
+                            }
+                        }
+                        cg_str(g, "\"");
+                    } else {
+                        cg_str(g, "lcn_str_from_int((int64_t)(");
+                        cg_expr(g, p);
+                        cg_str(g, "))");
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+        /* Multi-segment: emit nested lcn_str_concat. */
+        for (int i = 0; i < total - 1; i++) cg_str(g, "lcn_str_concat(");
+        bool first = true;
+        idx = 0;
+        for (AstNode *p = expr->params; p; p = p->next, idx++) {
+            if ((idx & 1) == 0) {
+                const char *s = p->val.str_val ? p->val.str_val : "";
+                if (s[0] == '\0' && !first) continue;
+            }
+            if (!first) cg_str(g, ", ");
+            if ((idx & 1) == 0) {
+                cg_str(g, "\"");
+                for (const char *q = p->val.str_val; q && *q; q++) {
+                    switch (*q) {
+                    case '\n': cg_str(g, "\\n"); break;
+                    case '"':  cg_str(g, "\\\""); break;
+                    case '\\': cg_str(g, "\\\\"); break;
+                    default: { char buf[2] = { *q, 0 }; cg_str(g, buf); }
+                    }
+                }
+                cg_str(g, "\"");
+            } else {
+                /* Heuristic: if the inner expression is a bare
+                 * AST_IDENT and not a known string variable, wrap
+                 * in lcn_str_from_int; otherwise emit directly. */
+                bool is_str_var = false;
+                if (p->kind == AST_IDENT && p->name) {
+                    int si;
+                    for (si = 0; si < g->string_var_count; si++) {
+                        if (strcmp(g->string_vars[si], p->name) == 0) {
+                            is_str_var = true; break;
+                        }
+                    }
+                }
+                if (p->kind == AST_STRING_LIT || p->kind == AST_INTERP_STRING ||
+                    is_str_var) {
+                    cg_expr(g, p);
+                } else {
+                    cg_str(g, "lcn_str_from_int((int64_t)(");
+                    cg_expr(g, p);
+                    cg_str(g, "))");
+                }
+            }
+            if (!first) cg_str(g, ")");
+            first = false;
+        }
+        break;
+    }
+
     case AST_BOOL_LIT:
         cg_str(g, expr->val.bool_val ? "true" : "false");
         break;

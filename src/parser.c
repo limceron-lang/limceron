@@ -43,6 +43,7 @@ const char *ast_kind_name(AstKind kind) {
         [AST_INT_LIT]       = "IntLit",
         [AST_FLOAT_LIT]     = "FloatLit",
         [AST_STRING_LIT]    = "StringLit",
+        [AST_INTERP_STRING] = "InterpString",
         [AST_BOOL_LIT]      = "BoolLit",
         [AST_NONE_LIT]      = "NoneLit",
         [AST_IDENT]         = "Ident",
@@ -765,16 +766,27 @@ static AstNode *parse_expr(Parser *p, Precedence min_prec) {
                  * data, mcp), lower to AST_HOST_CALL so the IR backend can
                  * emit a `(import "vdag:<ns>" "<fn>" ...)` declaration and
                  * marshal arguments through the buffer-protocol ABI defined
-                 * by Visual-DAG's host imports (see imports.go). */
+                 * by Visual-DAG's host imports (see imports.go).
+                 *
+                 * L4 (2026-05-13): `string` joins the host namespace set
+                 * so the `"...${expr}..."` interpolation lowering can
+                 * dispatch through `string.concat`, `string.from_int`,
+                 * etc. Authors may also call those verbs directly
+                 * (`string.concat(a, b)`). L7 (2026-05-13) extends the
+                 * set with `math` and `time` -- both back the L7 stdlib
+                 * minimum and share the same bare-prefix dispatch path. */
                 bool is_host_ns = false;
                 if (left && left->kind == AST_IDENT && left->name) {
                     const char *ns = left->name;
-                    is_host_ns = (strcmp(ns, "llm")  == 0 ||
-                                  strcmp(ns, "http") == 0 ||
-                                  strcmp(ns, "kb")   == 0 ||
-                                  strcmp(ns, "data") == 0 ||
-                                  strcmp(ns, "mcp")  == 0 ||
-                                  strcmp(ns, "json") == 0);
+                    is_host_ns = (strcmp(ns, "llm")    == 0 ||
+                                  strcmp(ns, "http")   == 0 ||
+                                  strcmp(ns, "kb")     == 0 ||
+                                  strcmp(ns, "data")   == 0 ||
+                                  strcmp(ns, "mcp")    == 0 ||
+                                  strcmp(ns, "json")   == 0 ||
+                                  strcmp(ns, "string") == 0 ||
+                                  strcmp(ns, "math")   == 0 ||
+                                  strcmp(ns, "time")   == 0);
                 }
                 AstNode *node = ast_new(p->arena,
                                          is_host_ns ? AST_HOST_CALL : AST_METHOD_CALL,
@@ -1034,6 +1046,95 @@ static AstNode *parse_prefix(Parser *p) {
     if (parser_check(p, TOK_STRING_LIT)) {
         AstNode *node = ast_new(p->arena, AST_STRING_LIT, loc);
         node->val.str_val = parser_advance(p).value.str_val;
+        return node;
+    }
+
+    /* L4: interpolated string literal `"...${expr}..."` lowered to
+     * AST_INTERP_STRING. The lexer already split the literal/expression
+     * segments and intern'd both halves; this rule materialises the
+     * matching AST and re-parses each `${expr}` body through a fresh
+     * sub-Lexer / sub-Parser that shares the host arena, intern table,
+     * and error reporter. */
+    if (parser_check(p, TOK_INTERP_STRING)) {
+        Token tok = parser_advance(p);
+        InterpString *is = tok.value.interp;
+        AstNode *node = ast_new(p->arena, AST_INTERP_STRING, loc);
+        if (!is) {
+            /* Defensive: a malformed lexer payload still produces an
+             * empty AST_INTERP_STRING with a single empty literal so
+             * downstream passes do not crash. */
+            AstNode *empty = ast_new(p->arena, AST_STRING_LIT, loc);
+            empty->val.str_val = "";
+            node->params = empty;
+            return node;
+        }
+        if (is->nested_detected) {
+            report_error(p->reporter, loc,
+                "ERR_NESTED_INTERPOLATION: `${...${...}...}` is forbidden in v1",
+                "split into separate concatenations or assign the inner "
+                "expression to a `let` first");
+            p->had_error = true;
+        }
+        /* Build the part list: literal[0], expr[0], literal[1], expr[1],
+         * ..., literal[count]. Each literal becomes an AST_STRING_LIT
+         * (even when empty -- the IR-gen pass skips zero-length
+         * literals when emitting str.concat). Each expression is parsed
+         * via a child Lexer/Parser. */
+        AstNode *parts = NULL;
+        int i;
+        for (i = 0; i <= is->count; i++) {
+            AstNode *lit = ast_new(p->arena, AST_STRING_LIT, loc);
+            lit->val.str_val = is->literals[i] ? is->literals[i] : "";
+            parts = ast_append(parts, lit);
+            if (i < is->count) {
+                /* Re-parse the expression source through a fresh
+                 * sub-Lexer/sub-Parser. We share the host arena +
+                 * intern table + reporter so any diagnostic emitted by
+                 * the sub-parse carries the same surface as the outer
+                 * compile. */
+                const char *src = is->expr_src[i] ? is->expr_src[i] : "";
+                size_t slen = strlen(src);
+                AstNode *expr;
+                if (slen == 0) {
+                    /* Empty `${}` -- treat as literal zero so type
+                     * coercion still works; the parser surfaces the
+                     * mistake via a soft diagnostic. */
+                    report_error(p->reporter, loc,
+                        "ERR_INTERP_EMPTY: `${}` requires an expression",
+                        "supply a variable or expression between the braces");
+                    p->had_error = true;
+                    expr = ast_new(p->arena, AST_INT_LIT, loc);
+                    expr->val.int_val = 0;
+                } else {
+                    ErrorReporter *rep = p->reporter;
+                    StringIntern *intern = p->lexer ? p->lexer->intern : NULL;
+                    if (!intern) {
+                        /* Should not happen in a normal compile but
+                         * keep the fallback path. */
+                        expr = ast_new(p->arena, AST_INT_LIT, loc);
+                        expr->val.int_val = 0;
+                    } else {
+                        Lexer sub_lex = lexer_new("<interp>", src, slen,
+                                                   intern, rep);
+                        Parser sub_p = parser_new(&sub_lex, p->arena, rep);
+                        expr = parse_expression(&sub_p);
+                        if (sub_p.had_error) p->had_error = true;
+                        if (!expr) {
+                            expr = ast_new(p->arena, AST_INT_LIT, loc);
+                            expr->val.int_val = 0;
+                        }
+                    }
+                }
+                /* Surface the original source location on the parsed
+                 * expression for better diagnostics. */
+                expr->loc.filename = loc.filename;
+                expr->loc.line     = is->expr_line[i];
+                expr->loc.column   = is->expr_column[i];
+                expr->loc.offset   = is->expr_offset[i];
+                parts = ast_append(parts, expr);
+            }
+        }
+        node->params = parts;
         return node;
     }
 
@@ -1958,7 +2059,13 @@ static AstNode *parse_use_decl(Parser *p) {
         return node;
     }
 
-    while (parser_match(p, TOK_DOT)) {
+    /* L7 stub: accept `use stdlib::math;` (and friends) as a no-op so
+     * authors who follow the L8 cross-file import convention do not
+     * trip a parse error today. The `::` separator is normalised onto
+     * `.` for the stored path so downstream passes (codegen access
+     * policy resolution, AST_USE handlers) keep treating it as a dotted
+     * module path. Full L8 module resolution is deferred per ROADMAP. */
+    while (parser_match(p, TOK_DOT) || parser_match(p, TOK_COLON_COLON)) {
         if (parser_match(p, TOK_LBRACE)) {
             /* use a.b.{c, d, e} */
             node->name = path;

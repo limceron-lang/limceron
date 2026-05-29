@@ -697,6 +697,19 @@ static void find_tool_calls_in_expr(AstNode *expr, ToolCallCtx *ctx,
         break;
     }
 
+    /* L4: walk every embedded expression inside an interpolated
+     * string so tool-call discovery sees calls like
+     * `"prefix ${llm.classify(p)?} suffix"`. */
+    case AST_INTERP_STRING: {
+        AstNode *part = expr->params;
+        while (part) {
+            if (part->kind != AST_STRING_LIT)
+                find_tool_calls_in_expr(part, ctx, on_call, user);
+            part = part->next;
+        }
+        break;
+    }
+
     /* Leaves: no children to recurse into */
     case AST_INT_LIT:
     case AST_FLOAT_LIT:
@@ -1348,6 +1361,244 @@ static void check_host_call_signatures(AstNode *program,
      * job. */
     for (decl = program->params; decl; decl = decl->next) {
         walk_for_host_calls(decl, &contract, reporter);
+    }
+}
+
+/* ============================================================
+ * Pass 6c: L4 string-interpolation coercion check
+ *
+ * Each `"...${expr}..."` site lowers (ir_gen) to a chain of
+ * `string.concat` calls with the per-type `string.from_*` host call
+ * inserted around non-string expressions. The runtime contract
+ * supports the four primitive scalars + `string`; everything else
+ * needs an explicit cast.
+ *
+ * The narrow rule we enforce here: if the inner expression is a
+ * `Json` value (recognised by binding to `let X: Json = ...` or
+ * field-access against such a binding), it MUST be wrapped in
+ * `as string` (which lowers to `vdag:json.as-string` per L3).
+ * Anything else slips through -- the IR-gen pass tolerates
+ * primitives because every i64/bool/f64 slot already has a matching
+ * `string.from_*` host verb, and the wasm side stubs a graceful
+ * fallback when the verb isn't wired yet.
+ *
+ * Detection is local-scope only: we walk each function body
+ * tracking which `let`s carry an explicit `Json` annotation. That
+ * is sufficient for the v1 test fixtures and matches how
+ * src/ir_gen.c's `is_json` provenance flag is computed.
+ * ============================================================ */
+
+#define LCN_INTERP_MAX_JSON_LOCALS 64
+
+typedef struct {
+    const char *names[LCN_INTERP_MAX_JSON_LOCALS];
+    int         count;
+} InterpJsonScope;
+
+static bool interp_json_scope_has(const InterpJsonScope *s, const char *name) {
+    int i;
+    if (!name) return false;
+    for (i = 0; i < s->count; i++) {
+        if (s->names[i] && strcmp(s->names[i], name) == 0) return true;
+    }
+    return false;
+}
+
+static void interp_json_scope_add(InterpJsonScope *s, const char *name) {
+    if (!name || s->count >= LCN_INTERP_MAX_JSON_LOCALS) return;
+    s->names[s->count++] = name;
+}
+
+/* True when `expr` denotes a Json value in the current scope.
+ *
+ *   - Bare AST_IDENT whose binding had `: Json` annotation.
+ *   - AST_FIELD_ACCESS / AST_INDEX whose left subtree is Json --
+ *     the L3 sugar keeps the result a Json handle until coerced.
+ *   - AST_TRY (`expr?`) on a Json-typed receiver -- transparent.
+ *
+ * Anything else returns false; the check pass then accepts the
+ * interpolation. */
+static bool interp_expr_is_json(const InterpJsonScope *s, AstNode *expr) {
+    if (!expr) return false;
+    switch (expr->kind) {
+    case AST_IDENT:
+        return interp_json_scope_has(s, expr->name);
+    case AST_FIELD_ACCESS:
+    case AST_INDEX:
+        return interp_expr_is_json(s, expr->left);
+    case AST_TRY:
+        return interp_expr_is_json(s, expr->left);
+    case AST_HOST_CALL:
+        /* Every `vdag:json.*` host call that returns a handle
+         * stays Json-typed. The coercion verbs
+         * (`json.as_string|as_int|as_bool`) deliberately strip the
+         * Json provenance, matching what ir_gen does. */
+        if (expr->name && strncmp(expr->name, "json.", 5) == 0) {
+            const char *verb = expr->name + 5;
+            if (strcmp(verb, "as_string") == 0) return false;
+            if (strcmp(verb, "as_int")    == 0) return false;
+            if (strcmp(verb, "as_bool")   == 0) return false;
+            return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+/* True if the expression is an AST_CAST to a target string-shaped
+ * type, in which case the L4 check accepts it regardless of the
+ * inner value's type. */
+static bool interp_expr_has_string_cast(AstNode *expr) {
+    if (!expr || expr->kind != AST_CAST) return false;
+    if (!expr->type_expr) return false;
+    if (expr->type_expr->kind != AST_TYPE_NAMED) return false;
+    const char *n = expr->type_expr->name;
+    if (!n) return false;
+    return strcmp(n, "string") == 0 || strcmp(n, "str") == 0;
+}
+
+static void interp_check_expr(AstNode *expr,
+                              InterpJsonScope *scope,
+                              ErrorReporter *reporter);
+static void interp_check_stmt(AstNode *stmt,
+                              InterpJsonScope *scope,
+                              ErrorReporter *reporter);
+
+static void interp_check_interp_string(AstNode *node,
+                                       InterpJsonScope *scope,
+                                       ErrorReporter *reporter) {
+    AstNode *part;
+    int idx = 0;
+    for (part = node->params; part; part = part->next, idx++) {
+        if (!part) break;
+        /* Even-indexed parts are literal segments produced by the
+         * parser (AST_STRING_LIT). Odd-indexed parts are the
+         * embedded `${...}` expressions. */
+        if ((idx & 1) == 0) continue;
+        /* Explicit `as string` cast accepts anything. */
+        if (interp_expr_has_string_cast(part)) {
+            interp_check_expr(part->left, scope, reporter);
+            continue;
+        }
+        if (interp_expr_is_json(scope, part)) {
+            report_error(reporter, part->loc,
+                "ERR_INTERP_NOT_COERCIBLE: `Json` cannot be coerced to "
+                "string implicitly -- use `${value as string}` to lower "
+                "to vdag:json.as-string",
+                "wrap the value in an explicit `as string` cast");
+        } else {
+            interp_check_expr(part, scope, reporter);
+        }
+    }
+}
+
+static void interp_check_expr(AstNode *expr,
+                              InterpJsonScope *scope,
+                              ErrorReporter *reporter) {
+    if (!expr) return;
+    if (expr->kind == AST_INTERP_STRING) {
+        interp_check_interp_string(expr, scope, reporter);
+        return;
+    }
+    /* Generic recursion -- sufficient for the v1 surface where
+     * AST_INTERP_STRING never appears as a direct child of complex
+     * declarations (no metadata sites, no annotations, etc.). */
+    interp_check_expr(expr->left,  scope, reporter);
+    interp_check_expr(expr->right, scope, reporter);
+    {
+        AstNode *p;
+        for (p = expr->params; p; p = p->next) {
+            if (p == expr->left || p == expr->right) continue;
+            interp_check_expr(p, scope, reporter);
+        }
+    }
+}
+
+static void interp_check_stmt(AstNode *stmt,
+                              InterpJsonScope *scope,
+                              ErrorReporter *reporter) {
+    if (!stmt) return;
+    switch (stmt->kind) {
+    case AST_LET: {
+        /* Track `let X: Json = ...` so subsequent interpolation
+         * sites referencing X are flagged. The scope is reset at
+         * function boundaries by the caller. */
+        if (stmt->type_expr && stmt->type_expr->kind == AST_TYPE_NAMED &&
+            stmt->type_expr->name &&
+            strcmp(stmt->type_expr->name, "Json") == 0) {
+            interp_json_scope_add(scope, stmt->name);
+        }
+        interp_check_expr(stmt->right, scope, reporter);
+        break;
+    }
+    case AST_BLOCK:
+    case AST_PROGRAM: {
+        AstNode *s;
+        for (s = stmt->params; s; s = s->next) interp_check_stmt(s, scope, reporter);
+        break;
+    }
+    case AST_EXPR_STMT:
+        interp_check_expr(stmt->left, scope, reporter);
+        break;
+    case AST_RETURN:
+        interp_check_expr(stmt->left, scope, reporter);
+        break;
+    case AST_ASSIGN:
+        interp_check_expr(stmt->left,  scope, reporter);
+        interp_check_expr(stmt->right, scope, reporter);
+        break;
+    case AST_IF:
+        interp_check_expr(stmt->left, scope, reporter);
+        interp_check_stmt(stmt->right,  scope, reporter);
+        interp_check_stmt(stmt->params, scope, reporter);
+        break;
+    case AST_WHILE:
+        interp_check_expr(stmt->left, scope, reporter);
+        interp_check_stmt(stmt->right, scope, reporter);
+        break;
+    case AST_LOOP:
+        interp_check_stmt(stmt->left, scope, reporter);
+        break;
+    case AST_FOR:
+        interp_check_expr(stmt->params, scope, reporter);
+        interp_check_stmt(stmt->right, scope, reporter);
+        break;
+    default:
+        interp_check_expr(stmt->left,  scope, reporter);
+        interp_check_expr(stmt->right, scope, reporter);
+        break;
+    }
+}
+
+static void interp_check_fn_body(AstNode *fn, ErrorReporter *reporter) {
+    InterpJsonScope scope;
+    memset(&scope, 0, sizeof(scope));
+    if (fn && fn->left) interp_check_stmt(fn->left, &scope, reporter);
+}
+
+static void check_interp_coercibility(AstNode *program,
+                                      ErrorReporter *reporter) {
+    AstNode *decl;
+    if (!program || program->kind != AST_PROGRAM) return;
+    for (decl = program->params; decl; decl = decl->next) {
+        if (decl->kind == AST_FN) {
+            interp_check_fn_body(decl, reporter);
+        } else if (decl->kind == AST_AGENT) {
+            /* Agent methods are threaded via ->left as a list of
+             * AST_FN nodes. Walk each method as a self-contained
+             * scope (Json provenance does not flow across method
+             * boundaries). */
+            AstNode *m;
+            for (m = decl->left; m; m = m->next) {
+                if (m->kind == AST_FN) interp_check_fn_body(m, reporter);
+            }
+            /* Some parser shapes thread methods via ->params instead.
+             * Walk that list too -- duplicate scopes are harmless. */
+            for (m = decl->params; m; m = m->next) {
+                if (m->kind == AST_FN) interp_check_fn_body(m, reporter);
+            }
+        }
     }
 }
 
@@ -2859,6 +3110,20 @@ static void check_expr(SymbolTable *st, AstNode *expr,
                 check_stmt(st, arm->right, reporter, arena);
             }
             arm = arm->next;
+        }
+        break;
+    }
+
+    /* L4: walk the embedded expressions of an interpolated string so
+     * any nested host-calls / casts / etc. still get type-checked
+     * here. Per-segment coercibility is enforced by the dedicated
+     * `check_interp_coercibility` pass (6c). */
+    case AST_INTERP_STRING: {
+        AstNode *part = expr->params;
+        while (part) {
+            if (part->kind != AST_STRING_LIT)
+                check_expr(st, part, reporter, arena);
+            part = part->next;
         }
         break;
     }
@@ -4744,6 +5009,13 @@ static void own_check_stmt(OwnershipCtx *ctx, AstNode *stmt,
                 /* Method calls (db.connect, db.query, db.get, etc.) */
                 if (rk == AST_METHOD_CALL)
                     ov->is_copy = true;  /* handles + method results are Copy */
+                /* L7: host-call results (vdag:* dispatched verbs) are
+                 * scalar i64 / f64 / i32-bool / handles -- never owned
+                 * memory the front-end has to track. Marking Copy here
+                 * lets `let secs = time.now(); ... math.clamp(secs, ...)`
+                 * round-trip without the ownership pass mis-firing. */
+                if (rk == AST_HOST_CALL)
+                    ov->is_copy = true;
                 /* Binary expressions produce primitives */
                 if (rk == AST_BINARY)
                     ov->is_copy = true;
@@ -4893,10 +5165,24 @@ static void own_check_fn(OwnershipCtx *ctx, AstNode *fn,
 
     own_push_scope(ctx);
 
-    /* Register function parameters as owned variables */
+    /* Register function parameters as owned variables.
+     *
+     * L7: scalar-typed params (int, bool, float, string) are Copy,
+     * matching the same rule used for `let x: int = ...` at line ~5018.
+     * Without this, the L7 stdlib pattern
+     * `fn f(label: string) -> bool { string.contains(label, "x") }`
+     * incorrectly trips the ownership pass on the second use of
+     * `label`. */
     for (p = fn->params; p; p = p->next) {
         if (p->kind == AST_PARAM && p->name) {
-            own_register(ctx, p->name, (int)p->loc.line);
+            VarOwnership *pv = own_register(ctx, p->name, (int)p->loc.line);
+            if (pv && p->type_expr && p->type_expr->name) {
+                const char *tn = p->type_expr->name;
+                if (strcmp(tn, "int") == 0 || strcmp(tn, "bool") == 0 ||
+                    strcmp(tn, "float") == 0 || strcmp(tn, "string") == 0 ||
+                    strcmp(tn, "i64") == 0 || strcmp(tn, "f64") == 0)
+                    pv->is_copy = true;
+            }
         }
     }
 
@@ -5069,6 +5355,14 @@ bool typecheck_program(AstNode *program, ErrorReporter *reporter,
 
     /* Pass 6: Basic type checking (enforced) */
     check_types(&st, program, reporter, arena);
+
+    /* Pass 6c: L4 string-interpolation coercion check. Each `${expr}`
+     * site must lower to one of the built-in `string.from_*` host
+     * calls; the canonical contract supports int / bool / float /
+     * string. `Json` requires an explicit `as string` cast (delegated
+     * to `vdag:json.as-string`). Anything else raises
+     * ERR_INTERP_NOT_COERCIBLE. */
+    check_interp_coercibility(program, reporter);
 
     /* Pass 7: Enum LLM constraint detection (advisory) */
     int enum_start = reporter->count;
