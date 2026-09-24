@@ -15,7 +15,7 @@ Limceron is a programming language for AI agents. The compiler is written in C (
 > 5. **`docs/adr/`** — if the task changed architecture, contracts (`include/vdag.wit`), or technical decisions, add a new ADR or update the relevant one.
 > 6. **Repo artifacts** — `README.md`, `docs/language-reference.md`, WIT contracts (`include/vdag.wit`, `include/vdag.errors.wit`) if the task touched them.
 
-**Why this matters:**  We can´t lost valuable context to sessions that closed without persisting. Every task that skips this step becomes technical debt that resurfaces next session and forces re-explaining everything. The rule exists so the next session starts with ALL of the previous session's knowledge.
+**Why this matters:** We can't afford to lose valuable context to sessions that closed without persisting. Every task that skips this step becomes technical debt that resurfaces next session and forces re-explaining everything. The rule exists so the next session starts with ALL of the previous session's knowledge.
 
 **How to apply it:**
 
