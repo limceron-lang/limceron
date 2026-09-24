@@ -1,22 +1,22 @@
 # Learnings
 
-Registro de errores cometidos y correcciones, para no repetirlos. Ver regla "Bucle de mejora
-automática" en `CLAUDE.md`.
+Log of mistakes made and how they were fixed, so they don't get repeated. See the "Automatic
+improvement loop" rule in `CLAUDE.md`.
 
-## Formato de entrada
+## Entry format
 
 ```markdown
-## YYYY-MM-DD — <título corto>
+## YYYY-MM-DD — <short title>
 
-**Síntoma:** qué salió mal / qué corrigió el usuario.
-**Causa raíz:** por qué pasó (no superficial — la causa real).
-**Regla:** qué hacer distinto la próxima vez, como instrucción ejecutable.
-**Trigger:** cómo reconocer la situación en el futuro para aplicar la regla.
+**Symptom:** what went wrong / what the user corrected.
+**Root cause:** why it happened (not surface-level — the real cause).
+**Rule:** what to do differently next time, as an executable instruction.
+**Trigger:** how to recognize the situation in the future to apply the rule.
 ```
 
-Una regla que se aplica 3+ veces y se mantiene estable se promueve a `CLAUDE.md`. Una regla que
-queda obsoleta se marca `DEPRECATED` con la razón — no se borra, el histórico tiene valor.
+A rule that gets applied 3+ times and holds up gets promoted to `CLAUDE.md`. A rule that turns out
+wrong gets marked `DEPRECATED` with the reason — it doesn't get deleted, the history has value.
 
 ---
 
-(sin entradas todavía)
+(no entries yet)

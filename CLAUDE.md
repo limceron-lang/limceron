@@ -4,48 +4,48 @@
 
 Limceron is a programming language for AI agents. The compiler is written in C (Stage 0) and self-hosts in Limceron (Stage 1). It compiles to C99 or native assembly (x86_64/aarch64).
 
-## Persistencia post-tarea (regla no negociable)
+## Post-task persistence (non-negotiable rule)
 
-> Después de terminar cualquier tarea, antes de cerrar la respuesta al usuario, actualizar siempre — en este orden:
+> After finishing any task, before closing the response to the user, always update — in this order:
 >
-> 1. **Memoria persistente** (`/Users/mikelcarozzi/.claude/projects/-Users-mikelcarozzi-Documents-Desarrollo-IA-Limceron-lang/memory/`) — agregar/actualizar entradas tipo `user`, `feedback`, `project`, `reference`.
-> 2. **`LEARNINGS.md`** — registrar errores cometidos y resoluciones (bucle de mejora automática, ver más abajo).
-> 3. **`CLAUDE.md`** — si la tarea reveló una nueva regla operativa, convención del proyecto, comando frecuente o decisión arquitectónica, agregarla acá.
-> 4. **`ROADMAP.md`** — actualizar siempre que se cierre o replanifique una etapa del bootstrap (Stage 0/1/2) o una feature de la lista L1-L13. Es el roadmap vivo del repo.
-> 5. **`docs/adr/`** — si la tarea cambió arquitectura, contratos (`include/vdag.wit`) o decisiones técnicas, agregar un ADR nuevo o actualizar el correspondiente.
-> 6. **Artefactos del repo** — `README.md`, `docs/language-reference.md`, contratos WIT (`include/vdag.wit`, `include/vdag.errors.wit`) si la tarea los tocó.
+> 1. **Persistent memory** (`/Users/mikelcarozzi/.claude/projects/-Users-mikelcarozzi-Documents-Desarrollo-IA-Limceron-lang/memory/`) — add/update `user`, `feedback`, `project`, `reference` entries.
+> 2. **`LEARNINGS.md`** — record mistakes made and how they were fixed (see the learnings loop below).
+> 3. **`CLAUDE.md`** — if the task revealed a new operating rule, project convention, frequent command, or architectural decision, add it here.
+> 4. **`ROADMAP.md`** — update whenever a bootstrap stage (Stage 0/1/2) or an L1-L13 feature is closed or replanned. This is the repo's living roadmap.
+> 5. **`docs/adr/`** — if the task changed architecture, contracts (`include/vdag.wit`), or technical decisions, add a new ADR or update the relevant one.
+> 6. **Repo artifacts** — `README.md`, `docs/language-reference.md`, WIT contracts (`include/vdag.wit`, `include/vdag.errors.wit`) if the task touched them.
 
-**Motivo (no olvidar):** Mikel ya perdió contexto valioso por sesiones cerradas sin persistir. Cada tarea sin actualización es deuda técnica que vuelve a aparecer la próxima sesión y obliga a re-explicar todo. La regla existe para que la próxima sesión arranque con TODO el conocimiento de la anterior.
+**Why this matters:** Mikel has already lost valuable context to sessions that closed without persisting. Every task that skips this step becomes technical debt that resurfaces next session and forces re-explaining everything. The rule exists so the next session starts with ALL of the previous session's knowledge.
 
-**Cómo aplicar:**
-- No depender solo del contexto de la conversación. Asumir que la sesión puede cortarse en cualquier momento.
-- Si una decisión cuesta más de 5 minutos de discusión, capturarla en el archivo que corresponda **antes** de implementar.
-- Al terminar una tarea, decir explícitamente al usuario qué se actualizó (1 línea: "Actualicé memoria + LEARNINGS + CLAUDE.md").
+**How to apply it:**
+- Don't rely solely on conversation context. Assume the session can end at any moment.
+- If a decision took more than 5 minutes of discussion, capture it in the right file **before** implementing.
+- When a task is done, tell the user in one line what was updated (e.g. "Updated memory + LEARNINGS + CLAUDE.md").
 
-## Bucle de mejora automática (patrón Boris Cherny)
+## Automatic improvement loop (Boris Cherny pattern)
 
-> Cada vez que cometas un error — y cada vez que el usuario te corrija — documentarlo en `LEARNINGS.md` con:
+> Every time you make a mistake — and every time the user corrects you — document it in `LEARNINGS.md` with:
 >
-> 1. **Síntoma** — qué hice mal o qué falló.
-> 2. **Causa raíz** — por qué pasó (no superficial: la causa real).
-> 3. **Regla** — qué haré distinto la próxima vez, en forma de instrucción ejecutable.
-> 4. **Trigger** — cómo reconocer la situación en el futuro para aplicar la regla.
+> 1. **Symptom** — what went wrong or what failed.
+> 2. **Root cause** — why it happened (not surface-level: the real cause).
+> 3. **Rule** — what to do differently next time, as an executable instruction.
+> 4. **Trigger** — how to recognize the situation in the future so the rule gets applied.
 
-**Reglas del bucle:**
+**Rules for the loop:**
 
-- **Documentar todo error**, incluso si parece menor. La acumulación es la que da el valor.
-- **Si una regla en `LEARNINGS.md` se aplica más de 3 veces y es estable, promoverla a `CLAUDE.md`** como convención del proyecto. `LEARNINGS.md` es el laboratorio; `CLAUDE.md` es la doctrina.
-- **Antes de empezar tareas no triviales, leer `LEARNINGS.md`**. Esto previene repetir errores ya documentados.
-- **Si una regla resulta equivocada con nueva evidencia, marcarla `DEPRECATED`** y registrar por qué — no borrar, el histórico tiene valor.
+- **Document every mistake**, even minor ones. The value comes from accumulation.
+- **If a rule in `LEARNINGS.md` gets applied 3+ times and holds up, promote it to `CLAUDE.md`** as a project convention. `LEARNINGS.md` is the lab; `CLAUDE.md` is the doctrine.
+- **Before starting non-trivial tasks, read `LEARNINGS.md`**. This prevents repeating already-documented mistakes.
+- **If a rule turns out wrong given new evidence, mark it `DEPRECATED`** and record why — don't delete it, the history has value.
 
-**Formato de entrada en `LEARNINGS.md`:** ver template en cabecera de ese archivo.
+**Entry format for `LEARNINGS.md`:** see the template at the top of that file.
 
-## Reglas de código
+## Code rules
 
-- **Idioma:** comentarios e identificadores en **inglés** — así está todo el codebase existente (`src/`, `runtime/`, `stage1/`, `test/`); no introducir comentarios en español.
-- **Comentarios:** por default, ninguno. Solo cuando el "porqué" no es obvio (workaround puntual, invariante sutil, causa raíz de un bug pasado — no repetir lo que ya dice el código).
-- **Sin features especulativos.** No agregar abstracciones para "futuros casos". Tres líneas similares > abstracción prematura.
-- **Tipos fuertes en todos lados:** C99 explícito en compilador/runtime; en Limceron mismo, `Result<T,E>`, generics monomorphization, enums tageados exhaustivos en `match`.
+- **Language:** comments and identifiers in **English** — that's the convention across the entire existing codebase (`src/`, `runtime/`, `stage1/`, `test/`); don't introduce Spanish comments.
+- **Comments:** none by default. Only when the "why" isn't obvious (a specific workaround, a subtle invariant, the root cause of a past bug — don't restate what the code already says).
+- **No speculative features.** Don't add abstractions for "future cases". Three similar lines beat a premature abstraction.
+- **Strong typing everywhere:** explicit C99 in the compiler/runtime; in Limceron itself, `Result<T,E>`, generics monomorphization, exhaustive tagged enums in `match`.
 
 ## Architecture
 
