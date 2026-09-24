@@ -16,18 +16,30 @@
 | Runtime (25 .c + 25 .h) | ~12,000 | Budget, LLM, MCP client+server, channels, threads, select, entropy, drift, delegation, memory, KB, dashboard, MySQL, Postgres, ONNX, access control, capability fence, string utils, JSON, stdlib |
 | **Total (excl. sqlite3)** | **~44,000** | |
 
-### Stage 1 — Self-Hosting (Limceron compiled by Stage 0) — IN PROGRESS
+### Stage 1 — Self-Hosting (Limceron compiled by Stage 0) — `make bootstrap` GREEN (2026-09-24)
 
 | Component | LOC | Status |
 |---|---|---|
-| `lexer.lceron` | 499 | Complete — tokenizes its own source (19,835 bytes → 3,447 tokens) |
-| `parser.lceron` | 1,757 | Complete — parses its own source (10,567 tokens → S-expression AST) |
-| `typecheck.lceron` | 2,677 | Complete — 4-pass type checker, verified end-to-end |
-| `codegen.lceron` | 2,243 | Complete — C99 code generator, verified end-to-end |
+| `lexer.lceron` | 531 | Complete — tokenizes its own source |
+| `parser.lceron` | 2,474 | Complete — parses its own source |
+| `typecheck.lceron` | 2,683 | Complete — verified end-to-end |
+| `codegen.lceron` | 5,814 | Complete — C99 code generator, verified end-to-end |
+| **Total** | **11,502** | (`wc -l stage1/*.lceron` — was 8,755 further back; re-run that command rather than trusting this row) |
 
-### Stage 2 — Full Self-Hosting — NOT STARTED
+`make bootstrap` (Stage 0 → Stage 1, then Stage 1 compiling itself → Stage 2) now passes end to end,
+including the Stage 1/Stage 2 lexer output fixed-point check — see `docs/CORRECCIONES-2026-06-11.md`
+C1 for what was broken and how it was fixed. This row previously said "NOT STARTED", which was wrong
+even at the time it was written: the Makefile already had `stage2-build` + `test-bootstrap` implemented.
 
-`stage2(source) == stage2(stage2(source))` — compiler compiles itself, output is identical.
+### Stage 2 (roadmap sense) — Full Self-Hosting w/ Ownership, Traits, comptime — NOT STARTED
+
+**Naming collision, read carefully:** the Makefile's `stage2-build`/`test-bootstrap` targets (see row
+above) build a "Stage 2" that means *Stage 1 compiling itself once* and checking lexer output parity.
+That is now green. This section's "Stage 2" means something larger and still unimplemented: a true
+double-compilation fixed point (`stage2(source) == stage2(stage2(source))`, i.e. an actual Stage 3 diff
+— no such target exists yet) plus the language features listed under "Parsed Only" below (ownership /
+borrow checker, traits/interfaces, comptime). Don't conflate the two "Stage 2"s; the Makefile's bootstrap
+passing does not mean this section is done.
 
 ---
 
@@ -115,7 +127,7 @@ Stage 0's job: compile enough Limceron to build Stage 1. That job is done.
 
 Features like traits, ownership, comptime are spec features for Stage 2 — not the bootstrap compiler.
 
-### Stage 1 Self-Hosting — 70%
+### Stage 1 Self-Hosting — 100% (`make bootstrap` green, 2026-09-24)
 
 | Area | % | Notes |
 |---|---|---|
@@ -123,7 +135,7 @@ Features like traits, ownership, comptime are spec features for Stage 2 — not 
 | Parser in Limceron | 100% | `parser.lceron` — parses itself |
 | Type checker in Limceron | 100% | `typecheck.lceron` — 4-pass, verified end-to-end |
 | Codegen in Limceron | 100% | `codegen.lceron` — C99 emitter, verified end-to-end |
-| Full pipeline verification | 80% | lex→parse→typecheck→codegen→gcc→run works, some false positives on self-referential code |
+| Full pipeline verification | 100% | `make bootstrap`: Stage 0 → Stage 1 → Stage 2, lexer output fixed-point check passes. Was 80% ("some false positives on self-referential code") when this row was last written — that note is untested folklore now, not a known-current issue; re-verify with `make bootstrap` before trusting either number. |
 
 ### Stage 1 Roadmap Phases (from plan)
 
@@ -139,8 +151,8 @@ Features like traits, ownership, comptime are spec features for Stage 2 — not 
 | Milestone | Status |
 |---|---|
 | Stage 0 bootstrap compiler | **COMPLETE** — compiles Stage 1, 24 examples, production agents |
-| Stage 1 self-hosting | **70%** — 4/4 pipeline components written and verified |
-| Stage 2 full self-hosting | **0%** — ownership, traits, comptime, native backend |
+| Stage 1 self-hosting | **COMPLETE** — 4/4 pipeline components, `make bootstrap` green |
+| Stage 2 full self-hosting (roadmap sense, see above) | **0%** — ownership, traits, comptime, native backend |
 | Production validation | **COMPLETE** — medical categorizer: LLM 82.6%, BERT 93.1% |
 | Documentation | **85%** — README needs update for new features |
 

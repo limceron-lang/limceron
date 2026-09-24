@@ -60,7 +60,33 @@ La suite (475 tests) pasa con el bootstrap roto: ningún test compila `stage1/*.
 
 ---
 
-## C2 — README desincronizado con la realidad (riesgo de credibilidad)
+## C2 — README desincronizado con la realidad (riesgo de credibilidad) — ✅ RESUELTO (2026-09-24)
+
+**Nota de cierre:** los 5 puntos atacados. (1) Reescrito el claim de fixed-point para decir exactamente
+lo que `make bootstrap` verifica hoy (Stage1==Stage2 en un lexer de prueba + self-hosting lexeando el
+propio Stage 1) — sin mencionar un "Stage 3" que no existe en el Makefile. (2) "477 tests / 2.123
+assertions" → "600+ tests / 2.700+ assertions" (real: 476+120+15=611 tests, 2139+609+37=2785
+assertions, redondeado hacia abajo como sugería el doc — no se armó `make readme-stats`, queda en
+roadmap). (3) LOC de Stage 1: 8.755 → 11.500+. (4) Narrativa dual-track: la sección "Native Compilation"
+ahora aclara que es el target primario para single-tenant/edge y linkea el ADR-0001 para el caso SaaS
+multi-tenant; la sección Documentation separa `examples/language/` de `examples/wasm/` en vez de listar
+solo wasm. (5) Tabla competitiva: agregada una oración que fija el criterio de comparación ("language
+primitive enforced at compile time") en vez de tocar cada celda — la mayoría de las filas ya estaban
+bien acotadas (p.ej. "Handoffs only" para OpenAI SDK), el problema era la falta de ese marco explícito.
+
+## C3 — ROADMAP.md interno stale — ✅ RESUELTO (2026-09-24, alcance acotado)
+
+**Nota de cierre:** arreglados los dos puntos que nombraba el doc — tabla de LOC de Stage 1 (7.176 →
+11.502, por archivo) y el estado "Stage 2 — NOT STARTED". Sobre esto último se encontró algo más grave
+que una cifra vieja: el ROADMAP usa "Stage 2" para dos cosas distintas — el Makefile (`stage2-build`/
+`test-bootstrap`, ya implementado y ahora verde) construye "Stage 1 compilándose a sí mismo una vez",
+mientras que la sección "Stage 2" del ROADMAP se refiere a un fixed-point real de doble compilación
+(`stage2(source)==stage2(stage2(source))`, un Stage 3 que no existe) MÁS ownership/traits/comptime — eso
+sigue en 0%, genuinamente no arrancado. Se documentó la colisión de nombres explícitamente para que no
+se vuelva a confundir "bootstrap pasa" con "Stage 2 del roadmap está listo". El resto del archivo (LOC
+de Stage 0, conteos de tests viejos, % de fases) sigue stale — no verificado en esta pasada, fuera del
+alcance que pedía este ítem; si se quiere ese archivo 100% honesto hace falta una pasada dedicada.
+
 
 El README es excelente marketing, pero hoy contiene claims falsificables en 5 minutos por cualquier evaluador — y la audiencia de un lenguaje de *trust* es exactamente la que va a verificar:
 
