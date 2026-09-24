@@ -42,7 +42,8 @@ typedef struct {
     } *tool_calls;
     int tool_call_count;
 
-    /* Entropy (Shannon entropy of first token logprobs) */
+    /* Entropy (Shannon entropy of first token logprobs -- a reasonable proxy for
+     * short/few-class outputs, weak for long-form output; see llm.c C6 note) */
     double   entropy;           /* H = -sum(p * log2(p)) */
     double   confidence;        /* 1.0 - normalized_entropy [0,1]; -1.0 = provider gave no
                                   * logprobs (no signal, NOT certainty -- see llm.c C5 note) */

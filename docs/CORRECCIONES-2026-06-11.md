@@ -147,10 +147,17 @@ faltaba `%%` en vez de sobrar). Test nuevo: `codegen_entropy_budget_fails_fast_w
 
 **Aceptación:** un agente con `entropy_budget` contra un endpoint sin logprobs falla ruidosamente con mensaje claro, nunca corre con confianza 1.0 sintética.
 
-## C6 — Entropía calculada solo sobre el primer token
+## C6 — Entropía calculada solo sobre el primer token — ✅ RESUELTO (2026-09-24, doc; N-token queda roadmap)
 
 `runtime/llm.c:378-379`: la entropía usa los top-logprobs del **primer token** de la completion. Es un proxy razonable para clasificación de pocas clases (el caso radiología) pero débil/engañoso para outputs largos (razonamiento, JSON rico).
 **Fix:** documentar la limitación donde se describe `result.confidence`; opcionalmente promediar sobre los primeros N tokens (configurable, default 1 para no romper compatibilidad).
+
+**Nota de cierre:** documentada la limitación en los 3 lugares donde importa — el comentario junto al
+cálculo en `runtime/llm.c`, el campo `entropy` en `runtime/llm.h`, y el párrafo de README que describe
+`result.confidence` al usuario (explica por qué un `{` inicial de JSON puede leer como "confiado" aunque
+el contenido sea incierto). El promedio sobre N tokens configurable queda sin implementar — es explícitamente
+opcional en este ítem y no bloqueante; requeriría enhebrar un parámetro nuevo por request → codegen →
+runtime, que es más alcance del que este ítem pedía.
 
 ## C7 — Higiene de warnings
 

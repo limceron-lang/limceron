@@ -376,7 +376,16 @@ static LcnLlmResponse *llm_parse_response(const char *body, size_t body_len)
 
     /* Logprobs → Shannon Entropy calculation
      * OpenAI/vLLM format: choices[0].logprobs.content[0].top_logprobs[{token, logprob}]
-     * We compute entropy over the top logprobs of the first completion token. */
+     * We compute entropy over the top logprobs of the first completion token ONLY.
+     *
+     * C6: this is a reasonable proxy for short, few-class outputs (classification
+     * labels, yes/no, a single category token) where most of the model's
+     * uncertainty shows up on that first token. It is a weak/misleading proxy for
+     * long-form output (reasoning, rich JSON) where the first token is often
+     * near-deterministic (e.g. the opening `{` of a JSON object) regardless of how
+     * uncertain the model is about the content that follows. Averaging over the
+     * first N tokens would be a straightforward improvement but isn't implemented
+     * -- see docs/CORRECCIONES-2026-06-11.md C6. */
     {
         const LcnJsonValue *lp_obj = lcn_json_get(first_choice, "logprobs");
         resp->entropy = 0.0;
