@@ -110,7 +110,7 @@ agent Bot {
 
 No extra code. No wrappers.
 
-No boilerplate. No decorators. No YAML. The `ask()` call returns a confidence score on every response -- Shannon entropy of the LLM's probability distribution, normalized to [0, 1]. High confidence auto-commits. Low confidence escalates to a human. You never have to guess whether your agent is guessing.
+No boilerplate. No decorators. No YAML. The `ask()` call returns a confidence score on every response where the provider exposes logprobs (OpenAI-compatible APIs, vLLM, Ollama) or you run a local ONNX model -- Shannon entropy of the LLM's probability distribution, normalized to [0, 1]. High confidence auto-commits. Low confidence escalates to a human. Providers that don't expose logprobs (Anthropic's native API and Bedrock, as of this writing) return no signal, and `entropy_budget` fails fast rather than silently treating that absence as certainty -- you never have to guess whether your agent is guessing, and you're told plainly when the runtime can't tell either.
 
 ## You Can Start Even Simpler (Markdown)
 
@@ -346,7 +346,7 @@ make test    # run the full suite
 | Compile-time access control | No | No | No | No | **Yes** |
 | Taint tracking (prompt injection) | No | No | No | No | **Yes -- type error** |
 | Budget as language primitive | No | No | No | No | **Yes -- keyword** |
-| Entropy/confidence on every call | No | No | No | No | **Yes** |
+| Entropy/confidence on every call | No | No | No | No | **Yes -- where the provider exposes logprobs, or local ONNX** |
 | Statistical drift detection | No | No | No | No | **Yes -- auto-pause** |
 | Native DB drivers (MySQL/Postgres) | No | No | No | No | **Yes -- direct TCP** |
 | ONNX model binding | No | No | No | No | **Yes -- CPU, <5ms** |

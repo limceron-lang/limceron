@@ -8733,6 +8733,19 @@ static void cg_agent(CodeGen *g, AstNode *agent) {
         cg_nl(g);
         /* Auto-record entropy if entropy_budget is configured */
         if (has_entropy_budget) {
+            /* C5: confidence < 0.0 is the "no logprobs from this provider" sentinel
+             * (runtime/llm.c). An agent that declared entropy_budget is asking the
+             * runtime to enforce on that signal -- silently treating its absence as
+             * confidence 1.0 would mean the fence never trips. Fail loud instead. */
+            cg_line(g, "if (_llm.confidence < 0.0) {");
+            g->indent++;
+            cg_line(g, "fprintf(stderr, \"entropy_budget requires logprobs or a local ONNX model; "
+                       "endpoint '%%s' (model '%%s') returned none.\\n\", "
+                       "self->endpoint ? self->endpoint : \"(default)\", self->model ? self->model : \"(default)\");");
+            cg_line(g, "if (_llm.content) free(_llm.content);");
+            cg_line(g, "return LCN_ERR(\"entropy_budget requires logprobs or a local ONNX model; provider returned none\");");
+            g->indent--;
+            cg_line(g, "}");
             cg_line(g, "/* Record entropy for budget tracking */");
             cg_line(g, "if (self->_entropy_tracker) {");
             g->indent++;
@@ -8740,7 +8753,7 @@ static void cg_agent(CodeGen *g, AstNode *agent) {
             cg_line(g, "const char *_eb_err = lcn_entropy_check_budget(self->_entropy_tracker, &self->entropy_budget);");
             cg_line(g, "if (_eb_err) {");
             g->indent++;
-            cg_line(g, "fprintf(stderr, \"entropy budget violated: %s\\n\", _eb_err);");
+            cg_line(g, "fprintf(stderr, \"entropy budget violated: %%s\\n\", _eb_err);");
             cg_line(g, "if (_llm.content) free(_llm.content);");
             cg_line(g, "return LCN_ERR(_eb_err);");
             g->indent--;

@@ -84,7 +84,21 @@ El README es excelente marketing, pero hoy contiene claims falsificables en 5 mi
 **Fix:** si es un caso negativo esperado (verificar que una firma inválida se rechaza), el mensaje debe decirlo (`expected-fail OK`); si no lo es, el test no está assertando el resultado. Cualquier línea con "FAILED" en una suite verde erosiona confianza en la suite.
 **Aceptación:** salida de `make test` sin la palabra FAILED salvo en fallos reales.
 
-## C5 — `confidence = 1.0` silencioso cuando el proveedor no da logprobs
+## C5 — `confidence = 1.0` silencioso cuando el proveedor no da logprobs — ✅ RESUELTO (2026-09-24)
+
+**Nota de cierre:** implementado el fix #1+#2 del doc (sentinel + fail-fast). `resp->confidence` es
+`-1.0` (no `1.0`) cuando no hay logprobs — documentado en `runtime/llm.h`, `runtime/lcn_runtime.h`
+(`LcnLlmResult` y `LcnLlmOutput`). El `run()` auto-generado para agentes con `entropy_budget` ahora
+chequea `_llm.confidence < 0.0` ANTES de `lcn_entropy_record`/`lcn_entropy_check_budget` y devuelve
+error con el endpoint/modelo en el mensaje, en vez de dejar que una confianza sintética 1.0 nunca
+dispare el fence. README (línea de `ask()` y tabla competitiva) matizado con la salvedad de logprobs —
+fix #3. Fix #4 (self-consistency sampling como proxy) queda en roadmap, no bloqueante, tal como decía
+el doc. De paso, se encontró y corrigió un bug UB no relacionado en el mismo bloque de codegen: un
+`cg_line(g, "...%s...")` sin el argumento correspondiente (mismo patrón que C1.a pero al revés —
+faltaba `%%` en vez de sobrar). Test nuevo: `codegen_entropy_budget_fails_fast_without_logprobs`.
+`make test` (476+120+15) y `make bootstrap` en verde.
+
+
 
 `runtime/llm.c:383`: si la respuesta no trae logprobs, `resp->confidence = 1.0`. Anthropic (API directa y Bedrock) **no expone logprobs** → contra los modelos Claude, todo `ask()` reporta confianza máxima y el `entropy_budget` no dispara jamás. Es el peor default posible para un lenguaje cuyo pitch es "el agente sabe cuándo no sabe": **ausencia de señal se reporta como certeza absoluta.**
 

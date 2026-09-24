@@ -3930,6 +3930,42 @@ TEST(codegen_invariant_avg_confidence) {
     free(c);
 }
 
+/* C5: an agent with entropy_budget must refuse to enforce on a synthetic
+ * confidence 1.0 when the provider gave no logprobs (confidence < 0.0,
+ * see runtime/llm.c). The generated run() must check for that sentinel
+ * and fail loud BEFORE recording it into the entropy tracker.
+ *
+ * The auto-generated run() (and the fix's guard) only exists in build mode
+ * (#include "lcn_runtime.h", g->use_runtime_header) — gen_c() uses the
+ * standalone codegen path, which stubs out entropy entirely, so this needs
+ * codegen_generate_for_build directly like codegen_no_guards_native does. */
+TEST(codegen_entropy_budget_fails_fast_without_logprobs) {
+    bool had_error = false;
+    AstNode *program = parse_source(
+        "agent Categorizer {\n"
+        "    prompt: \"classify this\"\n"
+        "    capabilities: [llm.complete]\n"
+        "    entropy_budget: {\n"
+        "        max_avg_entropy: 0.7\n"
+        "        max_low_confidence: 0.20\n"
+        "    }\n"
+        "}\n",
+        &had_error);
+    ASSERT_FALSE(had_error);
+    char *c = codegen_generate_for_build(program, "<test>", &test_arena);
+    ASSERT_NOT_NULL(c);
+    ASSERT(strstr(c, "if (_llm.confidence < 0.0)") != NULL);
+    ASSERT(strstr(c, "entropy_budget requires logprobs") != NULL);
+    /* The fail-fast guard must appear before the entropy is recorded, so a
+     * fake 1.0 never reaches the tracker/budget check. */
+    const char *guard = strstr(c, "if (_llm.confidence < 0.0)");
+    const char *record = strstr(c, "lcn_entropy_record(");
+    ASSERT_NOT_NULL(guard);
+    ASSERT_NOT_NULL(record);
+    ASSERT(guard < record);
+    free(c);
+}
+
 TEST(codegen_invariant_avg_entropy) {
     char *c = gen_c(
         "invariant low_entropy {\n"
@@ -8613,6 +8649,7 @@ int main(void) {
     fprintf(stderr, "\n── Invariant Wiring Tests ──\n");
     RUN_TEST(codegen_invariant_drift);
     RUN_TEST(codegen_invariant_avg_confidence);
+    RUN_TEST(codegen_entropy_budget_fails_fast_without_logprobs);
     RUN_TEST(codegen_invariant_avg_entropy);
     RUN_TEST(parse_invariant_decl);
 

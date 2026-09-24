@@ -44,7 +44,8 @@ typedef struct {
 
     /* Entropy (Shannon entropy of first token logprobs) */
     double   entropy;           /* H = -sum(p * log2(p)) */
-    double   confidence;        /* 1.0 - normalized_entropy [0,1] */
+    double   confidence;        /* 1.0 - normalized_entropy [0,1]; -1.0 = provider gave no
+                                  * logprobs (no signal, NOT certainty -- see llm.c C5 note) */
     double  *logprobs;          /* Raw log probabilities (malloc'd, caller frees) */
     int      logprob_count;
 

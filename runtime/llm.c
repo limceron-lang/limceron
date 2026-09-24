@@ -380,7 +380,13 @@ static LcnLlmResponse *llm_parse_response(const char *body, size_t body_len)
     {
         const LcnJsonValue *lp_obj = lcn_json_get(first_choice, "logprobs");
         resp->entropy = 0.0;
-        resp->confidence = 1.0;
+        /* C5: -1.0 is the "no signal" sentinel, not a real confidence value.
+         * Providers that don't expose logprobs (Anthropic native/Bedrock among
+         * them) must not be reported as maximally confident -- absence of signal
+         * is not certainty, and an agent's entropy_budget fence would never trip
+         * against a silent 1.0. Callers that enforce entropy_budget check for
+         * confidence < 0.0 and fail fast (see codegen.c has_entropy_budget). */
+        resp->confidence = -1.0;
         resp->logprobs = NULL;
         resp->logprob_count = 0;
 
