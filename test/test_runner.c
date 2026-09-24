@@ -7,6 +7,7 @@
 #include "lcn.h"
 #include "package.h"
 #include "test.h"
+#include <unistd.h>
 
 /* ============================================================
  * Helpers
@@ -1116,6 +1117,29 @@ TEST(security_hash_different) {
     ASSERT(memcmp(hash1, hash2, HASH_SIZE) != 0);
 }
 
+/* C4: security_verify_lceron() prints loud runtime diagnostics (including
+ * the literal word "FAILED") when verification fails -- correct behavior
+ * for a real tampered/misattributed .lceron file at runtime, but the three
+ * negative-case tests below deliberately trigger it to prove rejection
+ * works, and a bare "FAILED" line inside an otherwise-green `make test` run
+ * erodes confidence in the suite. Silence stderr around the call and print
+ * an explicit "expected-fail OK" marker instead, so the intent stays
+ * visible without looking like an unasserted failure. */
+static bool verify_expect_fail(const LceronObjHeader *header, const uint8_t *data, size_t len,
+                                const uint8_t public_key[HASH_SIZE], const char *why) {
+    bool ok;
+    int saved_stderr;
+    fflush(stderr);
+    saved_stderr = dup(fileno(stderr));
+    freopen("/dev/null", "w", stderr);
+    ok = security_verify_lceron(header, data, len, public_key);
+    fflush(stderr);
+    dup2(saved_stderr, fileno(stderr));
+    close(saved_stderr);
+    fprintf(stderr, "         [expected-fail OK] security_verify_lceron rejected %s\n", why);
+    return ok;
+}
+
 TEST(security_lceron_sign_verify) {
     uint8_t key[HASH_SIZE];
     uint8_t data[] = "fn main() { print(42) }";
@@ -1152,7 +1176,7 @@ TEST(security_lceron_tamper_detection) {
     security_sign_lceron(&header, data, sizeof(data), key);
 
     /* Verify with tampered data should FAIL */
-    ASSERT_FALSE(security_verify_lceron(&header, tampered, sizeof(tampered), key));
+    ASSERT_FALSE(verify_expect_fail(&header, tampered, sizeof(tampered), key, "tampered content"));
 }
 
 TEST(security_lceron_wrong_key) {
@@ -1172,7 +1196,7 @@ TEST(security_lceron_wrong_key) {
     security_sign_lceron(&header, data, sizeof(data), key1);
 
     /* Verify with different key should FAIL */
-    ASSERT_FALSE(security_verify_lceron(&header, data, sizeof(data), key2));
+    ASSERT_FALSE(verify_expect_fail(&header, data, sizeof(data), key2, "signature from a different key"));
 }
 
 TEST(security_lceron_bad_magic) {
@@ -1187,7 +1211,7 @@ TEST(security_lceron_bad_magic) {
 
     for (i = 0; i < HASH_SIZE; i++) key[i] = (uint8_t)i;
 
-    ASSERT_FALSE(security_verify_lceron(&header, data, sizeof(data), key));
+    ASSERT_FALSE(verify_expect_fail(&header, data, sizeof(data), key, "bad magic number"));
 }
 
 /* ============================================================

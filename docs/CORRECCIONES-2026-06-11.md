@@ -104,7 +104,18 @@ El README es excelente marketing, pero hoy contiene claims falsificables en 5 mi
 - "Stage 2 — Full Self-Hosting — NOT STARTED" pero el Makefile ya tiene `stage2-build` + `test-bootstrap` implementados.
 **Fix:** actualizar tras cerrar C1; idealmente generar las LOC con un script para que no vuelva a divergir.
 
-## C4 — Test de seguridad imprime FAILED dentro de una suite verde
+## C4 — Test de seguridad imprime FAILED dentro de una suite verde — ✅ RESUELTO (2026-09-24)
+
+**Nota de cierre:** era caso negativo esperado (`security_lceron_wrong_key`/`tamper_detection`/
+`bad_magic` deliberadamente pasan una key/dato/magic incorrectos y assertan `ASSERT_FALSE`), tal como
+preveía el doc. El fix fue en el test, no en `security.c`: `security_verify_lceron()` sigue imprimiendo
+su diagnóstico completo a stderr cuando falla de verdad en runtime (correcto — es una alerta de
+seguridad real), pero los 3 tests que la ejercitan a propósito ahora silencian stderr alrededor de la
+llamada (`dup`/`freopen("/dev/null")`/`dup2` para restaurar) e imprimen su propia línea
+`[expected-fail OK] ...` explicando qué se esperaba que fallara y por qué. `make test` ya no tiene
+ninguna línea con "FAILED" en una corrida verde.
+
+
 
 `make test` muestra `security: .lceron signature verification FAILED` (origen: `src/security.c:327`) y aun así "ALL TESTS PASSED".
 **Fix:** si es un caso negativo esperado (verificar que una firma inválida se rechaza), el mensaje debe decirlo (`expected-fail OK`); si no lo es, el test no está assertando el resultado. Cualquier línea con "FAILED" en una suite verde erosiona confianza en la suite.
