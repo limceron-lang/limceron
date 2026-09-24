@@ -2677,7 +2677,7 @@ static bool is_builtin_name(const char *name) {
         "len", "append", "push", "pop", "insert", "remove",
         "contains", "keys", "values",
         "starts_with", "ends_with", "env",
-        "json_parse", "json_get", "json_get_number", "json_array_len", "json_array_get", "json_stringify",
+        "json_parse", "json_get", "json_get_value", "json_get_number", "json_array_len", "json_array_get", "json_stringify",
         "str_eq", "str_replace", "str_trim", "str_substring", "str_split",
         "to_string", "to_int", "to_float", "parse",
         "read", "write", "open", "close",

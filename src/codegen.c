@@ -22,7 +22,7 @@ static bool is_codegen_builtin(const char *name) {
         "print", "println", "len", "contains", "starts_with", "ends_with",
         "env", "env_or", "str_eq", "str_replace", "str_trim", "str_substring",
         "to_string", "to_int", "split", "format",
-        "json_parse", "json_get", "json_get_number", "json_array_len",
+        "json_parse", "json_get", "json_get_value", "json_get_number", "json_array_len",
         "json_array_get", "json_stringify",
         "abs", "min", "max", "clamp", "floor", "ceil", "round",
         "abs_f", "min_f", "max_f",
@@ -840,7 +840,7 @@ static bool is_builtin_name(const char *name) {
         "print", "println", "len", "contains", "starts_with", "ends_with",
         "env", "env_or", "str_eq", "str_replace", "str_trim", "str_substring",
         "to_string", "to_int", "split", "format", "true", "false",
-        "json_parse", "json_get", "json_get_number", "json_array_len",
+        "json_parse", "json_get", "json_get_value", "json_get_number", "json_array_len",
         "json_array_get", "json_stringify",
         "abs", "min", "max", "clamp", "floor", "ceil", "round",
         "now_ms", "sleep_ms", "elapsed_ms", "format_timestamp",
@@ -1135,7 +1135,8 @@ static void cg_infer_type_emit(CodeGen *g, AstNode *expr) {
                 strcmp(cn, "str_slice") == 0) {
                 cg_str(g, "LcnString"); return;
             }
-            if (strcmp(cn, "json_parse") == 0 || strcmp(cn, "json_array_get") == 0) {
+            if (strcmp(cn, "json_parse") == 0 || strcmp(cn, "json_array_get") == 0 ||
+                strcmp(cn, "json_get_value") == 0) {
                 cg_str(g, "LcnJsonValue *"); return;
             }
             if (strcmp(cn, "vec_new") == 0) {
@@ -1425,6 +1426,7 @@ static bool might_be_string_expr(CodeGen *g, AstNode *expr) {
                    strcmp(fn, "read_line") == 0 || strcmp(fn, "format_timestamp") == 0 ||
                    strcmp(fn, "format") == 0 || strcmp(fn, "lcn_str_concat") == 0 ||
                    strcmp(fn, "split") == 0 || strcmp(fn, "json_array_get") == 0 ||
+                   strcmp(fn, "json_get_value") == 0 ||
                    strcmp(fn, "sql_escape") == 0 ||
                    strcmp(fn, "unwrap") == 0 ||
                    strcmp(fn, "char_at") == 0 || strcmp(fn, "str_from_code") == 0 ||
@@ -2479,6 +2481,7 @@ static void cg_expr(CodeGen *g, AstNode *expr) {
             }
             /* JSON builtins */
             else if (strcmp(fn_name, "json_parse") == 0 || strcmp(fn_name, "json_get") == 0 ||
+                     strcmp(fn_name, "json_get_value") == 0 ||
                      strcmp(fn_name, "json_get_number") == 0 ||
                      strcmp(fn_name, "json_array_len") == 0 ||
                      strcmp(fn_name, "json_array_get") == 0 ||
@@ -2925,6 +2928,14 @@ static void cg_expr(CodeGen *g, AstNode *expr) {
                 cg_str(g, "))");
             } else if (strcmp(fn_name, "json_get") == 0) {
                 cg_str(g, "lcn_json_get_string(");
+                if (arg1) cg_expr(g, arg1);
+                else cg_str(g, "NULL");
+                cg_str(g, ", ");
+                if (arg2) cg_expr(g, arg2);
+                else cg_str(g, "\"\"");
+                cg_str(g, ")");
+            } else if (strcmp(fn_name, "json_get_value") == 0) {
+                cg_str(g, "lcn_json_get(");
                 if (arg1) cg_expr(g, arg1);
                 else cg_str(g, "NULL");
                 cg_str(g, ", ");
