@@ -528,7 +528,7 @@ static const char *lsp_builtins[] = {
     "push", "pop", "env", "env_or", "str_eq", "str_replace", "str_trim",
     "str_split", "str_upper", "str_lower", "str_len", "str_find",
     "to_string", "to_int", "to_float",
-    "json_parse", "json_get", "json_array_len", "json_array_get",
+    "json_parse", "json_get", "json_get_value", "json_array_len", "json_array_get",
     "json_stringify", "json_set",
     "math_abs", "math_min", "math_max", "math_sqrt", "math_pow",
     "math_floor", "math_ceil",

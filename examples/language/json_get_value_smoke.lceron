@@ -1,0 +1,57 @@
+// json_get_value_smoke.lceron — proof-of-concept for the json_get_value
+// builtin added to unblock the pulso21-agentic ajustar_bbtt pilot (see
+// limceron-pulso21-integration.md, "Encargo para el agente especializado
+// en Limceron"). Native target (Stage 0, no WASM). Synthetic fixture only
+// — no real client data, no network/LLM calls.
+//
+// Mirrors the shape of ajustar_bbtt's 4-line Python merge:
+//   ajustada = dict(base)
+//   for campo, valor in (datos or {}).items():
+//       if valor:
+//           ajustada[campo] = valor
+// i.e. per top-level field: if the incoming value is non-empty, it wins;
+// otherwise the base value is kept. Exercises the three field shapes that
+// matter for BaseAjustada: a plain string, a list[str], and a list[struct].
+//
+// Written as independent if/else branches, each with its own println —
+// NOT `let x = if cond {a} else {b}` (block-bodied if-as-expression hits
+// an unimplemented codegen path in the C99 backend) and NOT `let mut x:
+// Json = ...` (explicit `Json` type annotations aren't handled by cg_type
+// either). Both are separate findings, reported alongside this file —
+// this program only exercises json_get_value itself.
+
+fn main() {
+    let base = json_parse(
+        "{\"introduccion\":\"base intro\",\"epp\":[\"casco\",\"guantes\"],\"cargos\":[{\"rol\":\"supervisor\",\"dedicacion\":\"full\"}]}")
+    let incoming = json_parse(
+        "{\"introduccion\":\"intro ajustada por sourcing\",\"epp\":[],\"cargos\":[{\"rol\":\"jefe de obra\",\"dedicacion\":\"part\"},{\"rol\":\"supervisor\",\"dedicacion\":\"full\"}]}")
+
+    // Simple string field ("introduccion"): json_get already covers this
+    // (returns string directly) — incoming has content, so it wins.
+    let incoming_intro = json_get(incoming, "introduccion")
+    if str_eq(incoming_intro, "") {
+        println("introduccion (expect: incoming, has content) -> " + json_get(base, "introduccion"))
+    } else {
+        println("introduccion (expect: incoming, has content) -> " + incoming_intro)
+    }
+
+    // list[str] field ("epp"): incoming is an EMPTY array -> keep base.
+    // This is exactly the case json_get can't handle (it only returns
+    // string) — needs json_get_value to get the array as a Json handle.
+    let incoming_epp = json_get_value(incoming, "epp")
+    if json_array_len(incoming_epp) == 0 {
+        println("epp (expect: base, incoming was empty) -> " + json_stringify(json_get_value(base, "epp")))
+    } else {
+        println("epp (expect: base, incoming was empty) -> " + json_stringify(incoming_epp))
+    }
+
+    // list[struct] field ("cargos"): incoming has content -> incoming wins,
+    // whole sub-tree replaced wholesale (no per-element merge), same as
+    // the Python loop's "ajustada[campo] = valor" for a list field.
+    let incoming_cargos = json_get_value(incoming, "cargos")
+    if json_array_len(incoming_cargos) == 0 {
+        println("cargos (expect: incoming, has content) -> " + json_stringify(json_get_value(base, "cargos")))
+    } else {
+        println("cargos (expect: incoming, has content) -> " + json_stringify(incoming_cargos))
+    }
+}

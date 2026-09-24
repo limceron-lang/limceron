@@ -2286,6 +2286,37 @@ TEST(codegen_json_array_get_builtin) {
     free(c);
 }
 
+/* json_get_value(doc, key) -> Json: like json_get, but returns the raw
+ * LcnJsonValue* handle instead of coercing to string -- the only way to
+ * read an object/array field (e.g. a JSON object's array-valued key) that
+ * isn't a bare scalar. json_get can't do this: it always returns string.
+ * Added for the pulso21-agentic ajustar_bbtt pilot -- see
+ * limceron-pulso21-integration.md and
+ * examples/language/json_get_value_smoke.lceron for the end-to-end proof. */
+TEST(codegen_json_get_value_builtin) {
+    char *c = gen_c("fn main() -> Result {\n    let v = json_get_value(doc, \"cargos\")\n}");
+    ASSERT_NOT_NULL(c);
+    ASSERT(strstr(c, "lcn_json_get(") != NULL);
+    /* Must NOT lower to json_get's string coercion. */
+    ASSERT(strstr(c, "lcn_json_get_string(") == NULL);
+    free(c);
+}
+
+TEST(codegen_json_get_value_returns_json_handle) {
+    /* Return type must be LcnJsonValue* (like json_array_get), not
+     * LcnString -- this is exactly the type-inference site a copy/paste
+     * of json_get's handling would get wrong. */
+    char *c = gen_c(
+        "fn main() -> Result {\n"
+        "    let doc = json_parse(\"{}\")\n"
+        "    let v = json_get_value(doc, \"cargos\")\n"
+        "    let n = json_array_len(v)\n"
+        "}\n");
+    ASSERT_NOT_NULL(c);
+    ASSERT(strstr(c, "LcnJsonValue * v = lcn_json_get(") != NULL);
+    free(c);
+}
+
 TEST(codegen_string_equality) {
     char *c = gen_c("fn main() -> Result {\n    let x = \"hello\"\n    if x == \"hello\" {\n        println(\"match\")\n    }\n}");
     ASSERT_NOT_NULL(c);
@@ -8560,6 +8591,8 @@ int main(void) {
     RUN_TEST(codegen_json_get_builtin);
     RUN_TEST(codegen_json_array_len_builtin);
     RUN_TEST(codegen_json_array_get_builtin);
+    RUN_TEST(codegen_json_get_value_builtin);
+    RUN_TEST(codegen_json_get_value_returns_json_handle);
     RUN_TEST(codegen_string_equality);
     RUN_TEST(codegen_string_inequality);
     RUN_TEST(codegen_enum_constants);

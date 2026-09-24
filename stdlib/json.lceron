@@ -3,6 +3,7 @@
 
 fn json_parse(text: string) -> Json { }              // builtin
 fn json_get(doc: Json, key: string) -> string { }    // builtin
+fn json_get_value(doc: Json, key: string) -> Json { } // builtin — object field as a handle (array/object), unlike json_get which only reads scalars as string
 fn json_get_number(doc: Json, key: string) -> f64 { }  // builtin
 fn json_array_len(arr: Json) -> i64 { }              // builtin
 fn json_array_get(arr: Json, index: i64) -> Json { } // builtin
