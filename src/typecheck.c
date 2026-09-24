@@ -4881,26 +4881,41 @@ static void own_check_call(OwnershipCtx *ctx, AstNode *call_expr,
     }
 
     /* Check each argument */
-    for (arg = call_expr->params; arg; arg = arg->next) {
-        if (arg->kind == AST_REF) {
-            /* &x or &mut x: temporary borrow for the call duration */
-            const char *ref_name = own_expr_ident_name(arg->left);
-            own_process_borrow(ctx, arg, reporter);
-            /* Track for release after the call */
-            if (ref_name && temp_count < 32) {
-                temp_borrows[temp_count] = ref_name;
-                temp_is_mut[temp_count] = arg->is_mut;
-                temp_count++;
-            }
-        } else {
-            const char *arg_name = own_expr_ident_name(arg);
-            if (arg_name) {
-                /* Plain identifier passed by value: move */
-                own_mark_move(ctx, arg_name, callee_name,
-                              (int)arg->loc.line, reporter, arg->loc);
+    {
+        int arg_index = 0;
+        for (arg = call_expr->params; arg; arg = arg->next, arg_index++) {
+            if (arg->kind == AST_REF) {
+                /* &x or &mut x: temporary borrow for the call duration */
+                const char *ref_name = own_expr_ident_name(arg->left);
+                own_process_borrow(ctx, arg, reporter);
+                /* Track for release after the call */
+                if (ref_name && temp_count < 32) {
+                    temp_borrows[temp_count] = ref_name;
+                    temp_is_mut[temp_count] = arg->is_mut;
+                    temp_count++;
+                }
             } else {
-                /* Recurse into complex sub-expressions of the arg */
-                own_check_expr(ctx, arg, reporter, arena);
+                const char *arg_name = own_expr_ident_name(arg);
+                if (arg_name) {
+                    /* C7: sb_append(handle, s) mutates through its handle (a
+                     * plain, non-owning `void *`) and never frees it -- unlike
+                     * sb_to_string(handle), which does free it. Treating the
+                     * handle as moved on every append made every subsequent
+                     * append/sb_to_string on the SAME builder a false-positive
+                     * "use of moved value": the builder pattern is specifically
+                     * meant to be reused across calls. Check for use-after-a-
+                     * REAL-move without marking a new one here. */
+                    if (arg_index == 0 && callee_name && strcmp(callee_name, "sb_append") == 0) {
+                        own_check_use(ctx, arg, reporter);
+                    } else {
+                        /* Plain identifier passed by value: move */
+                        own_mark_move(ctx, arg_name, callee_name,
+                                      (int)arg->loc.line, reporter, arg->loc);
+                    }
+                } else {
+                    /* Recurse into complex sub-expressions of the arg */
+                    own_check_expr(ctx, arg, reporter, arena);
+                }
             }
         }
     }

@@ -159,11 +159,38 @@ el contenido sea incierto). El promedio sobre N tokens configurable queda sin im
 opcional en este ítem y no bloqueante; requeriría enhebrar un parámetro nuevo por request → codegen →
 runtime, que es más alcance del que este ítem pedía.
 
-## C7 — Higiene de warnings
+## C7 — Higiene de warnings — ⚠️ PARCIAL (2026-09-24) — ver nota, encontró algo más grande
 
 - `runtime/onnx_model.c`: 13 warnings al compilar (p.ej. `output_tensor` declarado/posiblemente sin inicializar, línea 469).
 - El ownership checker emite `use of moved value 'sb'` para `stage1/parser.lceron:192-194` (patrón `sb_append(sb,...)` repetido) — determinar si es falso positivo del checker (las funciones sb_* probablemente toman préstamo, no ownership) o código stage1 a corregir. Si es falso positivo, es un bug del checker que va a moler a cualquier usuario real.
 **Fix:** llegar a cero warnings en `make` y considerar `-Werror` en CI.
+
+**Nota de cierre:**
+- `runtime/onnx_model.c`: 13 → 0 warnings. Los 9 `-Wunused-result` (ORT API marca todo con
+  `warn_unused_result`) se resolvieron con un helper `ort_ignore_status()` que además libera el
+  `OrtStatus*` si viene no-nulo — antes se descartaba sin liberar, un leak real, no solo un warning.
+  Los otros 4 (`output_tensor` "sometimes uninitialized") eran un bug real, no ruido del compilador:
+  `OrtValue *output_tensor = NULL;` estaba declarado en la línea 469, pero 3 rutas de error anteriores
+  hacían `goto cleanup` ANTES de esa declaración — el cleanup podía llamar `ReleaseValue()` sobre un
+  puntero de stack sin inicializar. Se movió la declaración al principio de la función.
+- **`sb_append`: confirmado falso positivo**, y arreglado en el checker (`own_check_call` en
+  `typecheck.c`), no en stage1. `lcn_sb_append(void *handle, ...)` muta a través del handle y nunca lo
+  libera (a diferencia de `lcn_sb_to_string`, que sí hace `free(sb)`) — es exactamente un builder
+  reutilizable, no un recurso lineal. El checker trataba CUALQUIER identificador pasado por valor a
+  CUALQUIER call como "moved" sin mirar la función ni el tipo. Fix acotado: el primer argumento de
+  `sb_append` específicamente ahora se trata como uso, no como move (se sigue detectando el use-after-
+  move real si se llama `sb_to_string` dos veces sobre el mismo builder — test de regresión agregado
+  para ambos casos).
+- **Hallazgo nuevo, más grande, fuera de alcance de este ítem:** arreglar `sb_append` bajó los
+  warnings de ownership de `stage1/parser.lceron` de "incluye sb" a **100 warnings restantes**, la
+  mayoría (`cur`, `v`, `p2`, `p3`, `p4`, `ty`...) del mismo patrón general: `own_check_call` no
+  distingue tipos Copy (int, bool) de recursos que realmente hay que mover, así que reasignar un
+  escalar tras pasarlo por valor (`cur = tok_next(toks, cur)`, común en un parser recursivo-descendente
+  escrito a mano) dispara el mismo falso positivo en escala mucho mayor. Arreglarlo de raíz necesita
+  que el checker sea consciente de tipos (Copy vs. owned) — trabajo de diseño propio, no cabe en
+  "higiene de warnings". Por eso **`-Werror` en CI queda explícitamente NO recomendado todavía**: con
+  100 warnings de ownership más los `-Wparentheses-equality` cosméticos del C generado, forzar
+  `-Werror` hoy rompería el build sin arreglar nada real.
 
 ## C8 — Exit codes y UX del compilador (menor)
 

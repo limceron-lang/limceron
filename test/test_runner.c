@@ -5929,6 +5929,41 @@ TEST(ownership_ref_param_borrow) {
     ASSERT_EQ(w, 0);
 }
 
+/* C7: sb_append(handle, s) mutates through a non-owning handle and never
+ * frees it (unlike sb_to_string, which does) -- repeated sb_append calls on
+ * the same builder must not be flagged as use-of-moved-value. Regression
+ * for the false positive found in stage1/parser.lceron (100+ warnings
+ * across the self-hosted compiler before this fix). */
+TEST(ownership_sb_append_reuse_not_a_move) {
+    int w = typecheck_ownership_warnings(
+        "fn main() -> Result {\n"
+        "    let sb = sb_new()\n"
+        "    sb_append(sb, \"a\")\n"
+        "    sb_append(sb, \"b\")\n"
+        "    sb_append(sb, \"c\")\n"
+        "    let s = sb_to_string(sb)\n"
+        "    println(s)\n"
+        "}\n"
+    );
+    ASSERT_EQ(w, 0);
+}
+
+TEST(ownership_sb_to_string_still_consumes) {
+    /* sb_to_string DOES free its handle -- reusing sb after it must still
+     * be flagged, so the sb_append fix above cannot have silenced this. */
+    int w = typecheck_ownership_warnings(
+        "fn main() -> Result {\n"
+        "    let sb = sb_new()\n"
+        "    sb_append(sb, \"a\")\n"
+        "    let s = sb_to_string(sb)\n"
+        "    let s2 = sb_to_string(sb)\n"
+        "    println(s)\n"
+        "    println(s2)\n"
+        "}\n"
+    );
+    ASSERT(w >= 1);
+}
+
 TEST(ownership_advisory_mode) {
     /* In default advisory mode, ownership violations are warnings, not errors.
      * The typecheck_program should still return true (no enforced errors). */
@@ -8811,6 +8846,8 @@ int main(void) {
     RUN_TEST(ownership_scope_release);
     RUN_TEST(ownership_function_param_move);
     RUN_TEST(ownership_ref_param_borrow);
+    RUN_TEST(ownership_sb_append_reuse_not_a_move);
+    RUN_TEST(ownership_sb_to_string_still_consumes);
     RUN_TEST(ownership_advisory_mode);
 
     fprintf(stderr, "\n── Package Manager Tests ──\n");

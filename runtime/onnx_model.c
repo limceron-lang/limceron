@@ -254,6 +254,18 @@ struct LcnModel {
     int             num_outputs;   /* number of output classes (detected at load) */
 };
 
+/* C7: the ORT C API marks every status-returning function
+ * `warn_unused_result`. The calls below are ones we deliberately don't
+ * branch on (config knobs that can't meaningfully fail after session
+ * options are valid, or introspection calls with a benign no-op default
+ * on failure) -- but silently discarding a non-NULL OrtStatus* also leaks
+ * it (the API requires ReleaseStatus on anything it returns). This
+ * releases it instead of just casting to void, which is the smallest fix
+ * that is both warning-clean and leak-clean. */
+static void ort_ignore_status(OrtStatus *s, const OrtApi *ort) {
+    if (s) ort->ReleaseStatus(s);
+}
+
 /* Derive vocab.txt path from model path (same directory). */
 static char *derive_vocab_path(const char *model_path) {
     const char *last_slash = strrchr(model_path, '/');
@@ -303,8 +315,8 @@ LcnModel *lcn_model_load(const char *model_path, const char *label_map_path) {
         m->loaded = false;
         return m;
     }
-    m->ort->SetIntraOpNumThreads(m->session_opts, 1);
-    m->ort->SetSessionGraphOptimizationLevel(m->session_opts, ORT_ENABLE_BASIC);
+    ort_ignore_status(m->ort->SetIntraOpNumThreads(m->session_opts, 1), m->ort);
+    ort_ignore_status(m->ort->SetSessionGraphOptimizationLevel(m->session_opts, ORT_ENABLE_BASIC), m->ort);
 
     /* Create session (load the ONNX model) */
     status = m->ort->CreateSession(m->env, model_path, m->session_opts, &m->session);
@@ -342,13 +354,13 @@ LcnModel *lcn_model_load(const char *model_path, const char *label_map_path) {
         status = m->ort->SessionGetOutputTypeInfo(m->session, 0, &out_type_info);
         if (!status && out_type_info) {
             const OrtTensorTypeAndShapeInfo *tensor_info = NULL;
-            m->ort->CastTypeInfoToTensorInfo(out_type_info, &tensor_info);
+            ort_ignore_status(m->ort->CastTypeInfoToTensorInfo(out_type_info, &tensor_info), m->ort);
             if (tensor_info) {
                 size_t dim_count = 0;
-                m->ort->GetDimensionsCount(tensor_info, &dim_count);
+                ort_ignore_status(m->ort->GetDimensionsCount(tensor_info, &dim_count), m->ort);
                 if (dim_count >= 2) {
                     int64_t *dims = (int64_t *)malloc(dim_count * sizeof(int64_t));
-                    m->ort->GetDimensions(tensor_info, dims, dim_count);
+                    ort_ignore_status(m->ort->GetDimensions(tensor_info, dims, dim_count), m->ort);
                     if (dims[dim_count - 1] > 0) {
                         m->num_outputs = (int)dims[dim_count - 1];
                     }
@@ -389,6 +401,12 @@ LcnModelResult lcn_model_predict(LcnModel *model, const char *text) {
 
     const OrtApi *ort = model->ort;
     OrtStatus *status = NULL;
+    /* C7: declared here, before the first `goto cleanup`, not at its point of
+     * first use further down -- cleanup: reads this unconditionally, and three
+     * earlier error paths used to jump straight past its `= NULL` initializer,
+     * leaving it genuinely uninitialized (not a checker false positive: real
+     * garbage-pointer read, potentially freed via ReleaseValue). */
+    OrtValue *output_tensor = NULL;
 
     /* 1. Tokenize */
     int token_ids[WP_MAX_TOKENS];
@@ -449,24 +467,23 @@ LcnModelResult lcn_model_predict(LcnModel *model, const char *text) {
 
     /* Determine how many inputs the model actually expects */
     size_t model_num_inputs = 0;
-    ort->SessionGetInputCount(model->session, &model_num_inputs);
+    ort_ignore_status(ort->SessionGetInputCount(model->session, &model_num_inputs), ort);
     if (model_num_inputs > 3) model_num_inputs = 3;
 
     /* Determine the actual output name from the model */
     size_t model_num_outputs = 0;
-    ort->SessionGetOutputCount(model->session, &model_num_outputs);
+    ort_ignore_status(ort->SessionGetOutputCount(model->session, &model_num_outputs), ort);
 
     OrtAllocator *allocator = NULL;
-    ort->GetAllocatorWithDefaultOptions(&allocator);
+    ort_ignore_status(ort->GetAllocatorWithDefaultOptions(&allocator), ort);
 
     char *actual_output_name = NULL;
     if (model_num_outputs > 0) {
-        ort->SessionGetOutputName(model->session, 0, allocator, &actual_output_name);
+        ort_ignore_status(ort->SessionGetOutputName(model->session, 0, allocator, &actual_output_name), ort);
     }
     const char *out_names[1];
     out_names[0] = actual_output_name ? actual_output_name : output_names[0];
 
-    OrtValue *output_tensor = NULL;
     status = ort->Run(model->session, NULL,
                       input_names, (const OrtValue *const *)input_tensors,
                       model_num_inputs,
@@ -486,7 +503,7 @@ LcnModelResult lcn_model_predict(LcnModel *model, const char *text) {
 
     /* 4. Extract logits */
     float *logits = NULL;
-    ort->GetTensorMutableData(output_tensor, (void **)&logits);
+    ort_ignore_status(ort->GetTensorMutableData(output_tensor, (void **)&logits), ort);
     if (!logits) {
         r.ok = false;
         r.error = "failed to get output tensor data";
