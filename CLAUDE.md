@@ -7,7 +7,7 @@ Limceron is a programming language for AI agents. The compiler is written in C (
 ## Post-task persistence (non-negotiable rule)
 
 > After finishing any task, before closing the response to the user, always update — in this order:
->
+> 
 > 1. **Persistent memory** (`/Users/mikelcarozzi/.claude/projects/-Users-mikelcarozzi-Documents-Desarrollo-IA-Limceron-lang/memory/`) — add/update `user`, `feedback`, `project`, `reference` entries.
 > 2. **`LEARNINGS.md`** — record mistakes made and how they were fixed (see the learnings loop below).
 > 3. **`CLAUDE.md`** — if the task revealed a new operating rule, project convention, frequent command, or architectural decision, add it here.
@@ -15,9 +15,10 @@ Limceron is a programming language for AI agents. The compiler is written in C (
 > 5. **`docs/adr/`** — if the task changed architecture, contracts (`include/vdag.wit`), or technical decisions, add a new ADR or update the relevant one.
 > 6. **Repo artifacts** — `README.md`, `docs/language-reference.md`, WIT contracts (`include/vdag.wit`, `include/vdag.errors.wit`) if the task touched them.
 
-**Why this matters:** Mikel has already lost valuable context to sessions that closed without persisting. Every task that skips this step becomes technical debt that resurfaces next session and forces re-explaining everything. The rule exists so the next session starts with ALL of the previous session's knowledge.
+**Why this matters:**  We can´t lost valuable context to sessions that closed without persisting. Every task that skips this step becomes technical debt that resurfaces next session and forces re-explaining everything. The rule exists so the next session starts with ALL of the previous session's knowledge.
 
 **How to apply it:**
+
 - Don't rely solely on conversation context. Assume the session can end at any moment.
 - If a decision took more than 5 minutes of discussion, capture it in the right file **before** implementing.
 - When a task is done, tell the user in one line what was updated (e.g. "Updated memory + LEARNINGS + CLAUDE.md").
@@ -25,7 +26,7 @@ Limceron is a programming language for AI agents. The compiler is written in C (
 ## Automatic improvement loop (Boris Cherny pattern)
 
 > Every time you make a mistake — and every time the user corrects you — document it in `LEARNINGS.md` with:
->
+> 
 > 1. **Symptom** — what went wrong or what failed.
 > 2. **Root cause** — why it happened (not surface-level: the real cause).
 > 3. **Rule** — what to do differently next time, as an executable instruction.
@@ -133,6 +134,7 @@ bash stage1/test_bootstrap.sh   # Bootstrap chain (11 tests)
 ## Common tasks
 
 ### Add a new builtin function
+
 1. Add to `is_codegen_builtin()` skip list in codegen.c (~line 42)
 2. Add type inference in `cg_infer_type_emit()` if needed
 3. Add emission in the builtin call section (~line 2200)
@@ -141,6 +143,7 @@ bash stage1/test_bootstrap.sh   # Bootstrap chain (11 tests)
 6. Add to Stage 1 codegen.lceron (is_builtin + emit handler)
 
 ### Add a new AST node type
+
 1. Add to `AstKind` enum in include/lcn.h
 2. Add to `ast_kind_name()` in parser.c
 3. Add parsing in parser.c
@@ -150,19 +153,15 @@ bash stage1/test_bootstrap.sh   # Bootstrap chain (11 tests)
 7. Add tests
 
 ### Add a new markdown section
+
 1. Add `MD_SECTION_*` enum in markdown.c
 2. Add classification in `md_classify_section()`
 3. Implement `md_parse_*()` function
 4. Add switch case in main parse loop
 5. Add test in test_runner.c
 
-## Current state (April 2026)
+## Current state
 
-- Stage 0: 100% complete
-- Stage 1: 100% complete (12 features ported, all tests passing)
-- Bootstrap: Stage 0→1→2→3 verified (fixed point)
-- SSA IR: x86_64 + aarch64 emitters with register allocator
-- K8s: health, metrics, signal, retry, progress primitives
-- Markdown: Full parity with .lceron (capability, taint, access_control, supervisor, etc.)
-- Tests: 489+ total across all suites
-- Exit case: BERT Patana categorizer ran against production data
+Point-in-time project status (test counts, stage completion, subsystem status) lives in
+`ROADMAP.md`, not here — see the "Overall Project" milestone table and the per-stage sections
+above it. Keep it updated there per the post-task persistence rule. 

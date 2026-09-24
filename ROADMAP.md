@@ -156,6 +156,14 @@ Features like traits, ownership, comptime are spec features for Stage 2 — not 
 | Production validation | **COMPLETE** — medical categorizer: LLM 82.6%, BERT 93.1% |
 | Documentation | **85%** — README needs update for new features |
 
+**Other subsystems** (moved here from `CLAUDE.md`'s old "Current state" section 2026-09-24; carried
+over as-is, NOT independently re-verified in this pass the way the bootstrap rows above were — treat as
+a lead to check, not a confirmed fact):
+
+- SSA IR: x86_64 + aarch64 emitters with register allocator
+- K8s: health, metrics, signal, retry, progress primitives
+- Markdown: full parity claimed with `.lceron` (capability, taint, access_control, supervisor, etc.)
+
 ---
 
 ## Security Audit: Capability Enforcement (2026-04-10)
