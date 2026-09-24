@@ -154,7 +154,7 @@ build/runtime/sqlite3.o: $(RT_DIR)/sqlite3.c | build/runtime
 
 # -- Tests --
 
-test: test-stage0 test-ir test-lsp test-multifile
+test: test-stage0 test-ir test-lsp test-multifile test-stage1-compiles
 
 test-stage0: $(TEST_BIN)
 	@./$(TEST_BIN)
@@ -202,6 +202,24 @@ test-multifile: $(S0_BIN)
 	@./$(S0_BIN) build examples/language/multifile/main.lceron -o /tmp/lcn_multifile_test 2>&1
 	@rm -f /tmp/lcn_multifile_test
 	@echo "  PASS: multi-file example compiles"
+
+# -- C1.c: cheap compile-only guard for stage1/*.lceron in the default `test`
+# target. The full bootstrap (stage1 -> stage2 self-hosting) is expensive and
+# lives in `make bootstrap`; this just catches "stage1 doesn't compile"
+# regressions (like C1.a/C1.b) without waiting for a nightly run.
+test-stage1-compiles: $(S0_BIN)
+	@echo "── Stage 1 compile-only guard (C1.c) ──"
+	@for f in lexer parser typecheck codegen; do \
+		./$(S0_BIN) build $(S1_DIR)/$$f.lceron -o /tmp/lcn_stage1_guard_$$f >/tmp/lcn_stage1_guard_$$f.log 2>&1; \
+		if [ $$? -ne 0 ]; then \
+			echo "  FAIL: stage1/$$f.lceron failed to compile"; \
+			tail -20 /tmp/lcn_stage1_guard_$$f.log; \
+			rm -f /tmp/lcn_stage1_guard_$$f /tmp/lcn_stage1_guard_$$f.log; \
+			exit 1; \
+		fi; \
+		rm -f /tmp/lcn_stage1_guard_$$f /tmp/lcn_stage1_guard_$$f.log; \
+	done
+	@echo "  PASS: stage1/*.lceron compiles"
 
 # -- Stage 1 self-hosted compiler tests --
 

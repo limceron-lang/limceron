@@ -4,7 +4,17 @@
 
 ---
 
-## C1 — CRÍTICO: el bootstrap está roto en HEAD
+## C1 — CRÍTICO: el bootstrap está roto en HEAD — ✅ RESUELTO (2026-09-23)
+
+**Nota de cierre:** los dos bugs de codegen (C1.a, C1.b) estaban tapando un tercero, no documentado acá:
+`system()` en `src/main.c` arma los comandos de `cc` sin comillas, así que cualquier checkout en una ruta
+con espacios (como esta, `.../Desarrollo IA/...`) rompe la compilación del runtime aunque C1.a/C1.b estén
+arreglados. Se agregó como C1.d. También se encontró que la causa raíz real de C1.b no era el codegen sino
+`parse_pattern` (L6): el stripping de `_<name>` se estaba aplicando también a las variables de loop
+(`for _wi in ...`), que en stage1 se referencian con el underscore adentro del cuerpo — la solución fue
+que `for` deje de pasar por el stripping (solo los arms de `match` lo necesitan), no mangling en codegen.
+`make bootstrap` y `make test` (475+120+15) quedan en verde. Se agregó `test-stage1-compiles` (C1.c) a
+`make test` para que esto no vuelva a colarse en silencio.
 
 **Repro:**
 ```bash

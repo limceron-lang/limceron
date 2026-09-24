@@ -999,16 +999,16 @@ static int cmd_build(const char *input, const char *output, const char *argv0,
             /* sqlite3 needs special flags: suppress warnings, single-threaded */
             if (strcmp(rt_files[ri], "sqlite3") == 0) {
                 snprintf(cmd, sizeof(cmd),
-                         "%s -std=c99 -O2 -I%s %s -DSQLITE_THREADSAFE=0 "
-                         "-DSQLITE_OMIT_LOAD_EXTENSION -w -c %s -o %s 2>&1",
+                         "%s -std=c99 -O2 -I'%s' %s -DSQLITE_THREADSAFE=0 "
+                         "-DSQLITE_OMIT_LOAD_EXTENSION -w -c '%s' -o '%s' 2>&1",
                          build_cc, rt_dir, target_cflags, src_path, obj_path);
             } else if (strcmp(rt_files[ri], "mysql_driver") == 0) {
                 /* mysql_driver needs libmysqlclient headers */
                 snprintf(cmd, sizeof(cmd),
-                         "%s -std=c99 -O2 -Wall -I%s %s "
+                         "%s -std=c99 -O2 -Wall -I'%s' %s "
                          "-I/opt/homebrew/opt/mysql-client/include "
                          "-I/usr/include/mysql "
-                         "-c %s -o %s 2>&1",
+                         "-c '%s' -o '%s' 2>&1",
                          build_cc, rt_dir, target_cflags, src_path, obj_path);
             } else if (strcmp(rt_files[ri], "onnx_model") == 0) {
                 /* onnx_model: detect libonnxruntime via pkg-config */
@@ -1023,17 +1023,17 @@ static int cmd_build(const char *input, const char *output, const char *argv0,
                 }
                 if (strlen(onnx_cflags) > 0) {
                     snprintf(cmd, sizeof(cmd),
-                             "%s -std=c99 -O2 -Wall -I%s %s -DLCN_HAS_ONNXRUNTIME %s "
-                             "-c %s -o %s 2>&1",
+                             "%s -std=c99 -O2 -Wall -I'%s' %s -DLCN_HAS_ONNXRUNTIME %s "
+                             "-c '%s' -o '%s' 2>&1",
                              build_cc, rt_dir, target_cflags, onnx_cflags, src_path, obj_path);
                 } else {
                     snprintf(cmd, sizeof(cmd),
-                             "%s -std=c99 -O2 -Wall -I%s %s -c %s -o %s 2>&1",
+                             "%s -std=c99 -O2 -Wall -I'%s' %s -c '%s' -o '%s' 2>&1",
                              build_cc, rt_dir, target_cflags, src_path, obj_path);
                 }
             } else {
                 snprintf(cmd, sizeof(cmd),
-                         "%s -std=c99 -O2 -Wall -I%s %s -c %s -o %s 2>&1",
+                         "%s -std=c99 -O2 -Wall -I'%s' %s -c '%s' -o '%s' 2>&1",
                          build_cc, rt_dir, target_cflags, src_path, obj_path);
             }
             int rc = system(cmd);
@@ -1083,7 +1083,7 @@ static int cmd_build(const char *input, const char *output, const char *argv0,
             /* Cross-compilation: use target CC and LDFLAGS, skip host-specific libs */
             snprintf(cmd, sizeof(cmd),
                      "%s -std=c99 -O2 -Wall -Wno-unused-function -Wno-unused-variable "
-                     "-I%s %s %s%s -o %s %s%s 2>&1",
+                     "-I'%s' %s '%s'%s -o '%s' %s%s 2>&1",
                      build_cc, rt_dir, target_cflags, tmp_c, rt_objs_str,
                      output, target_ldflags, user_ldflags);
         } else {
@@ -1102,7 +1102,7 @@ static int cmd_build(const char *input, const char *output, const char *argv0,
                 }
             }
             snprintf(cmd, sizeof(cmd),
-                     "cc -std=c99 -O2 -Wall -Wno-unused-function -Wno-unused-variable -I%s %s%s -o %s"
+                     "cc -std=c99 -O2 -Wall -Wno-unused-function -Wno-unused-variable -I'%s' '%s'%s -o '%s'"
                      " -L/opt/homebrew/opt/mysql-client/lib -lmysqlclient -lm%s%s 2>&1",
                      rt_dir, tmp_c, rt_objs_str, output, user_ldflags, extra_libs);
         }

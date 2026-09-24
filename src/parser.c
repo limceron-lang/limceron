@@ -322,6 +322,7 @@ static AstNode *parse_expr(Parser *p, Precedence min_prec);
 static AstNode *parse_statement(Parser *p);
 static AstNode *parse_block(Parser *p);
 static AstNode *parse_pattern(Parser *p);
+static AstNode *parse_pattern_ex(Parser *p, bool strip_underscore_binding);
 static bool is_ident_or_keyword(TokenKind kind);
 static const char *consume_ident_name(Parser *p);
 
@@ -568,7 +569,38 @@ static AstNode *parse_attributes(Parser *p) {
  * Pattern Parser
  * ============================================================ */
 
-static AstNode *parse_pattern(Parser *p) {
+/* C1.b: the `_<name>` wildcard-with-binding strip below can mint a bind
+ * name that collides with a C99 keyword (`_if` -> `if`) even though the
+ * Limceron source never spells that keyword as a plain identifier — the
+ * lexer would have tokenized it as the keyword, not TOK_IDENT, anywhere
+ * else. This is the only place such a collision can be manufactured, so
+ * it's sanitized right here rather than at every codegen emission site. */
+static bool is_c99_keyword(const char *s) {
+    static const char *kws[] = {
+        "auto", "break", "case", "char", "const", "continue", "default",
+        "do", "double", "else", "enum", "extern", "float", "for", "goto",
+        "if", "inline", "int", "long", "register", "restrict", "return",
+        "short", "signed", "sizeof", "static", "struct", "switch",
+        "typedef", "union", "unsigned", "void", "volatile", "while",
+        "_Bool", "_Complex", "_Imaginary", NULL
+    };
+    for (int i = 0; kws[i]; i++) {
+        if (strcmp(s, kws[i]) == 0) return true;
+    }
+    return false;
+}
+
+static const char *sanitize_c_ident(Parser *p, const char *name) {
+    if (!is_c99_keyword(name)) return name;
+    size_t len = strlen(name);
+    char *mangled = (char *)arena_alloc(p->arena, len + 2);
+    memcpy(mangled, name, len);
+    mangled[len] = '_';
+    mangled[len + 1] = '\0';
+    return mangled;
+}
+
+static AstNode *parse_pattern_ex(Parser *p, bool strip_underscore_binding) {
     SourceLoc loc = p->current.loc;
     /* L6-MARKER-PARSER: extended pattern grammar (wildcards with
      * binding, kind-tagged literal patterns, qualified host-error
@@ -576,8 +608,16 @@ static AstNode *parse_pattern(Parser *p) {
 
     /* L6: `_<name>` -- wildcard with binding. Strip the leading `_`
      * so the downstream catch-all lowering treats it as a plain
-     * ident binding. */
-    if (parser_check(p, TOK_IDENT) && p->current.value.str_val &&
+     * ident binding.
+     *
+     * `for`-loop headers opt out (strip_underscore_binding=false): they
+     * predate L6 and existing code (stage1 sources) binds `_wi`-style
+     * counters and then refers to them AS WRITTEN (with the underscore)
+     * throughout the loop body. Stripping here would declare `wi` but
+     * leave every body reference to `_wi` dangling. Match arms keep the
+     * strip (see l6_parser_underscore_binding_strips_leading_underscore). */
+    if (strip_underscore_binding &&
+        parser_check(p, TOK_IDENT) && p->current.value.str_val &&
         p->current.value.str_val[0] == '_' &&
         p->current.value.str_val[1] != '\0') {
         const char *raw = p->current.value.str_val;
@@ -589,7 +629,7 @@ static AstNode *parse_pattern(Parser *p) {
             !parser_check(p, TOK_LBRACE)      &&
             !parser_check(p, TOK_COLON)) {
             AstNode *n = ast_new(p->arena, AST_PAT_IDENT, loc);
-            n->name = bind;
+            n->name = sanitize_c_ident(p, bind);
             return n;
         }
         /* Fall-through: synthesise the underscore-prefixed PAT_IDENT
@@ -772,6 +812,10 @@ static AstNode *parse_pattern(Parser *p) {
     report_error(p->reporter, p->current.loc, "expected pattern", NULL);
     p->had_error = true;
     return ast_new(p->arena, AST_PAT_WILDCARD, loc);
+}
+
+static AstNode *parse_pattern(Parser *p) {
+    return parse_pattern_ex(p, true);
 }
 
 /* ============================================================
@@ -1680,10 +1724,10 @@ static AstNode *parse_statement(Parser *p) {
     /* For loop */
     if (parser_match(p, TOK_FOR)) {
         AstNode *node = ast_new(p->arena, AST_FOR, loc);
-        node->left = parse_pattern(p);
+        node->left = parse_pattern_ex(p, false);
         /* Optional second pattern (index): for i, item in ... */
         if (parser_match(p, TOK_COMMA)) {
-            AstNode *second = parse_pattern(p);
+            AstNode *second = parse_pattern_ex(p, false);
             /* Store both patterns — left is first, right->left is second */
             AstNode *wrap = ast_new(p->arena, AST_TUPLE, loc);
             wrap->params = node->left;
