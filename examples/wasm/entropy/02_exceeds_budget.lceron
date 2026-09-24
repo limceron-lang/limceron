@@ -1,0 +1,31 @@
+// 02_exceeds_budget.lceron -- L11 sample: entropy fence trips (Err path)
+//
+// The agent declares `entropy_budget: 1` (1 bit). The first llm.classify
+// consumes 1 bit, taking the budget to 0. The second llm.classify needs
+// 1 bit but only 0 remain -- the fence returns
+// `HostError.EntropyExceeded = -9` instead of dispatching the call.
+//
+// Expected behaviour at the wasm runtime:
+//   - $entropy_remaining initialised to 1
+//   - first  llm.classify: 1 >= 1 -> dispatch, budget = 0
+//                          returns Ok(N) (Mock client cooperation)
+//   - second llm.classify: 0 <  1 -> fence trips
+//                          function returns i64 -9 BEFORE dispatching
+//
+// The `?` operator on the second call observes the -9 sentinel and
+// propagates it upward unchanged, so main exits with -9 (Err).
+//
+// This is the canonical failure mode `entropy.fence@1.0` will surface
+// in Visual-DAG's ADR-0016 replay determinism story.
+
+agent EntropyExceeds {
+    capabilities: [llm.classify]
+    entropy_budget: 1
+
+    fn main() -> int {
+        let a = llm.classify("first")?    // dispatched: budget 1 -> 0
+        let b = llm.classify("second")?   // fence trips: returns -9
+        // Never reached: the `?` on `b` short-circuited main with -9.
+        a + b
+    }
+}

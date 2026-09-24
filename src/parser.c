@@ -43,12 +43,14 @@ const char *ast_kind_name(AstKind kind) {
         [AST_INT_LIT]       = "IntLit",
         [AST_FLOAT_LIT]     = "FloatLit",
         [AST_STRING_LIT]    = "StringLit",
+        [AST_INTERP_STRING] = "InterpString",
         [AST_BOOL_LIT]      = "BoolLit",
         [AST_NONE_LIT]      = "NoneLit",
         [AST_IDENT]         = "Ident",
         [AST_BINARY]        = "Binary",
         [AST_UNARY]         = "Unary",
         [AST_CALL]          = "Call",
+        [AST_HOST_CALL]     = "HostCall",
         [AST_FIELD_ACCESS]  = "FieldAccess",
         [AST_INDEX]         = "Index",
         [AST_METHOD_CALL]   = "MethodCall",
@@ -69,6 +71,9 @@ const char *ast_kind_name(AstKind kind) {
         [AST_SELECT]        = "Select",
         [AST_SELECT_ARM]    = "SelectArm",
         [AST_TRY]           = "Try",
+        [AST_RESULT_OK]     = "ResultOk",
+        [AST_RESULT_ERR]    = "ResultErr",
+        [AST_TRY_CATCH]     = "TryCatch",
         [AST_UNSAFE_BLOCK]  = "UnsafeBlock",
         [AST_COMPTIME]      = "Comptime",
         [AST_REF]           = "Ref",
@@ -317,6 +322,7 @@ static AstNode *parse_expr(Parser *p, Precedence min_prec);
 static AstNode *parse_statement(Parser *p);
 static AstNode *parse_block(Parser *p);
 static AstNode *parse_pattern(Parser *p);
+static AstNode *parse_pattern_ex(Parser *p, bool strip_underscore_binding);
 static bool is_ident_or_keyword(TokenKind kind);
 static const char *consume_ident_name(Parser *p);
 
@@ -563,8 +569,106 @@ static AstNode *parse_attributes(Parser *p) {
  * Pattern Parser
  * ============================================================ */
 
-static AstNode *parse_pattern(Parser *p) {
+/* C1.b: the `_<name>` wildcard-with-binding strip below can mint a bind
+ * name that collides with a C99 keyword (`_if` -> `if`) even though the
+ * Limceron source never spells that keyword as a plain identifier — the
+ * lexer would have tokenized it as the keyword, not TOK_IDENT, anywhere
+ * else. This is the only place such a collision can be manufactured, so
+ * it's sanitized right here rather than at every codegen emission site. */
+static bool is_c99_keyword(const char *s) {
+    static const char *kws[] = {
+        "auto", "break", "case", "char", "const", "continue", "default",
+        "do", "double", "else", "enum", "extern", "float", "for", "goto",
+        "if", "inline", "int", "long", "register", "restrict", "return",
+        "short", "signed", "sizeof", "static", "struct", "switch",
+        "typedef", "union", "unsigned", "void", "volatile", "while",
+        "_Bool", "_Complex", "_Imaginary", NULL
+    };
+    for (int i = 0; kws[i]; i++) {
+        if (strcmp(s, kws[i]) == 0) return true;
+    }
+    return false;
+}
+
+static const char *sanitize_c_ident(Parser *p, const char *name) {
+    if (!is_c99_keyword(name)) return name;
+    size_t len = strlen(name);
+    char *mangled = (char *)arena_alloc(p->arena, len + 2);
+    memcpy(mangled, name, len);
+    mangled[len] = '_';
+    mangled[len + 1] = '\0';
+    return mangled;
+}
+
+static AstNode *parse_pattern_ex(Parser *p, bool strip_underscore_binding) {
     SourceLoc loc = p->current.loc;
+    /* L6-MARKER-PARSER: extended pattern grammar (wildcards with
+     * binding, kind-tagged literal patterns, qualified host-error
+     * variants). See ROADMAP.md L6 row. */
+
+    /* L6: `_<name>` -- wildcard with binding. Strip the leading `_`
+     * so the downstream catch-all lowering treats it as a plain
+     * ident binding.
+     *
+     * `for`-loop headers opt out (strip_underscore_binding=false): they
+     * predate L6 and existing code (stage1 sources) binds `_wi`-style
+     * counters and then refers to them AS WRITTEN (with the underscore)
+     * throughout the loop body. Stripping here would declare `wi` but
+     * leave every body reference to `_wi` dangling. Match arms keep the
+     * strip (see l6_parser_underscore_binding_strips_leading_underscore). */
+    if (strip_underscore_binding &&
+        parser_check(p, TOK_IDENT) && p->current.value.str_val &&
+        p->current.value.str_val[0] == '_' &&
+        p->current.value.str_val[1] != '\0') {
+        const char *raw = p->current.value.str_val;
+        const char *bind = raw + 1;
+        parser_advance(p);
+        if (!parser_check(p, TOK_COLON_COLON) &&
+            !parser_check(p, TOK_DOT)         &&
+            !parser_check(p, TOK_LPAREN)      &&
+            !parser_check(p, TOK_LBRACE)      &&
+            !parser_check(p, TOK_COLON)) {
+            AstNode *n = ast_new(p->arena, AST_PAT_IDENT, loc);
+            n->name = sanitize_c_ident(p, bind);
+            return n;
+        }
+        /* Fall-through: synthesise the underscore-prefixed PAT_IDENT
+         * and continue along the qualified-path branch below. */
+        AstNode *n = ast_new(p->arena, AST_PAT_IDENT, loc);
+        n->name = raw;
+        while (parser_check(p, TOK_DOT) ||
+               parser_check(p, TOK_COLON_COLON)) {
+            bool was_cc = parser_check(p, TOK_COLON_COLON);
+            parser_advance(p);
+            if (parser_check(p, TOK_IDENT)) {
+                const char *next = parser_advance(p).value.str_val;
+                size_t len1 = strlen(n->name);
+                size_t len2 = strlen(next);
+                size_t seplen = was_cc ? 2 : 1;
+                char *qn = (char *)arena_alloc(p->arena,
+                                               len1 + seplen + len2 + 1);
+                memcpy(qn, n->name, len1);
+                if (was_cc) { qn[len1] = ':'; qn[len1 + 1] = ':'; }
+                else        { qn[len1] = '.'; }
+                memcpy(qn + len1 + seplen, next, len2);
+                qn[len1 + seplen + len2] = '\0';
+                n->name = qn;
+            }
+        }
+        if (parser_match(p, TOK_LPAREN)) {
+            n->kind = AST_PAT_ENUM;
+            AstNode *fields = NULL;
+            while (!parser_check(p, TOK_RPAREN) &&
+                   !parser_check(p, TOK_EOF)) {
+                AstNode *f = parse_pattern(p);
+                fields = ast_append(fields, f);
+                if (!parser_match(p, TOK_COMMA)) break;
+            }
+            parser_expect(p, TOK_RPAREN, "after enum pattern");
+            n->params = fields;
+        }
+        return n;
+    }
 
     /* _ wildcard */
     if (parser_check(p, TOK_IDENT) && p->current.value.str_val &&
@@ -573,11 +677,12 @@ static AstNode *parse_pattern(Parser *p) {
         return ast_new(p->arena, AST_PAT_WILDCARD, loc);
     }
 
-    /* Literal patterns */
+    /* Literal patterns. L6: stamp pat->name with a canonical kind
+     * tag so downstream passes discriminate `false` from `0`. */
     if (parser_check(p, TOK_INT_LIT)) {
         AstNode *n = ast_new(p->arena, AST_PAT_LITERAL, loc);
         n->val.int_val = parser_advance(p).value.int_val;
-        /* Range pattern: 1..=9 or 1..9 */
+        n->name = "int";
         if (parser_check(p, TOK_DOT_DOT) || parser_check(p, TOK_DOT_DOT_EQ)) {
             bool inclusive = parser_check(p, TOK_DOT_DOT_EQ);
             parser_advance(p);
@@ -592,20 +697,25 @@ static AstNode *parse_pattern(Parser *p) {
     if (parser_check(p, TOK_STRING_LIT)) {
         AstNode *n = ast_new(p->arena, AST_PAT_LITERAL, loc);
         n->val.str_val = parser_advance(p).value.str_val;
+        n->name = "str";
         return n;
     }
     if (parser_match(p, TOK_TRUE)) {
         AstNode *n = ast_new(p->arena, AST_PAT_LITERAL, loc);
         n->val.bool_val = true;
+        n->name = "true";
         return n;
     }
     if (parser_match(p, TOK_FALSE)) {
         AstNode *n = ast_new(p->arena, AST_PAT_LITERAL, loc);
         n->val.bool_val = false;
+        n->name = "false";
         return n;
     }
     if (parser_match(p, TOK_NONE)) {
-        return ast_new(p->arena, AST_PAT_LITERAL, loc);
+        AstNode *n = ast_new(p->arena, AST_PAT_LITERAL, loc);
+        n->name = "none";
+        return n;
     }
 
     /* Tuple pattern: (a, b, c) */
@@ -627,17 +737,25 @@ static AstNode *parse_pattern(Parser *p) {
         AstNode *n = ast_new(p->arena, AST_PAT_IDENT, loc);
         n->name = parser_advance(p).value.str_val;
 
-        /* Qualified: Enum.Variant */
-        while (parser_match(p, TOK_DOT)) {
+        /* Qualified path: Enum.Variant or Enum::Variant.
+         * L5 introduces `Result::Ok(v)` / `Result::Err(e)` patterns; the `::`
+         * separator is preserved in the joined name so the typecheck
+         * exhaustiveness pass can recognise the Result family by suffix
+         * regardless of which separator the user wrote. */
+        while (parser_check(p, TOK_DOT) || parser_check(p, TOK_COLON_COLON)) {
+            bool was_cc = parser_check(p, TOK_COLON_COLON);
+            parser_advance(p);
             if (parser_check(p, TOK_IDENT)) {
                 const char *next = parser_advance(p).value.str_val;
                 size_t len1 = strlen(n->name);
                 size_t len2 = strlen(next);
-                char *qn = (char *)arena_alloc(p->arena, len1 + 1 + len2 + 1);
+                size_t seplen = was_cc ? 2 : 1;
+                char *qn = (char *)arena_alloc(p->arena, len1 + seplen + len2 + 1);
                 memcpy(qn, n->name, len1);
-                qn[len1] = '.';
-                memcpy(qn + len1 + 1, next, len2);
-                qn[len1 + 1 + len2] = '\0';
+                if (was_cc) { qn[len1] = ':'; qn[len1 + 1] = ':'; }
+                else        { qn[len1] = '.'; }
+                memcpy(qn + len1 + seplen, next, len2);
+                qn[len1 + seplen + len2] = '\0';
                 n->name = qn;
             }
         }
@@ -696,6 +814,10 @@ static AstNode *parse_pattern(Parser *p) {
     return ast_new(p->arena, AST_PAT_WILDCARD, loc);
 }
 
+static AstNode *parse_pattern(Parser *p) {
+    return parse_pattern_ex(p, true);
+}
+
 /* ============================================================
  * Expression Parser (Pratt)
  * ============================================================ */
@@ -723,7 +845,9 @@ static Precedence get_precedence(TokenKind kind) {
     case TOK_POWER:                             return PREC_POWER;
     case TOK_DOT: case TOK_LPAREN:
     case TOK_LBRACKET: case TOK_QUESTION:
-    case TOK_AS: case TOK_IS:                   return PREC_POSTFIX;
+    case TOK_QUESTION_DOT:
+    case TOK_AS: case TOK_IS:
+    case TOK_COLON_COLON:                       return PREC_POSTFIX;
     default:                                    return PREC_NONE;
     }
 }
@@ -746,9 +870,48 @@ static AstNode *parse_expr(Parser *p, Precedence min_prec) {
 
             /* Method call: expr.method(args) */
             if (parser_match(p, TOK_LPAREN)) {
-                AstNode *node = ast_new(p->arena, AST_METHOD_CALL, loc);
+                /* Host-call detection: when the left-hand side is a bare
+                 * identifier matching a capability namespace (llm, http, kb,
+                 * data, mcp), lower to AST_HOST_CALL so the IR backend can
+                 * emit a `(import "vdag:<ns>" "<fn>" ...)` declaration and
+                 * marshal arguments through the buffer-protocol ABI defined
+                 * by Visual-DAG's host imports (see imports.go).
+                 *
+                 * L4 (2026-05-13): `string` joins the host namespace set
+                 * so the `"...${expr}..."` interpolation lowering can
+                 * dispatch through `string.concat`, `string.from_int`,
+                 * etc. Authors may also call those verbs directly
+                 * (`string.concat(a, b)`). L7 (2026-05-13) extends the
+                 * set with `math` and `time` -- both back the L7 stdlib
+                 * minimum and share the same bare-prefix dispatch path. */
+                bool is_host_ns = false;
+                if (left && left->kind == AST_IDENT && left->name) {
+                    const char *ns = left->name;
+                    is_host_ns = (strcmp(ns, "llm")    == 0 ||
+                                  strcmp(ns, "http")   == 0 ||
+                                  strcmp(ns, "kb")     == 0 ||
+                                  strcmp(ns, "data")   == 0 ||
+                                  strcmp(ns, "mcp")    == 0 ||
+                                  strcmp(ns, "json")   == 0 ||
+                                  strcmp(ns, "string") == 0 ||
+                                  strcmp(ns, "math")   == 0 ||
+                                  strcmp(ns, "time")   == 0);
+                }
+                AstNode *node = ast_new(p->arena,
+                                         is_host_ns ? AST_HOST_CALL : AST_METHOD_CALL,
+                                         loc);
                 node->left = left;
-                node->name = field;
+                if (is_host_ns) {
+                    /* For host calls store the qualified name "ns.fn" in
+                     * ->name so downstream passes have a single string key
+                     * matching CapXxx identifiers in imports.go. */
+                    size_t nlen = strlen(left->name) + 1 + strlen(field) + 1;
+                    char *qn = (char *)arena_alloc(p->arena, nlen);
+                    snprintf(qn, nlen, "%s.%s", left->name, field);
+                    node->name = qn;
+                } else {
+                    node->name = field;
+                }
                 AstNode *args = NULL;
                 while (!parser_check(p, TOK_RPAREN) && !parser_check(p, TOK_EOF)) {
                     AstNode *arg = parse_expr(p, PREC_NONE);
@@ -765,6 +928,51 @@ static AstNode *parse_expr(Parser *p, Precedence min_prec) {
                 node->name = field;
                 left = node;
             }
+            continue;
+        }
+
+        if (op == TOK_COLON_COLON) {
+            /* L5: `Type::Variant` qualified path. The two shapes we support
+             * in stage0:
+             *   Result::Ok(v) / Result::Err(code) — rewritten to a bare
+             *     `Ok`/`Err` identifier so the AST_CALL handler below
+             *     converts the subsequent (v) into AST_RESULT_OK / AST_RESULT_ERR.
+             *   host_error::<sentinel>           — rewritten to a single
+             *     joined identifier `host_error::<sentinel>` whose value is
+             *     resolved by typecheck against the enum loaded from
+             *     include/vdag.errors.wit.
+             * Any other `A::B` shape collapses to a joined identifier too,
+             * leaving downstream passes free to resolve it. */
+            parser_advance(p);
+            SourceLoc loc = p->previous.loc;
+            const char *tail =
+                parser_expect(p, TOK_IDENT, "after '::'").value.str_val;
+            if (left && left->kind == AST_IDENT && left->name) {
+                if (strcmp(left->name, "Result") == 0 &&
+                    (strcmp(tail, "Ok") == 0 || strcmp(tail, "Err") == 0)) {
+                    AstNode *short_id = ast_new(p->arena, AST_IDENT, loc);
+                    short_id->name = tail; /* "Ok" or "Err" */
+                    left = short_id;
+                    continue;
+                }
+                size_t a = strlen(left->name), b = strlen(tail);
+                char *joined = (char *)arena_alloc(p->arena, a + 2 + b + 1);
+                memcpy(joined, left->name, a);
+                joined[a]     = ':';
+                joined[a + 1] = ':';
+                memcpy(joined + a + 2, tail, b);
+                joined[a + 2 + b] = '\0';
+                AstNode *q = ast_new(p->arena, AST_IDENT, loc);
+                q->name = joined;
+                left = q;
+                continue;
+            }
+            /* Left was not a bare identifier (rare). Wrap as field access
+             * so downstream printers do not lose the source location. */
+            AstNode *fa = ast_new(p->arena, AST_FIELD_ACCESS, loc);
+            fa->left = left;
+            fa->name = tail;
+            left = fa;
             continue;
         }
 
@@ -791,6 +999,22 @@ static AstNode *parse_expr(Parser *p, Precedence min_prec) {
             }
             parser_expect(p, TOK_RPAREN, "after function arguments");
             node->params = args;
+            /* L5: rewrite Ok(x) / Err(code) — Result<T,E> constructors —
+             * into dedicated AST kinds so downstream passes (typecheck,
+             * ir_gen) recognize them without name-based pattern matching
+             * on every AST_CALL. */
+            if (left && left->kind == AST_IDENT && left->name && args &&
+                !args->next) {
+                if (strcmp(left->name, "Ok") == 0) {
+                    AstNode *ok = ast_new(p->arena, AST_RESULT_OK, loc);
+                    ok->left = args;
+                    node = ok;
+                } else if (strcmp(left->name, "Err") == 0) {
+                    AstNode *err = ast_new(p->arena, AST_RESULT_ERR, loc);
+                    err->left = args;
+                    node = err;
+                }
+            }
             left = node;
             continue;
         }
@@ -931,6 +1155,95 @@ static AstNode *parse_prefix(Parser *p) {
     if (parser_check(p, TOK_STRING_LIT)) {
         AstNode *node = ast_new(p->arena, AST_STRING_LIT, loc);
         node->val.str_val = parser_advance(p).value.str_val;
+        return node;
+    }
+
+    /* L4: interpolated string literal `"...${expr}..."` lowered to
+     * AST_INTERP_STRING. The lexer already split the literal/expression
+     * segments and intern'd both halves; this rule materialises the
+     * matching AST and re-parses each `${expr}` body through a fresh
+     * sub-Lexer / sub-Parser that shares the host arena, intern table,
+     * and error reporter. */
+    if (parser_check(p, TOK_INTERP_STRING)) {
+        Token tok = parser_advance(p);
+        InterpString *is = tok.value.interp;
+        AstNode *node = ast_new(p->arena, AST_INTERP_STRING, loc);
+        if (!is) {
+            /* Defensive: a malformed lexer payload still produces an
+             * empty AST_INTERP_STRING with a single empty literal so
+             * downstream passes do not crash. */
+            AstNode *empty = ast_new(p->arena, AST_STRING_LIT, loc);
+            empty->val.str_val = "";
+            node->params = empty;
+            return node;
+        }
+        if (is->nested_detected) {
+            report_error(p->reporter, loc,
+                "ERR_NESTED_INTERPOLATION: `${...${...}...}` is forbidden in v1",
+                "split into separate concatenations or assign the inner "
+                "expression to a `let` first");
+            p->had_error = true;
+        }
+        /* Build the part list: literal[0], expr[0], literal[1], expr[1],
+         * ..., literal[count]. Each literal becomes an AST_STRING_LIT
+         * (even when empty -- the IR-gen pass skips zero-length
+         * literals when emitting str.concat). Each expression is parsed
+         * via a child Lexer/Parser. */
+        AstNode *parts = NULL;
+        int i;
+        for (i = 0; i <= is->count; i++) {
+            AstNode *lit = ast_new(p->arena, AST_STRING_LIT, loc);
+            lit->val.str_val = is->literals[i] ? is->literals[i] : "";
+            parts = ast_append(parts, lit);
+            if (i < is->count) {
+                /* Re-parse the expression source through a fresh
+                 * sub-Lexer/sub-Parser. We share the host arena +
+                 * intern table + reporter so any diagnostic emitted by
+                 * the sub-parse carries the same surface as the outer
+                 * compile. */
+                const char *src = is->expr_src[i] ? is->expr_src[i] : "";
+                size_t slen = strlen(src);
+                AstNode *expr;
+                if (slen == 0) {
+                    /* Empty `${}` -- treat as literal zero so type
+                     * coercion still works; the parser surfaces the
+                     * mistake via a soft diagnostic. */
+                    report_error(p->reporter, loc,
+                        "ERR_INTERP_EMPTY: `${}` requires an expression",
+                        "supply a variable or expression between the braces");
+                    p->had_error = true;
+                    expr = ast_new(p->arena, AST_INT_LIT, loc);
+                    expr->val.int_val = 0;
+                } else {
+                    ErrorReporter *rep = p->reporter;
+                    StringIntern *intern = p->lexer ? p->lexer->intern : NULL;
+                    if (!intern) {
+                        /* Should not happen in a normal compile but
+                         * keep the fallback path. */
+                        expr = ast_new(p->arena, AST_INT_LIT, loc);
+                        expr->val.int_val = 0;
+                    } else {
+                        Lexer sub_lex = lexer_new("<interp>", src, slen,
+                                                   intern, rep);
+                        Parser sub_p = parser_new(&sub_lex, p->arena, rep);
+                        expr = parse_expression(&sub_p);
+                        if (sub_p.had_error) p->had_error = true;
+                        if (!expr) {
+                            expr = ast_new(p->arena, AST_INT_LIT, loc);
+                            expr->val.int_val = 0;
+                        }
+                    }
+                }
+                /* Surface the original source location on the parsed
+                 * expression for better diagnostics. */
+                expr->loc.filename = loc.filename;
+                expr->loc.line     = is->expr_line[i];
+                expr->loc.column   = is->expr_column[i];
+                expr->loc.offset   = is->expr_offset[i];
+                parts = ast_append(parts, expr);
+            }
+        }
+        node->params = parts;
         return node;
     }
 
@@ -1133,10 +1446,36 @@ static AstNode *parse_prefix(Parser *p) {
 
     /* Try-otherwise: try <expr> otherwise <fallback>
      * Evaluates expr; if it errors, evaluates fallback instead.
-     * 'try' is detected as an identifier (not a keyword). */
+     * 'try' is detected as an identifier (not a keyword).
+     *
+     * L5: `try { body } catch (e: T) { handler }` — Result<T,E> recovery.
+     * If the next token after 'try' is '{', we parse the new form; else we
+     * fall through to the legacy try-otherwise. */
     if (parser_check(p, TOK_IDENT) && p->current.value.str_val &&
         strcmp(p->current.value.str_val, "try") == 0) {
         parser_advance(p); /* consume 'try' */
+        if (parser_check(p, TOK_LBRACE)) {
+            /* try { body } catch (e: T) { handler } */
+            AstNode *node = ast_new(p->arena, AST_TRY_CATCH, loc);
+            node->left = parse_block(p);
+            if (parser_check(p, TOK_IDENT) && p->current.value.str_val &&
+                strcmp(p->current.value.str_val, "catch") == 0) {
+                parser_advance(p); /* consume 'catch' */
+                parser_expect(p, TOK_LPAREN, "after 'catch'");
+                if (parser_check(p, TOK_IDENT)) {
+                    node->name = p->current.value.str_val;
+                    parser_advance(p);
+                } else {
+                    node->name = "e";
+                }
+                if (parser_match(p, TOK_COLON)) {
+                    node->type_expr = parse_type_expr(p);
+                }
+                parser_expect(p, TOK_RPAREN, "after catch binding");
+                node->right = parse_block(p);
+            }
+            return node;
+        }
         AstNode *node = ast_new(p->arena, AST_TRY_OTHERWISE, loc);
         node->left = parse_expr(p, PREC_PIPE_OP);
         if (parser_match(p, TOK_OTHERWISE)) {
@@ -1385,10 +1724,10 @@ static AstNode *parse_statement(Parser *p) {
     /* For loop */
     if (parser_match(p, TOK_FOR)) {
         AstNode *node = ast_new(p->arena, AST_FOR, loc);
-        node->left = parse_pattern(p);
+        node->left = parse_pattern_ex(p, false);
         /* Optional second pattern (index): for i, item in ... */
         if (parser_match(p, TOK_COMMA)) {
-            AstNode *second = parse_pattern(p);
+            AstNode *second = parse_pattern_ex(p, false);
             /* Store both patterns — left is first, right->left is second */
             AstNode *wrap = ast_new(p->arena, AST_TUPLE, loc);
             wrap->params = node->left;
@@ -1829,7 +2168,13 @@ static AstNode *parse_use_decl(Parser *p) {
         return node;
     }
 
-    while (parser_match(p, TOK_DOT)) {
+    /* L7 stub: accept `use stdlib::math;` (and friends) as a no-op so
+     * authors who follow the L8 cross-file import convention do not
+     * trip a parse error today. The `::` separator is normalised onto
+     * `.` for the stored path so downstream passes (codegen access
+     * policy resolution, AST_USE handlers) keep treating it as a dotted
+     * module path. Full L8 module resolution is deferred per ROADMAP. */
+    while (parser_match(p, TOK_DOT) || parser_match(p, TOK_COLON_COLON)) {
         if (parser_match(p, TOK_LBRACE)) {
             /* use a.b.{c, d, e} */
             node->name = path;
@@ -1939,15 +2284,65 @@ static AstNode *parse_decl_field(Parser *p) {
     field->name = consume_ident_name(p);
     parser_expect(p, TOK_COLON, "after field name");
 
-    /* Array value: [item, item, ...] — parse as identifiers (qualified) */
+    /* Array value: [item, item, ...] — parse as identifiers (qualified).
+     *
+     * L12: an array element may carry a parameterised form
+     *   http.fetch(["api.openai.com:443", "*.example.com:443"])
+     * that pins a compile-time host:port allowlist for the
+     * network-shaped capability. The bare form (just `http.fetch`)
+     * is preserved verbatim as AST_IDENT for backwards compatibility.
+     * The parameterised form lowers to AST_CAPABILITY_ITEM whose
+     * `name` is the qualified verb and whose `params` is a linked
+     * list of AST_STRING_LIT host:port specs. Downstream consumers
+     * that only read `elem->name` (wit_collect_caps,
+     * collect_agent_caps) keep working unchanged. */
     if (parser_check(p, TOK_LBRACKET)) {
         parser_advance(p);
         AstNode *arr = ast_new(p->arena, AST_ARRAY, loc);
         AstNode *elems = NULL;
         while (!parser_check(p, TOK_RBRACKET) && !parser_check(p, TOK_EOF)) {
             SourceLoc eloc = p->current.loc;
-            AstNode *elem = ast_new(p->arena, AST_IDENT, eloc);
-            elem->name = parse_qualified_ident(p);
+            const char *qname = parse_qualified_ident(p);
+            AstNode *elem;
+            /* Parameterised form: ident(["host:port", ...]) */
+            if (parser_check(p, TOK_LPAREN)) {
+                parser_advance(p); /* consume '(' */
+                elem = ast_new(p->arena, AST_CAPABILITY_ITEM, eloc);
+                elem->name = qname;
+                /* Inside parens we require a single bracketed list of
+                 * string literals: ["host:port", ...]. The full grammar
+                 * for parameterised capabilities will grow later (e.g.
+                 * `agent.call(["worker_a", "worker_b"])`); for v1 we
+                 * only accept the host:port allowlist shape. */
+                if (parser_check(p, TOK_LBRACKET)) {
+                    parser_advance(p); /* consume '[' */
+                    AstNode *hosts = NULL;
+                    while (!parser_check(p, TOK_RBRACKET) &&
+                           !parser_check(p, TOK_EOF)) {
+                        SourceLoc hloc = p->current.loc;
+                        Token tok = parser_expect(p, TOK_STRING_LIT,
+                            "host:port string in capability allowlist");
+                        AstNode *s = ast_new(p->arena, AST_STRING_LIT, hloc);
+                        s->val.str_val = tok.value.str_val;
+                        hosts = ast_append(hosts, s);
+                        if (!parser_match(p, TOK_COMMA)) break;
+                    }
+                    parser_expect(p, TOK_RBRACKET,
+                                  "after capability allowlist");
+                    elem->params = hosts;
+                } else {
+                    report_error(p->reporter, p->current.loc,
+                        "expected '[\"host:port\", ...]' after capability '('",
+                        NULL);
+                    p->had_error = true;
+                }
+                parser_expect(p, TOK_RPAREN,
+                              "after parameterised capability");
+            } else {
+                /* Bare form: just the qualified verb. */
+                elem = ast_new(p->arena, AST_IDENT, eloc);
+                elem->name = qname;
+            }
             elems = ast_append(elems, elem);
             if (!parser_match(p, TOK_COMMA)) break;
         }

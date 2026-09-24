@@ -1,0 +1,35 @@
+// 01_within_budget.lceron -- L13 sample: budget runtime fence (Ok path)
+//
+// The agent declares `budget: { max_tokens: 5000, max_cost: 0.05 }` and
+// makes two llm.classify calls. Each llm.classify is estimated at 100
+// tokens + 500 micro-USD (= $0.0005), so the total per-call spend is
+// 200 tokens and 1000 micro-USD -- comfortably inside the declared
+// envelope.
+//
+// Expected behaviour at the wasm runtime:
+//   - $tokens_remaining        initialised to 5000
+//   - $cost_micro_usd_remaining initialised to 50000  (= 0.05 USD * 1e6)
+//   - first  llm.classify: 5000 >= 100 -> tokens=4900,
+//                          50000 >= 500 -> cost=49500, dispatch
+//   - second llm.classify: 4900 >= 100 -> tokens=4800,
+//                          49500 >= 500 -> cost=49000, dispatch
+//   - main returns Ok(sum of returned byte counts) -- non-negative.
+//
+// At the Limceron level the fences are invisible: callers never see the
+// token/cost globals. A breach on either counter surfaces as
+// `Err(HostError.BudgetExceeded = -10)` via the same Result<i64, HostError>
+// encoding every host call already uses, which composes with `?` and
+// try/catch.
+
+agent BudgetOk {
+    capabilities: [llm.classify]
+    budget: { max_tokens: 5000, max_cost: 0.05 }
+
+    fn main() -> int {
+        let a = llm.classify("first")?
+        let b = llm.classify("second")?
+        // Sum is the program verdict. Both calls trivially fit the
+        // declared budget, so main returns the positive byte sum.
+        a + b
+    }
+}

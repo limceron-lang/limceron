@@ -14,6 +14,7 @@
 
 #include "lcn.h"
 #include "ir.h"
+#include "wit_load.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -63,6 +64,7 @@ const char *ir_opcode_name(IrOpcode op) {
     case IR_LOAD:         return "load";
     case IR_STORE:        return "store";
     case IR_CALL:         return "call";
+    case IR_HOST_CALL:    return "host_call";
     case IR_RET:          return "ret";
     case IR_BR:           return "br";
     case IR_JMP:          return "jmp";
@@ -265,6 +267,67 @@ int ir_emit_call(IrFunction *fn, IrModule *mod, const char *callee,
     return inst->id;
 }
 
+/* Emit a host-call instruction.
+ *
+ * `qualified_name` is the dotted capability identifier ("llm.classify",
+ * "http.fetch", ...). The IR backend (ir_emit_wasm.c) splits it on the
+ * '.' to derive both the import module name ("vdag:llm") and the
+ * function name ("classify"); see imports.go for the per-capability ABI.
+ *
+ * The return value of a host call is always int (the i32 status / byte
+ * count returned by the wazero host fn). We model it as IR_TYPE_I64
+ * so it composes with the rest of Limceron's integer arithmetic without
+ * extra casts. */
+int ir_emit_host_call(IrFunction *fn, IrModule *mod,
+                       const char *qualified_name,
+                       int *args, int arg_count) {
+    /* L4 (2026-05-13): the `vdag:string` interpolation primitives
+     * return a string handle (pointer to a length-prefixed bytestring
+     * in linear memory) rather than the default i64 byte-count or
+     * negative sentinel. Type-tagging the SSA slot keeps the wasm
+     * backend's local allocator declaring an i32 to match the host
+     * import signature.
+     *
+     * L7 (2026-05-13): the float-domain math host calls (math.sqrt,
+     * sin, cos, tan, log, exp, pow) return f64. The boolean string
+     * predicates (string.contains / starts_with / ends_with) return
+     * 0/1 and we tag them IR_TYPE_BOOL so a
+     * `fn foo() -> bool { string.contains(...) }` shape lines up
+     * with the WASM `(result i32)` Limceron emits for bool returns.
+     *
+     * Every other capability still bottoms out at i64 (positive
+     * bytes-written / negative HostErr* per ADR-0002). */
+    IrType result_type = IR_TYPE_I64;
+    if (qualified_name &&
+        (strcmp(qualified_name, "string.concat")     == 0 ||
+         strcmp(qualified_name, "string.from_int")   == 0 ||
+         strcmp(qualified_name, "string.from_bool")  == 0 ||
+         strcmp(qualified_name, "string.from_float") == 0)) {
+        result_type = IR_TYPE_STRING;
+    } else if (qualified_name &&
+               (strcmp(qualified_name, "math.sqrt") == 0 ||
+                strcmp(qualified_name, "math.sin")  == 0 ||
+                strcmp(qualified_name, "math.cos")  == 0 ||
+                strcmp(qualified_name, "math.tan")  == 0 ||
+                strcmp(qualified_name, "math.log")  == 0 ||
+                strcmp(qualified_name, "math.exp")  == 0 ||
+                strcmp(qualified_name, "math.pow")  == 0)) {
+        result_type = IR_TYPE_F64;
+    } else if (qualified_name &&
+               (strcmp(qualified_name, "string.contains")    == 0 ||
+                strcmp(qualified_name, "string.starts_with") == 0 ||
+                strcmp(qualified_name, "string.ends_with")   == 0)) {
+        result_type = IR_TYPE_BOOL;
+    }
+    IrInst *inst = ir_inst_new(fn, mod, IR_HOST_CALL, result_type);
+    inst->fn_name = arena_strdup(mod->arena, qualified_name);
+    int i;
+    for (i = 0; i < arg_count && i < 16; i++)
+        inst->call_args[i] = args[i];
+    inst->call_arg_count = arg_count;
+    return inst->id;
+}
+
 void ir_emit_ret(IrFunction *fn, IrModule *mod, int value) {
     IrInst *inst = ir_inst_new(fn, mod, IR_RET, IR_TYPE_VOID);
     inst->operands[0] = value;
@@ -347,6 +410,14 @@ typedef struct {
     const char *name;
     int         addr_id;    /* SSA value of the alloca */
     IrType      type;
+    /* L3: marks a local that holds a Json handle. The IR-gen pass
+     * sets this when the let-initializer is one of `json.parse`,
+     * `json.field`, `json.field_get`, `json.field_get_safe`,
+     * `json.array_index`, or `json.array_get`, or when the let has
+     * an explicit `: Json` annotation. Field-access / `as` lowering
+     * dispatches on this flag rather than on the IR type (every
+     * Json value occupies the same i64 SSA slot as a regular int). */
+    bool        is_json;
 } IrGenVar;
 
 typedef struct {
@@ -356,10 +427,48 @@ typedef struct {
     int         scope_depth;
 } IrGenScope;
 
+/* Maximum agent-local fn registry size per IR generation pass.
+ * Sized generously: agents typically have <10 methods, but we keep
+ * a flat array across all agents to simplify lookup. */
+#define IR_GEN_MAX_AGENT_FNS 256
+
+/* Maximum nested loop depth per function. Each `while`, `for-in`, or `loop`
+ * pushes one entry; `break` / `continue` consult the top. 16 is generous —
+ * deeper nesting almost certainly indicates a bug. */
+#define IR_GEN_MAX_LOOP_DEPTH 16
+
+typedef struct {
+    int  continue_bb;   /* `continue` target (loop header / cond / inc) */
+    int  break_bb;      /* `break`    target (post-loop / exit)         */
+    bool saw_break;     /* set true on any AST_BREAK inside this loop;
+                         * used to warn about provably-infinite loops    */
+} IrGenLoopCtx;
+
+/* L5: catch-handler stack. Each `try { } catch (e: T) { }` pushes a frame
+ * before lowering the try-block; `?` inside the body jumps to the top
+ * frame's handler block (with the err value stored to err_addr) instead
+ * of returning Err from the enclosing function. */
+#define IR_GEN_MAX_CATCH_DEPTH 16
+
+typedef struct {
+    int catch_bb;      /* block to jump to on Err propagation */
+    int err_addr;      /* alloca address where ? stashes the err code */
+} IrGenCatchCtx;
+
 typedef struct {
     IrModule   *mod;
     IrFunction *current_fn;
     IrGenScope  scope;
+
+    /* Per-fn break/continue target stack. Pushed on entering a loop body,
+     * popped on exit. AST_BREAK/AST_CONTINUE jump to the TOP entry, which
+     * naturally gives innermost-loop semantics under nesting. */
+    IrGenLoopCtx loop_stack[IR_GEN_MAX_LOOP_DEPTH];
+    int          loop_depth;
+
+    /* L5: catch-handler stack. NULL/empty means `?` returns Err from fn. */
+    IrGenCatchCtx catch_stack[IR_GEN_MAX_CATCH_DEPTH];
+    int           catch_depth;
 
     /* Function name registry for call target resolution */
     struct {
@@ -367,6 +476,40 @@ typedef struct {
         IrType      ret_type;
     } fn_registry[256];
     int fn_reg_count;
+
+    /* Agent-local function registry: maps unqualified callee name to its
+     * mangled IR symbol when invoked from inside the *same* agent. Calls
+     * resolve through this table FIRST (only while lowering an agent body),
+     * then fall through to the global lcn_<name> resolution. */
+    struct {
+        const char *agent_kebab;  /* the agent this binding belongs to */
+        const char *fn_name;      /* unqualified Limceron name (e.g. "classify") */
+        const char *ir_symbol;    /* mangled IR symbol (e.g. "__lcn_branch_classify_classify") */
+        IrType      ret_type;
+    } agent_fn_registry[IR_GEN_MAX_AGENT_FNS];
+    int agent_fn_reg_count;
+
+    /* Currently-lowering agent kebab (NULL when not inside an agent body).
+     * Used by irgen_call to scope agent-local resolution. */
+    const char *current_agent_kebab;
+
+    /* True once we have emitted an unmangled `lcn_main` wrapper. The
+     * first agent declaring `fn main` wins; later agents emit only the
+     * mangled form and a stderr warning. */
+    bool        has_unmangled_main;
+
+    /* L8: module-scoped fn registry. Each entry maps a (module_stem,
+     * fn_name) pair to its mangled IR symbol. Populated by the program-
+     * level walk so that calls of the form `helpers.greet(x)` (parsed as
+     * AST_METHOD_CALL with the module name on the LHS) can route to the
+     * cross-file mangled symbol. */
+    struct {
+        const char *module_stem;  /* e.g. "helpers" */
+        const char *fn_name;      /* e.g. "greet" */
+        const char *ir_symbol;    /* e.g. "lcn___helpers_greet" */
+        IrType      ret_type;
+    } module_fn_registry[256];
+    int module_fn_reg_count;
 } IrGenContext;
 
 static void irgen_scope_init(IrGenScope *s) {
@@ -393,6 +536,7 @@ static void irgen_scope_add(IrGenScope *s, const char *name, int addr_id, IrType
         s->vars[s->var_count].name = name;
         s->vars[s->var_count].addr_id = addr_id;
         s->vars[s->var_count].type = type;
+        s->vars[s->var_count].is_json = false;
         s->var_count++;
     }
 }
@@ -405,6 +549,36 @@ static IrGenVar *irgen_scope_lookup(IrGenScope *s, const char *name) {
             return &s->vars[i];
     }
     return NULL;
+}
+
+/* ============================================================
+ * Loop Break/Continue Stack
+ *
+ * Each `while`/`for`/`loop` body pushes a (continue_bb, break_bb) frame
+ * before lowering its body and pops it after. `break` / `continue` target
+ * the TOP-OF-STACK frame, so under nested loops the inner break exits
+ * the inner loop only, never the outer one.
+ * ============================================================ */
+
+static void irgen_loop_push(IrGenContext *ctx, int continue_bb, int break_bb) {
+    if (ctx->loop_depth < IR_GEN_MAX_LOOP_DEPTH) {
+        ctx->loop_stack[ctx->loop_depth].continue_bb = continue_bb;
+        ctx->loop_stack[ctx->loop_depth].break_bb    = break_bb;
+        ctx->loop_stack[ctx->loop_depth].saw_break   = false;
+        ctx->loop_depth++;
+    }
+}
+
+static IrGenLoopCtx *irgen_loop_top(IrGenContext *ctx) {
+    if (ctx->loop_depth <= 0) return NULL;
+    return &ctx->loop_stack[ctx->loop_depth - 1];
+}
+
+/* Returns the top frame's saw_break flag, then pops the frame. */
+static bool irgen_loop_pop(IrGenContext *ctx) {
+    if (ctx->loop_depth <= 0) return false;
+    ctx->loop_depth--;
+    return ctx->loop_stack[ctx->loop_depth].saw_break;
 }
 
 /* Register a function in the context for call-site type inference */
@@ -443,6 +617,11 @@ static IrType ast_type_to_ir(AstNode *type_expr) {
             return IR_TYPE_STRING;
         if (strcmp(type_expr->name, "void") == 0)
             return IR_TYPE_VOID;
+        /* L3: `Json` is an opaque handle. On the wasm side it is an
+         * i32 handle issued by the host, but at the SSA layer (where
+         * every host-call return lives) it occupies an i64 slot. */
+        if (strcmp(type_expr->name, "Json") == 0)
+            return IR_TYPE_I64;
         /* Default: treat unknown named types as struct/ptr */
         return IR_TYPE_PTR;
     }
@@ -468,6 +647,7 @@ static IrType irgen_infer_type(AstNode *expr) {
     case AST_INT_LIT:    return IR_TYPE_I64;
     case AST_FLOAT_LIT:  return IR_TYPE_F64;
     case AST_STRING_LIT: return IR_TYPE_STRING;
+    case AST_INTERP_STRING: return IR_TYPE_STRING;   /* L4 */
     case AST_BOOL_LIT:   return IR_TYPE_BOOL;
     case AST_NONE_LIT:   return IR_TYPE_PTR;
     case AST_BINARY: {
@@ -495,6 +675,21 @@ static IrType irgen_infer_type(AstNode *expr) {
 /* Determine the actual type of a generated SSA value */
 static IrType irgen_value_type(IrGenContext *ctx, int val_id) {
     if (val_id < 0) return IR_TYPE_VOID;
+    /* L8: function parameters have a value-id but no defining
+     * instruction in any BB (they're produced at function entry).
+     * Look them up against the parameter table first so a caller
+     * asking for the type of e.g. a `string` param does not get
+     * the IR_TYPE_I64 fallback -- which would mis-route an
+     * interpolation segment through `string.from_int` and break
+     * the WASM type checker at the host-call boundary. */
+    if (ctx->current_fn) {
+        int i;
+        for (i = 0; i < ctx->current_fn->param_count; i++) {
+            if (ctx->current_fn->param_value_ids[i] == val_id) {
+                return ctx->current_fn->param_types[i];
+            }
+        }
+    }
     IrBasicBlock *bb;
     for (bb = ctx->current_fn->entry; bb; bb = bb->next) {
         IrInst *inst;
@@ -579,6 +774,44 @@ static int irgen_unary(IrGenContext *ctx, AstNode *expr) {
 }
 
 /* Generate IR for a function call */
+/* Look up an unqualified callee inside the current agent's local fn
+ * registry. Returns the mangled IR symbol and writes its return type to
+ * *out_ret_type, or NULL if no binding exists. */
+static const char *irgen_lookup_agent_local(IrGenContext *ctx,
+                                            const char *callee,
+                                            IrType *out_ret_type) {
+    if (!ctx->current_agent_kebab || !callee) return NULL;
+    int i;
+    for (i = 0; i < ctx->agent_fn_reg_count; i++) {
+        if (strcmp(ctx->agent_fn_registry[i].agent_kebab,
+                   ctx->current_agent_kebab) == 0 &&
+            strcmp(ctx->agent_fn_registry[i].fn_name, callee) == 0) {
+            if (out_ret_type) *out_ret_type = ctx->agent_fn_registry[i].ret_type;
+            return ctx->agent_fn_registry[i].ir_symbol;
+        }
+    }
+    return NULL;
+}
+
+/* L8: look up a fn imported from another module by (module_stem, fn_name).
+ * Returns the mangled IR symbol and writes the return type to *out_ret_type,
+ * or NULL when no cross-file binding matches. */
+static const char *irgen_lookup_module_fn(IrGenContext *ctx,
+                                           const char *module_stem,
+                                           const char *fn_name,
+                                           IrType *out_ret_type) {
+    if (!module_stem || !fn_name) return NULL;
+    int i;
+    for (i = 0; i < ctx->module_fn_reg_count; i++) {
+        if (strcmp(ctx->module_fn_registry[i].module_stem, module_stem) == 0 &&
+            strcmp(ctx->module_fn_registry[i].fn_name, fn_name) == 0) {
+            if (out_ret_type) *out_ret_type = ctx->module_fn_registry[i].ret_type;
+            return ctx->module_fn_registry[i].ir_symbol;
+        }
+    }
+    return NULL;
+}
+
 static int irgen_call(IrGenContext *ctx, AstNode *expr) {
     /* Get the callee name */
     const char *callee = NULL;
@@ -604,7 +837,16 @@ static int irgen_call(IrGenContext *ctx, AstNode *expr) {
         args[arg_count++] = irgen_expr(ctx, arg_node);
     }
 
-    /* Determine return type from registry */
+    /* If we're lowering an agent body, an unqualified callee that names a
+     * sibling fn in the SAME agent must resolve to the mangled IR symbol. */
+    IrType local_ret = IR_TYPE_VOID;
+    const char *local_sym = irgen_lookup_agent_local(ctx, callee, &local_ret);
+    if (local_sym) {
+        return ir_emit_call(ctx->current_fn, ctx->mod, local_sym,
+                            local_ret, args, arg_count);
+    }
+
+    /* Determine return type from global registry */
     IrType ret_type = irgen_lookup_fn_ret(ctx, callee);
 
     /* Build qualified name: lcn_<name> */
@@ -612,6 +854,335 @@ static int irgen_call(IrGenContext *ctx, AstNode *expr) {
     snprintf(fn_name, sizeof(fn_name), "lcn_%s", callee);
 
     return ir_emit_call(ctx->current_fn, ctx->mod, fn_name, ret_type, args, arg_count);
+}
+
+/* ============================================================
+ * L3: Json provenance helpers
+ *
+ * The front-end exposes `Json` as an opaque handle type. At the SSA
+ * level every Json handle lives in an i64 slot identical to a regular
+ * integer, so we cannot dispatch field-access lowering on IR type.
+ * Instead we tag scope variables whose initializer originates from
+ * the vdag:json namespace; field access (`x.foo`) and the `as int |
+ * string | bool` coercion operators then consult this tag to decide
+ * whether to lower to a host call or fall through to the
+ * default-no-op behaviour.
+ * ============================================================ */
+
+/* L6 marker -- general match decision-tree lowering follows. */
+static bool l6_pat_ident_is_qualified(const AstNode *pat) {
+    if (!pat || pat->kind != AST_PAT_IDENT || !pat->name) return false;
+    for (const char *q = pat->name; q[0] && q[1]; q++) {
+        if (q[0] == ':' && q[1] == ':') return true;
+    }
+    return false;
+}
+
+static int irgen_lower_arm_body_l6(IrGenContext *ctx, AstNode *arm,
+                                   int subj, IrBasicBlock *merge_bb,
+                                   IrBasicBlock **out_pred) {
+    int val = -1;
+    *out_pred = NULL;
+    irgen_scope_push(&ctx->scope);
+    AstNode *pat = arm->left;
+    const char *bind = NULL;
+    if (pat) {
+        if (pat->kind == AST_PAT_IDENT && pat->name &&
+            !l6_pat_ident_is_qualified(pat))
+            bind = pat->name;
+        else if (pat->kind == AST_PAT_ENUM && pat->params &&
+                 pat->params->kind == AST_PAT_IDENT && pat->params->name)
+            bind = pat->params->name;
+    }
+    if (bind) {
+        int slot = ir_emit_alloca(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+        ir_emit_store(ctx->current_fn, ctx->mod, subj, slot);
+        irgen_scope_add(&ctx->scope, bind, slot, IR_TYPE_I64);
+    }
+    AstNode *body = arm->right;
+    if (body && body->kind == AST_BLOCK) {
+        AstNode *tail = NULL;
+        for (AstNode *s = body->params; s; s = s->next)
+            if (!s->next && s->kind == AST_EXPR_STMT && s->left) tail = s;
+        for (AstNode *s = body->params; s; s = s->next) {
+            if (s == tail) val = irgen_expr(ctx, s->left);
+            else           irgen_stmt(ctx, s);
+        }
+    } else if (body) {
+        val = irgen_expr(ctx, body);
+    }
+    {
+        IrBasicBlock *cur = ctx->current_fn->current_bb;
+        IrInst *last = cur ? cur->last : NULL;
+        if (!last || (last->op != IR_RET && last->op != IR_JMP &&
+                      last->op != IR_BR)) {
+            ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
+            *out_pred = ctx->current_fn->current_bb;
+        }
+    }
+    irgen_scope_pop(&ctx->scope);
+    return val;
+}
+
+static int irgen_match_decision_tree(IrGenContext *ctx, AstNode *expr) {
+    int arm_count = 0;
+    for (AstNode *a = expr->params; a; a = a->next, arm_count++) {
+        if (a->kind != AST_MATCH_ARM || !a->left) return -1;
+        AstNode *pat = a->left;
+        switch (pat->kind) {
+        case AST_PAT_WILDCARD:
+            break;
+        case AST_PAT_IDENT:
+            if (l6_pat_ident_is_qualified(pat)) {
+                const char *head_end = pat->name;
+                for (const char *q = pat->name; *q; q++) {
+                    if (q[0] == ':' && q[1] == ':') { head_end = q; break; }
+                }
+                size_t hlen = (size_t)(head_end - pat->name);
+                if (hlen != 10 ||
+                    (memcmp(pat->name, "host_error", 10) != 0 &&
+                     memcmp(pat->name, "host-error", 10) != 0)) {
+                    return -1;
+                }
+            }
+            break;
+        case AST_PAT_LITERAL:
+            if (pat->name && strcmp(pat->name, "str") == 0)  return -1;
+            if (pat->name && strcmp(pat->name, "none") == 0) return -1;
+            break;
+        case AST_PAT_ENUM: {
+            if (!pat->name) return -1;
+            const char *head_end = pat->name;
+            for (const char *q = pat->name; *q; q++) {
+                if (q[0] == ':' && q[1] == ':') { head_end = q; break; }
+                else if (q[0] == '.')           { head_end = q; break; }
+            }
+            size_t hlen = (size_t)(head_end - pat->name);
+            if (hlen == 10 &&
+                (memcmp(pat->name, "host_error", 10) == 0 ||
+                 memcmp(pat->name, "host-error", 10) == 0)) {
+                break;
+            }
+            return -1;
+        }
+        default:
+            return -1;
+        }
+    }
+    if (arm_count == 0) return -1;
+
+    int subj = irgen_expr(ctx, expr->left);
+    if (subj < 0) return -1;
+    IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
+
+    IrBasicBlock *merge_bb = ir_bb_new(ctx->current_fn, ctx->mod,
+                                       "match.merge");
+
+    enum { L6_MATCH_MAX_ARMS = 32 };
+    if (arm_count > L6_MATCH_MAX_ARMS) return -1;
+    IrBasicBlock *arm_pred_bb[L6_MATCH_MAX_ARMS] = {0};
+    IrBasicBlock *arm_body_bb[L6_MATCH_MAX_ARMS] = {0};
+    IrBasicBlock *arm_next_bb[L6_MATCH_MAX_ARMS] = {0};
+    int           arm_val[L6_MATCH_MAX_ARMS];
+    IrBasicBlock *arm_pred[L6_MATCH_MAX_ARMS];
+    int i;
+    for (i = 0; i < arm_count; i++) {
+        char lp[32], lb[32], ln[32];
+        snprintf(lp, sizeof(lp), "match.arm%d", i);
+        snprintf(lb, sizeof(lb), "match.arm%d.body", i);
+        snprintf(ln, sizeof(ln), "match.arm%d.next", i);
+        arm_pred_bb[i] = ir_bb_new(ctx->current_fn, ctx->mod, lp);
+        arm_body_bb[i] = ir_bb_new(ctx->current_fn, ctx->mod, lb);
+        arm_next_bb[i] = ir_bb_new(ctx->current_fn, ctx->mod, ln);
+        arm_val[i] = -1;
+        arm_pred[i] = NULL;
+    }
+    ir_set_current_bb(ctx->current_fn, pre_bb);
+    ir_emit_jmp(ctx->current_fn, ctx->mod, arm_pred_bb[0]->id);
+
+    AstNode *arm = expr->params;
+    for (i = 0; i < arm_count && arm; i++, arm = arm->next) {
+        AstNode *pat = arm->left;
+        bool guarded = (arm->params != NULL);
+
+        ir_set_current_bb(ctx->current_fn, arm_pred_bb[i]);
+        int pred_val = -1;
+        bool is_catchall = false;
+        if (pat->kind == AST_PAT_WILDCARD ||
+            (pat->kind == AST_PAT_IDENT &&
+             !l6_pat_ident_is_qualified(pat))) {
+            is_catchall = true;
+        } else if (pat->kind == AST_PAT_IDENT &&
+                   l6_pat_ident_is_qualified(pat)) {
+            const char *sep = NULL;
+            for (const char *q = pat->name; q[0] && q[1]; q++) {
+                if (q[0] == ':' && q[1] == ':') { sep = q; break; }
+            }
+            if (!sep) return -1;
+            int64_t sentinel = 0;
+            if (!lcn_wit_resolve_host_error("host-error", sep + 2,
+                                            &sentinel))
+                return -1;
+            int lit = ir_emit_const_int(ctx->current_fn, ctx->mod,
+                                        sentinel);
+            pred_val = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                     IR_CMP_EQ, IR_TYPE_BOOL,
+                                     subj, lit);
+        } else if (pat->kind == AST_PAT_LITERAL && pat->name) {
+            if (strcmp(pat->name, "int") == 0) {
+                int lit = ir_emit_const_int(ctx->current_fn, ctx->mod,
+                                            pat->val.int_val);
+                pred_val = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_EQ, IR_TYPE_BOOL,
+                                         subj, lit);
+            } else if (strcmp(pat->name, "true") == 0) {
+                int one = ir_emit_const_int(ctx->current_fn, ctx->mod, 1);
+                pred_val = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_EQ, IR_TYPE_BOOL,
+                                         subj, one);
+            } else if (strcmp(pat->name, "false") == 0) {
+                int zero = ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+                pred_val = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_EQ, IR_TYPE_BOOL,
+                                         subj, zero);
+            } else {
+                return -1;
+            }
+        } else if (pat->kind == AST_PAT_ENUM && pat->name) {
+            const char *sep = NULL;
+            for (const char *q = pat->name; q[0] && q[1]; q++) {
+                if (q[0] == ':' && q[1] == ':') { sep = q; break; }
+            }
+            if (!sep) return -1;
+            int64_t sentinel = 0;
+            if (!lcn_wit_resolve_host_error("host-error", sep + 2,
+                                            &sentinel))
+                return -1;
+            int lit = ir_emit_const_int(ctx->current_fn, ctx->mod,
+                                        sentinel);
+            pred_val = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                     IR_CMP_EQ, IR_TYPE_BOOL,
+                                     subj, lit);
+        } else {
+            return -1;
+        }
+
+        if (is_catchall) {
+            if (guarded) {
+                irgen_scope_push(&ctx->scope);
+                if (pat->kind == AST_PAT_IDENT && pat->name) {
+                    int slot = ir_emit_alloca(ctx->current_fn, ctx->mod,
+                                              IR_TYPE_I64);
+                    ir_emit_store(ctx->current_fn, ctx->mod, subj, slot);
+                    irgen_scope_add(&ctx->scope, pat->name,
+                                    slot, IR_TYPE_I64);
+                }
+                int g = irgen_expr(ctx, arm->params);
+                irgen_scope_pop(&ctx->scope);
+                if (g < 0) return -1;
+                ir_emit_br(ctx->current_fn, ctx->mod, g,
+                           arm_body_bb[i]->id, arm_next_bb[i]->id);
+            } else {
+                ir_emit_jmp(ctx->current_fn, ctx->mod,
+                            arm_body_bb[i]->id);
+            }
+        } else {
+            if (guarded) {
+                char lg[32];
+                snprintf(lg, sizeof(lg), "match.arm%d.guard", i);
+                IrBasicBlock *guard_bb = ir_bb_new(ctx->current_fn,
+                                                   ctx->mod, lg);
+                ir_emit_br(ctx->current_fn, ctx->mod, pred_val,
+                           guard_bb->id, arm_next_bb[i]->id);
+                ir_set_current_bb(ctx->current_fn, guard_bb);
+                irgen_scope_push(&ctx->scope);
+                if (pat->kind == AST_PAT_ENUM && pat->params &&
+                    pat->params->kind == AST_PAT_IDENT &&
+                    pat->params->name) {
+                    int slot = ir_emit_alloca(ctx->current_fn, ctx->mod,
+                                              IR_TYPE_I64);
+                    ir_emit_store(ctx->current_fn, ctx->mod, subj, slot);
+                    irgen_scope_add(&ctx->scope, pat->params->name,
+                                    slot, IR_TYPE_I64);
+                }
+                int g = irgen_expr(ctx, arm->params);
+                irgen_scope_pop(&ctx->scope);
+                if (g < 0) return -1;
+                ir_emit_br(ctx->current_fn, ctx->mod, g,
+                           arm_body_bb[i]->id, arm_next_bb[i]->id);
+            } else {
+                ir_emit_br(ctx->current_fn, ctx->mod, pred_val,
+                           arm_body_bb[i]->id, arm_next_bb[i]->id);
+            }
+        }
+
+        ir_set_current_bb(ctx->current_fn, arm_body_bb[i]);
+        arm_val[i] = irgen_lower_arm_body_l6(ctx, arm, subj, merge_bb,
+                                             &arm_pred[i]);
+
+        ir_set_current_bb(ctx->current_fn, arm_next_bb[i]);
+        if (i + 1 < arm_count) {
+            ir_emit_jmp(ctx->current_fn, ctx->mod,
+                        arm_pred_bb[i + 1]->id);
+        } else {
+            ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
+        }
+    }
+
+    ir_set_current_bb(ctx->current_fn, merge_bb);
+    int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+    IrInst *phi_inst = merge_bb->last;
+    if (phi_inst && phi_inst->op == IR_PHI && phi_inst->id == phi) {
+        for (i = 0; i < arm_count; i++) {
+            if (arm_val[i] >= 0 && arm_pred[i]) {
+                ir_phi_add_incoming(phi_inst, arm_val[i],
+                                    arm_pred[i]->id);
+            }
+        }
+    }
+    return phi;
+}
+
+/* Return true if the qualified host-call name produces a Json handle
+ * we should track across let-bindings. Verbs that decode a handle
+ * into a primitive (string-value/int-value/bool-value/length/is-null
+ * /stringify/as-*) are NOT in this set -- their result is the leaf
+ * value, not another handle. */
+static bool host_call_returns_json(const char *qname) {
+    if (!qname) return false;
+    return strcmp(qname, "json.parse")            == 0 ||
+           strcmp(qname, "json.field")            == 0 ||
+           strcmp(qname, "json.field_get")        == 0 ||
+           strcmp(qname, "json.field_get_safe")   == 0 ||
+           strcmp(qname, "json.array_index")      == 0 ||
+           strcmp(qname, "json.array_get")        == 0;
+}
+
+/* True when `expr` evaluates to a Json handle. Used at let-binding
+ * sites (to tag the bound name) and at field-access / cast sites (to
+ * decide whether to rewrite to the vdag:json sugar). */
+static bool expr_is_json(IrGenContext *ctx, AstNode *expr) {
+    if (!expr) return false;
+    switch (expr->kind) {
+    case AST_HOST_CALL:
+        return host_call_returns_json(expr->name);
+    case AST_IDENT: {
+        if (!expr->name) return false;
+        IrGenVar *v = irgen_scope_lookup(&ctx->scope, expr->name);
+        return v && v->is_json;
+    }
+    case AST_FIELD_ACCESS:
+        /* `x.foo.bar` -- recursing into ->left tells us whether the
+         * intermediate result is Json. Field access on a Json
+         * receiver itself returns Json (see field-get/field-get-safe). */
+        return expr_is_json(ctx, expr->left);
+    case AST_TRY:
+        /* `expr?` is transparent -- the propagator just strips the
+         * Err half; the Ok half retains the underlying type. */
+        return expr_is_json(ctx, expr->left);
+    default:
+        return false;
+    }
 }
 
 /* Main expression IR generator */
@@ -628,6 +1199,72 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
     case AST_STRING_LIT:
         return ir_emit_const_string(ctx->current_fn, ctx->mod,
                                      expr->val.str_val ? expr->val.str_val : "");
+
+    /* L4: `"...${expr}..."` lowers to a left-folded chain of
+     * `vdag:string.concat(prev, next)` host calls. Each segment
+     * normalises to a string first:
+     *   - AST_STRING_LIT  -> emitted as-is (skipped if empty).
+     *   - i64-shaped expr -> `vdag:string.from_int(v)`
+     *   - bool-shaped     -> `vdag:string.from_bool(v)`
+     *   - f64-shaped      -> `vdag:string.from_float(v)`
+     *   - already-string  -> passed through verbatim.
+     *   - Json handle     -> `vdag:json.as_string(h)` (the L4
+     *                         typecheck pass requires the author
+     *                         to spell that cast explicitly, but
+     *                         we still emit it defensively in
+     *                         case the check is bypassed).
+     * The result is a single string-typed SSA value that callers
+     * can feed into a `let`, a return, or another concat. */
+    case AST_INTERP_STRING: {
+        AstNode *part = expr->params;
+        int acc = -1;
+        int idx = 0;
+        for (; part; part = part->next, idx++) {
+            int seg = -1;
+            if ((idx & 1) == 0) {
+                /* Literal segment (always AST_STRING_LIT by
+                 * construction). Skip empty segments to keep the
+                 * concat chain shorter. */
+                const char *s = part->val.str_val ? part->val.str_val : "";
+                if (s[0] == '\0' && acc != -1) continue;
+                seg = ir_emit_const_string(ctx->current_fn, ctx->mod, s);
+            } else {
+                int v = irgen_expr(ctx, part);
+                IrType vt = irgen_value_type(ctx, v);
+                if (expr_is_json(ctx, part)) {
+                    int args[1] = { v };
+                    seg = ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                            "json.as_string", args, 1);
+                } else if (vt == IR_TYPE_STRING) {
+                    seg = v;
+                } else if (vt == IR_TYPE_BOOL) {
+                    int args[1] = { v };
+                    seg = ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                            "string.from_bool", args, 1);
+                } else if (vt == IR_TYPE_F64) {
+                    int args[1] = { v };
+                    seg = ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                            "string.from_float", args, 1);
+                } else {
+                    int args[1] = { v };
+                    seg = ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                            "string.from_int", args, 1);
+                }
+            }
+            if (seg < 0) continue;
+            if (acc < 0) {
+                acc = seg;
+            } else {
+                int args[2] = { acc, seg };
+                acc = ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                        "string.concat", args, 2);
+            }
+        }
+        if (acc < 0) {
+            acc = ir_emit_const_string(ctx->current_fn, ctx->mod, "");
+        }
+        return acc;
+    }
 
     case AST_BOOL_LIT:
         return ir_emit_const_bool(ctx->current_fn, ctx->mod, expr->val.bool_val);
@@ -652,6 +1289,31 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
                 }
             }
         }
+        /* L5: `<enum>::<variant>` qualified identifier (parser joins both
+         * halves with `::` into a single name). Resolve against the
+         * canonical include/vdag.errors.wit table and emit an integer
+         * literal carrying the sentinel value. The typecheck pass already
+         * flagged unknown variants; if we still cannot resolve here we
+         * fall through to the zero placeholder below to avoid masking
+         * earlier errors. */
+        {
+            const char *n = expr->name;
+            const char *sep = NULL;
+            for (const char *q = n; q[0] && q[1]; q++) {
+                if (q[0] == ':' && q[1] == ':') { sep = q; break; }
+            }
+            if (sep && (sep - n) > 0) {
+                char enum_name[64];
+                size_t en = (size_t)(sep - n);
+                if (en >= sizeof(enum_name)) en = sizeof(enum_name) - 1;
+                memcpy(enum_name, n, en);
+                enum_name[en] = '\0';
+                int64_t val = 0;
+                if (lcn_wit_resolve_host_error(enum_name, sep + 2, &val)) {
+                    return ir_emit_const_int(ctx->current_fn, ctx->mod, val);
+                }
+            }
+        }
         /* Fallback: emit a const 0 as placeholder */
         return ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
     }
@@ -665,60 +1327,700 @@ static int irgen_expr(IrGenContext *ctx, AstNode *expr) {
     case AST_CALL:
         return irgen_call(ctx, expr);
 
+    case AST_METHOD_CALL: {
+        /* L8: `<module>.<fn>(args)` where <module> is the stem of an
+         * imported sibling file routes to the mangled IR symbol
+         * `lcn___<module>_<fn>` so cross-module calls become direct
+         * calls inside the same wasm compilation unit (no
+         * `(import ...)` declaration is emitted). The receiver must be
+         * a bare identifier and must resolve in the module-fn registry;
+         * everything else falls through to a no-op placeholder which
+         * matches the legacy pre-L8 behaviour for ordinary method-call
+         * shapes the IR back-end did not lower. */
+        if (expr->left && expr->left->kind == AST_IDENT && expr->left->name &&
+            expr->name) {
+            IrType ret_type = IR_TYPE_VOID;
+            const char *sym = irgen_lookup_module_fn(ctx, expr->left->name,
+                                                     expr->name, &ret_type);
+            if (sym) {
+                int args[16];
+                int arg_count = 0;
+                AstNode *arg_node;
+                for (arg_node = expr->params;
+                     arg_node && arg_count < 16; arg_node = arg_node->next) {
+                    args[arg_count++] = irgen_expr(ctx, arg_node);
+                }
+                return ir_emit_call(ctx->current_fn, ctx->mod, sym,
+                                    ret_type, args, arg_count);
+            }
+        }
+        if (expr->left) (void)irgen_expr(ctx, expr->left);
+        return ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+    }
+
+    case AST_HOST_CALL: {
+        /* Host-call lowering. The qualified name is stored in expr->name
+         * (set by the parser, e.g. "llm.classify"). Args are in
+         * expr->params. We lower each argument expression to an SSA
+         * value and emit IR_HOST_CALL; the WASM backend marshals each
+         * arg according to the per-capability ABI documented in
+         * imports.go.
+         *
+         * L7: the pure-int helpers in stdlib/math (min, max, clamp,
+         * abs, sign) are intercepted BEFORE reaching ir_emit_host_call
+         * and lowered inline as compiler builtins -- no `(import
+         * "vdag:math" ...)` declaration is emitted because the body
+         * is a closed-form integer expression. This matches the spec
+         * pinned in stdlib/math.lceron and means an author writing
+         * `math.clamp(x, 0, 60)` pays zero host-call cost. */
+        int args[16];
+        int arg_count = 0;
+        AstNode *arg_node;
+        for (arg_node = expr->params; arg_node && arg_count < 16;
+             arg_node = arg_node->next) {
+            args[arg_count++] = irgen_expr(ctx, arg_node);
+        }
+        const char *qname = expr->name ? expr->name : "unknown.unknown";
+
+        /* ── L7: pure-int math builtins ─────────────────────────── */
+        if (qname && strncmp(qname, "math.", 5) == 0) {
+            const char *verb = qname + 5;
+
+            /* abs(x) = (x < 0) ? -x : x */
+            if (strcmp(verb, "abs") == 0 && arg_count == 1) {
+                int x = args[0];
+                int zero = ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+                int neg = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                        IR_SUB, IR_TYPE_I64, zero, x);
+                int cond = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_LT, IR_TYPE_BOOL, x, zero);
+                IrBasicBlock *thn = ir_bb_new(ctx->current_fn, ctx->mod, "abs.neg");
+                IrBasicBlock *els = ir_bb_new(ctx->current_fn, ctx->mod, "abs.pos");
+                IrBasicBlock *mrg = ir_bb_new(ctx->current_fn, ctx->mod, "abs.merge");
+                ir_emit_br(ctx->current_fn, ctx->mod, cond, thn->id, els->id);
+                ir_set_current_bb(ctx->current_fn, thn);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, els);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, mrg);
+                int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (mrg->last && mrg->last->op == IR_PHI && mrg->last->id == phi) {
+                    ir_phi_add_incoming(mrg->last, neg, thn->id);
+                    ir_phi_add_incoming(mrg->last, x,   els->id);
+                }
+                return phi;
+            }
+
+            /* min(a, b) = (a < b) ? a : b */
+            if (strcmp(verb, "min") == 0 && arg_count == 2) {
+                int a = args[0];
+                int b = args[1];
+                int cond = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_LT, IR_TYPE_BOOL, a, b);
+                IrBasicBlock *thn = ir_bb_new(ctx->current_fn, ctx->mod, "min.lt");
+                IrBasicBlock *els = ir_bb_new(ctx->current_fn, ctx->mod, "min.ge");
+                IrBasicBlock *mrg = ir_bb_new(ctx->current_fn, ctx->mod, "min.merge");
+                ir_emit_br(ctx->current_fn, ctx->mod, cond, thn->id, els->id);
+                ir_set_current_bb(ctx->current_fn, thn);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, els);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, mrg);
+                int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (mrg->last && mrg->last->op == IR_PHI && mrg->last->id == phi) {
+                    ir_phi_add_incoming(mrg->last, a, thn->id);
+                    ir_phi_add_incoming(mrg->last, b, els->id);
+                }
+                return phi;
+            }
+
+            /* max(a, b) = (a > b) ? a : b */
+            if (strcmp(verb, "max") == 0 && arg_count == 2) {
+                int a = args[0];
+                int b = args[1];
+                int cond = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_GT, IR_TYPE_BOOL, a, b);
+                IrBasicBlock *thn = ir_bb_new(ctx->current_fn, ctx->mod, "max.gt");
+                IrBasicBlock *els = ir_bb_new(ctx->current_fn, ctx->mod, "max.le");
+                IrBasicBlock *mrg = ir_bb_new(ctx->current_fn, ctx->mod, "max.merge");
+                ir_emit_br(ctx->current_fn, ctx->mod, cond, thn->id, els->id);
+                ir_set_current_bb(ctx->current_fn, thn);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, els);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mrg->id);
+                ir_set_current_bb(ctx->current_fn, mrg);
+                int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (mrg->last && mrg->last->op == IR_PHI && mrg->last->id == phi) {
+                    ir_phi_add_incoming(mrg->last, a, thn->id);
+                    ir_phi_add_incoming(mrg->last, b, els->id);
+                }
+                return phi;
+            }
+
+            /* clamp(x, lo, hi) = min(max(x, lo), hi) */
+            if (strcmp(verb, "clamp") == 0 && arg_count == 3) {
+                int x  = args[0];
+                int lo = args[1];
+                int hi = args[2];
+                /* tmp = (x > lo) ? x : lo */
+                int c1 = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                       IR_CMP_GT, IR_TYPE_BOOL, x, lo);
+                IrBasicBlock *t1 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.gt");
+                IrBasicBlock *e1 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.le");
+                IrBasicBlock *m1 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.m1");
+                ir_emit_br(ctx->current_fn, ctx->mod, c1, t1->id, e1->id);
+                ir_set_current_bb(ctx->current_fn, t1);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, m1->id);
+                ir_set_current_bb(ctx->current_fn, e1);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, m1->id);
+                ir_set_current_bb(ctx->current_fn, m1);
+                int tmp = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (m1->last && m1->last->op == IR_PHI && m1->last->id == tmp) {
+                    ir_phi_add_incoming(m1->last, x,  t1->id);
+                    ir_phi_add_incoming(m1->last, lo, e1->id);
+                }
+                /* result = (tmp < hi) ? tmp : hi */
+                int c2 = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                       IR_CMP_LT, IR_TYPE_BOOL, tmp, hi);
+                IrBasicBlock *t2 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.lt");
+                IrBasicBlock *e2 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.ge");
+                IrBasicBlock *m2 = ir_bb_new(ctx->current_fn, ctx->mod, "clamp.m2");
+                ir_emit_br(ctx->current_fn, ctx->mod, c2, t2->id, e2->id);
+                ir_set_current_bb(ctx->current_fn, t2);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, m2->id);
+                ir_set_current_bb(ctx->current_fn, e2);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, m2->id);
+                ir_set_current_bb(ctx->current_fn, m2);
+                int out = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (m2->last && m2->last->op == IR_PHI && m2->last->id == out) {
+                    ir_phi_add_incoming(m2->last, tmp, t2->id);
+                    ir_phi_add_incoming(m2->last, hi,  e2->id);
+                }
+                return out;
+            }
+
+            /* sign(x) = (x > 0) ? 1 : ((x < 0) ? -1 : 0) */
+            if (strcmp(verb, "sign") == 0 && arg_count == 1) {
+                int x = args[0];
+                int zero = ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+                int one  = ir_emit_const_int(ctx->current_fn, ctx->mod, 1);
+                int neg1 = ir_emit_const_int(ctx->current_fn, ctx->mod, -1);
+                int cpos = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_GT, IR_TYPE_BOOL, x, zero);
+                IrBasicBlock *pb = ir_bb_new(ctx->current_fn, ctx->mod, "sign.pos");
+                IrBasicBlock *nb = ir_bb_new(ctx->current_fn, ctx->mod, "sign.npos");
+                IrBasicBlock *mb = ir_bb_new(ctx->current_fn, ctx->mod, "sign.mrg");
+                ir_emit_br(ctx->current_fn, ctx->mod, cpos, pb->id, nb->id);
+                ir_set_current_bb(ctx->current_fn, pb);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mb->id);
+                ir_set_current_bb(ctx->current_fn, nb);
+                int cneg = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                         IR_CMP_LT, IR_TYPE_BOOL, x, zero);
+                IrBasicBlock *nb_neg = ir_bb_new(ctx->current_fn, ctx->mod, "sign.neg");
+                IrBasicBlock *nb_zer = ir_bb_new(ctx->current_fn, ctx->mod, "sign.zer");
+                IrBasicBlock *nb_mrg = ir_bb_new(ctx->current_fn, ctx->mod, "sign.nm");
+                ir_emit_br(ctx->current_fn, ctx->mod, cneg, nb_neg->id, nb_zer->id);
+                ir_set_current_bb(ctx->current_fn, nb_neg);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, nb_mrg->id);
+                ir_set_current_bb(ctx->current_fn, nb_zer);
+                ir_emit_jmp(ctx->current_fn, ctx->mod, nb_mrg->id);
+                ir_set_current_bb(ctx->current_fn, nb_mrg);
+                int inner = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (nb_mrg->last && nb_mrg->last->op == IR_PHI &&
+                    nb_mrg->last->id == inner) {
+                    ir_phi_add_incoming(nb_mrg->last, neg1, nb_neg->id);
+                    ir_phi_add_incoming(nb_mrg->last, zero, nb_zer->id);
+                }
+                ir_emit_jmp(ctx->current_fn, ctx->mod, mb->id);
+                ir_set_current_bb(ctx->current_fn, mb);
+                int out = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+                if (mb->last && mb->last->op == IR_PHI && mb->last->id == out) {
+                    ir_phi_add_incoming(mb->last, one,   pb->id);
+                    ir_phi_add_incoming(mb->last, inner, nb_mrg->id);
+                }
+                return out;
+            }
+        }
+
+        return ir_emit_host_call(ctx->current_fn, ctx->mod, qname,
+                                  args, arg_count);
+    }
+
     case AST_CAST: {
+        /* L3: when the source operand is a Json handle, `as int`,
+         * `as string`, and `as bool` lower to vdag:json coercion
+         * verbs instead of the front-end's value-cast IR. */
+        if (expr_is_json(ctx, expr->left) &&
+            expr->type_expr && expr->type_expr->kind == AST_TYPE_NAMED &&
+            expr->type_expr->name) {
+            const char *target_name = expr->type_expr->name;
+            const char *qname = NULL;
+            if (strcmp(target_name, "int") == 0 ||
+                strcmp(target_name, "i64") == 0) {
+                qname = "json.as_int";
+            } else if (strcmp(target_name, "string") == 0 ||
+                       strcmp(target_name, "str") == 0) {
+                qname = "json.as_string";
+            } else if (strcmp(target_name, "bool") == 0) {
+                qname = "json.as_bool";
+            }
+            if (qname) {
+                int handle = irgen_expr(ctx, expr->left);
+                int args[1] = { handle };
+                return ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                          qname, args, 1);
+            }
+        }
         int val = irgen_expr(ctx, expr->left);
         IrType target = ast_type_to_ir(expr->type_expr);
         return ir_emit_cast(ctx->current_fn, ctx->mod, target, val);
     }
 
+    case AST_FIELD_ACCESS: {
+        /* L3 sugar: Json field access -> json.field_get(_, "name"). */
+        if (expr_is_json(ctx, expr->left) && expr->name) {
+            int handle = irgen_expr(ctx, expr->left);
+            int key    = ir_emit_const_string(ctx->current_fn, ctx->mod,
+                                              expr->name);
+            int args[2] = { handle, key };
+            const char *qname = expr->is_unsafe
+                ? "json.field_get_safe"
+                : "json.field_get";
+            return ir_emit_host_call(ctx->current_fn, ctx->mod,
+                                      qname, args, 2);
+        }
+        if (expr->left) (void)irgen_expr(ctx, expr->left);
+        return ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+    }
+
     case AST_IF: {
-        /* if/else as expression: returns a value via phi node */
+        /* if/else as expression. Each branch is lowered so that its tail
+         * statement (if it's an AST_EXPR_STMT) produces an SSA value;
+         * those values are combined in a PHI at the merge block, and the
+         * PHI id is returned so callers like `let x = if c { a } else { b }`
+         * or tail-position returns work.
+         *
+         * Branches that terminate via explicit `return` (or any other
+         * terminator) do NOT contribute to the PHI; if both terminate the
+         * merge block is unreachable and we return -1.
+         */
         IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
         int cond = irgen_expr(ctx, expr->left);
 
-        IrBasicBlock *then_bb = ir_bb_new(ctx->current_fn, ctx->mod, "if.then");
-        IrBasicBlock *else_bb = ir_bb_new(ctx->current_fn, ctx->mod, "if.else");
+        IrBasicBlock *then_bb  = ir_bb_new(ctx->current_fn, ctx->mod, "if.then");
+        IrBasicBlock *else_bb  = ir_bb_new(ctx->current_fn, ctx->mod, "if.else");
         IrBasicBlock *merge_bb = ir_bb_new(ctx->current_fn, ctx->mod, "if.merge");
 
-        /* Emit branch in the block that evaluated the condition */
         ir_set_current_bb(ctx->current_fn, pre_bb);
         ir_emit_br(ctx->current_fn, ctx->mod, cond, then_bb->id, else_bb->id);
 
-        /* Generate then block */
+        /* Lower one branch body; returns the tail-expression value (or
+         * -1 if none / branch terminated early), and reports via
+         * *out_pred the BB that actually jumps to merge (or NULL if the
+         * branch terminated and no jmp is emitted). */
+        #define LOWER_BRANCH(BRANCH_BODY, OUT_VAL, OUT_PRED) do {              \
+            int _val = -1;                                                     \
+            IrBasicBlock *_pred = NULL;                                        \
+            AstNode *_body = (BRANCH_BODY);                                    \
+            irgen_scope_push(&ctx->scope);                                     \
+            if (_body) {                                                       \
+                AstNode *_tail = NULL;                                         \
+                if (_body->kind == AST_BLOCK) {                                \
+                    for (AstNode *_s = _body->params; _s; _s = _s->next) {     \
+                        if (!_s->next && _s->kind == AST_EXPR_STMT && _s->left)\
+                            _tail = _s;                                        \
+                    }                                                          \
+                    for (AstNode *_s = _body->params; _s; _s = _s->next) {     \
+                        if (_s == _tail) {                                     \
+                            _val = irgen_expr(ctx, _s->left);                  \
+                        } else {                                               \
+                            irgen_stmt(ctx, _s);                               \
+                        }                                                      \
+                    }                                                          \
+                } else if (_body->kind == AST_EXPR_STMT && _body->left) {      \
+                    _val = irgen_expr(ctx, _body->left);                       \
+                } else {                                                       \
+                    irgen_stmt(ctx, _body);                                    \
+                }                                                              \
+            }                                                                  \
+            /* Skip the jmp if the branch already terminated. */               \
+            IrBasicBlock *_cur = ctx->current_fn->current_bb;                  \
+            IrInst *_last = _cur ? _cur->last : NULL;                          \
+            if (!_last ||                                                      \
+                (_last->op != IR_RET && _last->op != IR_JMP &&                 \
+                 _last->op != IR_BR)) {                                        \
+                ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);          \
+                _pred = ctx->current_fn->current_bb;                           \
+            }                                                                  \
+            irgen_scope_pop(&ctx->scope);                                      \
+            (OUT_VAL)  = _val;                                                 \
+            (OUT_PRED) = _pred;                                                \
+        } while (0)
+
+        int then_val = -1, else_val = -1;
+        IrBasicBlock *then_pred = NULL, *else_pred = NULL;
+
         ir_set_current_bb(ctx->current_fn, then_bb);
-        irgen_scope_push(&ctx->scope);
-        if (expr->right) {
-            /* then body */
-            AstNode *stmt;
-            if (expr->right->kind == AST_BLOCK) {
-                for (stmt = expr->right->params; stmt; stmt = stmt->next)
-                    irgen_stmt(ctx, stmt);
-            } else {
-                irgen_stmt(ctx, expr->right);
-            }
-        }
-        ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
-        irgen_scope_pop(&ctx->scope);
+        LOWER_BRANCH(expr->right, then_val, then_pred);
 
-        /* Generate else block */
         ir_set_current_bb(ctx->current_fn, else_bb);
+        LOWER_BRANCH(expr->params, else_val, else_pred);
+
+        #undef LOWER_BRANCH
+
+        ir_set_current_bb(ctx->current_fn, merge_bb);
+
+        /* Build PHI from incoming branches that produced a value. */
+        if ((then_val >= 0 && then_pred) || (else_val >= 0 && else_pred)) {
+            IrType phi_type = (then_val >= 0)
+                ? irgen_value_type(ctx, then_val)
+                : irgen_value_type(ctx, else_val);
+            int phi_id = ir_emit_phi(ctx->current_fn, ctx->mod, phi_type);
+            IrInst *phi_inst = NULL;
+            /* Locate the phi inst we just emitted (current_bb->last). */
+            if (merge_bb->last && merge_bb->last->op == IR_PHI &&
+                merge_bb->last->id == phi_id) {
+                phi_inst = merge_bb->last;
+            }
+            if (phi_inst) {
+                if (then_val >= 0 && then_pred) {
+                    ir_phi_add_incoming(phi_inst, then_val, then_pred->id);
+                }
+                if (else_val >= 0 && else_pred) {
+                    ir_phi_add_incoming(phi_inst, else_val, else_pred->id);
+                }
+            }
+            return phi_id;
+        }
+        return -1;
+    }
+
+    case AST_RESULT_OK:
+        /* Ok(v) — lower v and pass through. The encoding is "non-negative
+         * i64 = Ok"; the caller of `?` will dispatch on sign. */
+        return expr->left ? irgen_expr(ctx, expr->left)
+                          : ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+
+    case AST_RESULT_ERR:
+        /* Err(code) — lower the (already-negative) sentinel code and pass
+         * through. We trust the source-level code to be negative; if it
+         * is not, downstream `?` sees a non-negative value and treats
+         * it as Ok, which matches "Err(0) means no-error" only by accident.
+         * The v1 contract is: Err arguments must be negative. */
+        return expr->left ? irgen_expr(ctx, expr->left)
+                          : ir_emit_const_int(ctx->current_fn, ctx->mod, -1);
+
+    case AST_TRY: {
+        /* `expr?` — Result propagation. Lower the operand to value V, then:
+         *   if V < 0 -> jump to current catch handler (or return V from fn)
+         *   else     -> continue with V as the expression result
+         *
+         * Shape:
+         *
+         *   bbN:  %v = <expr>
+         *         %neg = cmp_lt %v, 0
+         *         br %neg, @try.err, @try.ok
+         *   try.err:
+         *         <store err to catch slot OR ret %v>
+         *   try.ok:
+         *         (V is the result)
+         */
+        int v = irgen_expr(ctx, expr->left);
+        if (v < 0) return -1;
+        int zero = ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+        int is_err = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                    IR_CMP_LT, IR_TYPE_BOOL, v, zero);
+
+        /* Remember the block where the br must live (where %is_err was
+         * just defined). ir_bb_new below will move current_bb. */
+        IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
+
+        IrBasicBlock *err_bb = ir_bb_new(ctx->current_fn, ctx->mod, "try.err");
+        IrBasicBlock *ok_bb  = ir_bb_new(ctx->current_fn, ctx->mod, "try.ok");
+
+        ir_set_current_bb(ctx->current_fn, pre_bb);
+        ir_emit_br(ctx->current_fn, ctx->mod, is_err, err_bb->id, ok_bb->id);
+
+        ir_set_current_bb(ctx->current_fn, err_bb);
+        if (ctx->catch_depth > 0) {
+            /* Stash the err value into the catch slot, then jump there. */
+            IrGenCatchCtx *top =
+                &ctx->catch_stack[ctx->catch_depth - 1];
+            ir_emit_store(ctx->current_fn, ctx->mod, v, top->err_addr);
+            ir_emit_jmp(ctx->current_fn, ctx->mod, top->catch_bb);
+        } else {
+            /* No enclosing try-catch: propagate Err by returning from fn. */
+            ir_emit_ret(ctx->current_fn, ctx->mod, v);
+        }
+
+        ir_set_current_bb(ctx->current_fn, ok_bb);
+        return v;
+    }
+
+    case AST_TRY_CATCH: {
+        /* try { body } catch (e: T) { handler }
+         *
+         * Shape:
+         *
+         *   pre:
+         *     %err_addr = alloca i64
+         *     jmp @try.body
+         *   try.body:
+         *     <body lowered with (catch_bb=catch, err_addr) pushed>
+         *     <tail expr ok_val>
+         *     jmp @try.merge
+         *   catch:
+         *     <handler scope binds `e` to load(%err_addr)>
+         *     <tail expr err_val>
+         *     jmp @try.merge
+         *   try.merge:
+         *     %r = phi [ok_val, body_pred] [err_val, catch_pred]
+         */
+        if (ctx->catch_depth >= IR_GEN_MAX_CATCH_DEPTH) return -1;
+
+        /* 1) Alloca err slot in the CURRENT (pre) block, then snapshot
+         * the pre-block pointer BEFORE creating new blocks (ir_bb_new
+         * moves current_bb away from us). */
+        int err_addr = ir_emit_alloca(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+        IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
+
+        IrBasicBlock *try_bb   = ir_bb_new(ctx->current_fn, ctx->mod, "try.body");
+        IrBasicBlock *catch_bb = ir_bb_new(ctx->current_fn, ctx->mod, "try.catch");
+        IrBasicBlock *merge_bb = ir_bb_new(ctx->current_fn, ctx->mod, "try.merge");
+
+        /* Stitch pre_bb -> try_bb. */
+        ir_set_current_bb(ctx->current_fn, pre_bb);
+        ir_emit_jmp(ctx->current_fn, ctx->mod, try_bb->id);
+
+        /* 2) Lower try-body with catch frame pushed. Use the existing
+         * branch-lowering shape: tail-expr of the block becomes the
+         * value flowing into the PHI. */
+        ctx->catch_stack[ctx->catch_depth].catch_bb = catch_bb->id;
+        ctx->catch_stack[ctx->catch_depth].err_addr = err_addr;
+        ctx->catch_depth++;
+
+        ir_set_current_bb(ctx->current_fn, try_bb);
+        int ok_val = -1;
+        IrBasicBlock *body_pred = NULL;
+        AstNode *body = expr->left;
         irgen_scope_push(&ctx->scope);
-        if (expr->params) {
-            /* else body (AST_IF: params=else_body) */
-            AstNode *stmt;
-            if (expr->params->kind == AST_BLOCK) {
-                for (stmt = expr->params->params; stmt; stmt = stmt->next)
-                    irgen_stmt(ctx, stmt);
-            } else {
-                irgen_stmt(ctx, expr->params);
+        if (body && body->kind == AST_BLOCK) {
+            AstNode *tail = NULL;
+            for (AstNode *s = body->params; s; s = s->next) {
+                if (!s->next && s->kind == AST_EXPR_STMT && s->left)
+                    tail = s;
+            }
+            for (AstNode *s = body->params; s; s = s->next) {
+                if (s == tail) {
+                    ok_val = irgen_expr(ctx, s->left);
+                } else {
+                    irgen_stmt(ctx, s);
+                }
+            }
+        } else if (body) {
+            ok_val = irgen_expr(ctx, body);
+        }
+        {
+            IrBasicBlock *cur = ctx->current_fn->current_bb;
+            IrInst *last = cur ? cur->last : NULL;
+            if (!last || (last->op != IR_RET && last->op != IR_JMP &&
+                          last->op != IR_BR)) {
+                ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
+                body_pred = ctx->current_fn->current_bb;
             }
         }
-        ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
+        irgen_scope_pop(&ctx->scope);
+        ctx->catch_depth--;
+
+        /* 3) Lower catch handler. The catch variable (expr->name, type i64)
+         * is bound by allocating a fresh slot and storing the loaded err
+         * value into it; the handler body can then reference `e` like any
+         * other let-bound local. */
+        ir_set_current_bb(ctx->current_fn, catch_bb);
+        irgen_scope_push(&ctx->scope);
+        const char *err_name = expr->name ? expr->name : "e";
+        int err_val = ir_emit_load(ctx->current_fn, ctx->mod,
+                                    IR_TYPE_I64, err_addr);
+        int e_slot = ir_emit_alloca(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+        ir_emit_store(ctx->current_fn, ctx->mod, err_val, e_slot);
+        irgen_scope_add(&ctx->scope, err_name, e_slot, IR_TYPE_I64);
+
+        int catch_val = -1;
+        IrBasicBlock *catch_pred = NULL;
+        AstNode *handler = expr->right;
+        if (handler && handler->kind == AST_BLOCK) {
+            AstNode *tail = NULL;
+            for (AstNode *s = handler->params; s; s = s->next) {
+                if (!s->next && s->kind == AST_EXPR_STMT && s->left)
+                    tail = s;
+            }
+            for (AstNode *s = handler->params; s; s = s->next) {
+                if (s == tail) {
+                    catch_val = irgen_expr(ctx, s->left);
+                } else {
+                    irgen_stmt(ctx, s);
+                }
+            }
+        } else if (handler) {
+            catch_val = irgen_expr(ctx, handler);
+        }
+        {
+            IrBasicBlock *cur = ctx->current_fn->current_bb;
+            IrInst *last = cur ? cur->last : NULL;
+            if (!last || (last->op != IR_RET && last->op != IR_JMP &&
+                          last->op != IR_BR)) {
+                ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);
+                catch_pred = ctx->current_fn->current_bb;
+            }
+        }
         irgen_scope_pop(&ctx->scope);
 
-        /* Continue in merge block */
+        /* 4) PHI in merge_bb. */
         ir_set_current_bb(ctx->current_fn, merge_bb);
-        return -1; /* If used as expression, would need phi */
+        if ((ok_val >= 0 && body_pred) ||
+            (catch_val >= 0 && catch_pred)) {
+            int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+            IrInst *phi_inst = merge_bb->last;
+            if (phi_inst && phi_inst->op == IR_PHI && phi_inst->id == phi) {
+                if (ok_val >= 0 && body_pred)
+                    ir_phi_add_incoming(phi_inst, ok_val, body_pred->id);
+                if (catch_val >= 0 && catch_pred)
+                    ir_phi_add_incoming(phi_inst, catch_val, catch_pred->id);
+            }
+            return phi;
+        }
+        return -1;
+    }
+
+    case AST_MATCH: {
+        /* L5: lower `match result { Ok(v) => B1, Err(e) => B2 }` over the
+         * negative-i64 Result encoding. We accept any two-arm match whose
+         * patterns are enum-shaped and whose variant tail is `Ok` or `Err`
+         * (with or without a `Result::` / `Result.` prefix). Anything else
+         * is left to the C-transpiler match (used by tagged-union enums);
+         * returning -1 here keeps the IR backend a no-op for those cases.
+         *
+         * Shape (mirrors the try/catch lowering):
+         *
+         *   pre:  %v   = <subject>
+         *         %neg = cmp_lt %v, 0
+         *         br %neg, @match.err, @match.ok
+         *   match.ok:
+         *         <bind v-name = %v>
+         *         <body lowered ; tail -> ok_val>
+         *         jmp @match.merge
+         *   match.err:
+         *         <bind e-name = %v>
+         *         <body lowered ; tail -> err_val>
+         *         jmp @match.merge
+         *   match.merge:
+         *         %r = phi [ok_val, ok_pred] [err_val, err_pred]
+         */
+        AstNode *arm_ok  = NULL;
+        AstNode *arm_err = NULL;
+        int arm_count = 0;
+        for (AstNode *a = expr->params; a; a = a->next) {
+            arm_count++;
+            if (a->kind != AST_MATCH_ARM || !a->left) continue;
+            AstNode *pat = a->left;
+            if (pat->kind != AST_PAT_ENUM || !pat->name) continue;
+            const char *name = pat->name;
+            const char *tail = name;
+            for (const char *q = name; *q; q++) {
+                if (q[0] == ':' && q[1] == ':') { tail = q + 2; q++; }
+                else if (q[0] == '.')           { tail = q + 1; }
+            }
+            if (strcmp(tail, "Ok")  == 0) arm_ok  = a;
+            if (strcmp(tail, "Err") == 0) arm_err = a;
+        }
+        if (!(arm_count == 2 && arm_ok && arm_err)) {
+            return irgen_match_decision_tree(ctx, expr);
+        }
+
+        int subj = irgen_expr(ctx, expr->left);
+        if (subj < 0) return -1;
+        int zero = ir_emit_const_int(ctx->current_fn, ctx->mod, 0);
+        int is_err = ir_emit_binop(ctx->current_fn, ctx->mod,
+                                    IR_CMP_LT, IR_TYPE_BOOL, subj, zero);
+        IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
+
+        IrBasicBlock *ok_bb    = ir_bb_new(ctx->current_fn, ctx->mod, "match.ok");
+        IrBasicBlock *err_bb   = ir_bb_new(ctx->current_fn, ctx->mod, "match.err");
+        IrBasicBlock *merge_bb = ir_bb_new(ctx->current_fn, ctx->mod, "match.merge");
+
+        ir_set_current_bb(ctx->current_fn, pre_bb);
+        ir_emit_br(ctx->current_fn, ctx->mod, is_err, err_bb->id, ok_bb->id);
+
+        /* Helper macro: lower one match arm with the variant payload bound
+         * (single-field PAT_ENUM today: Ok(v) / Err(e)). Sets OUT_VAL to
+         * the tail-expr value and OUT_PRED to the BB that jumps to merge. */
+        #define LOWER_ARM(ARM_NODE, BIND_VAL, OUT_VAL, OUT_PRED) do {           \
+            int _val = -1;                                                      \
+            IrBasicBlock *_pred = NULL;                                         \
+            irgen_scope_push(&ctx->scope);                                      \
+            AstNode *_pat = (ARM_NODE)->left;                                   \
+            const char *_bind = NULL;                                           \
+            if (_pat && _pat->params && _pat->params->name)                     \
+                _bind = _pat->params->name;                                     \
+            if (_bind) {                                                        \
+                int _slot = ir_emit_alloca(ctx->current_fn, ctx->mod,           \
+                                            IR_TYPE_I64);                       \
+                ir_emit_store(ctx->current_fn, ctx->mod, (BIND_VAL), _slot);    \
+                irgen_scope_add(&ctx->scope, _bind, _slot, IR_TYPE_I64);        \
+            }                                                                   \
+            AstNode *_body = (ARM_NODE)->right;                                 \
+            if (_body && _body->kind == AST_BLOCK) {                            \
+                AstNode *_tail = NULL;                                          \
+                for (AstNode *_s = _body->params; _s; _s = _s->next) {          \
+                    if (!_s->next && _s->kind == AST_EXPR_STMT && _s->left)     \
+                        _tail = _s;                                             \
+                }                                                               \
+                for (AstNode *_s = _body->params; _s; _s = _s->next) {          \
+                    if (_s == _tail) _val = irgen_expr(ctx, _s->left);          \
+                    else             irgen_stmt(ctx, _s);                       \
+                }                                                               \
+            } else if (_body) {                                                 \
+                _val = irgen_expr(ctx, _body);                                  \
+            }                                                                   \
+            {                                                                   \
+                IrBasicBlock *_cur = ctx->current_fn->current_bb;               \
+                IrInst *_last = _cur ? _cur->last : NULL;                       \
+                if (!_last || (_last->op != IR_RET &&                           \
+                               _last->op != IR_JMP &&                           \
+                               _last->op != IR_BR)) {                           \
+                    ir_emit_jmp(ctx->current_fn, ctx->mod, merge_bb->id);       \
+                    _pred = ctx->current_fn->current_bb;                        \
+                }                                                               \
+            }                                                                   \
+            irgen_scope_pop(&ctx->scope);                                       \
+            (OUT_VAL)  = _val;                                                  \
+            (OUT_PRED) = _pred;                                                 \
+        } while (0)
+
+        int ok_val = -1, err_val = -1;
+        IrBasicBlock *ok_pred = NULL, *err_pred = NULL;
+
+        ir_set_current_bb(ctx->current_fn, ok_bb);
+        LOWER_ARM(arm_ok, subj, ok_val, ok_pred);
+
+        ir_set_current_bb(ctx->current_fn, err_bb);
+        LOWER_ARM(arm_err, subj, err_val, err_pred);
+
+        #undef LOWER_ARM
+
+        ir_set_current_bb(ctx->current_fn, merge_bb);
+        if ((ok_val >= 0 && ok_pred) || (err_val >= 0 && err_pred)) {
+            int phi = ir_emit_phi(ctx->current_fn, ctx->mod, IR_TYPE_I64);
+            IrInst *phi_inst = merge_bb->last;
+            if (phi_inst && phi_inst->op == IR_PHI && phi_inst->id == phi) {
+                if (ok_val  >= 0 && ok_pred)
+                    ir_phi_add_incoming(phi_inst, ok_val,  ok_pred->id);
+                if (err_val >= 0 && err_pred)
+                    ir_phi_add_incoming(phi_inst, err_val, err_pred->id);
+            }
+            return phi;
+        }
+        return -1;
     }
 
     default:
@@ -748,6 +2050,22 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
                     IrType call_ret = irgen_lookup_fn_ret(ctx, stmt->right->left->name);
                     if (call_ret != IR_TYPE_VOID) var_type = call_ret;
                 }
+                /* L8: cross-module method call -- the receiver is an
+                 * imported module stem, so the var type follows the
+                 * fn's declared return type recorded in the module-fn
+                 * registry. Without this, `let prompt = helpers.fmt(...)`
+                 * would default to i64 and trip the WASM type checker
+                 * at the next host call that consumes it. */
+                if (stmt->right->kind == AST_METHOD_CALL &&
+                    stmt->right->left &&
+                    stmt->right->left->kind == AST_IDENT &&
+                    stmt->right->left->name && stmt->right->name) {
+                    IrType mod_ret = IR_TYPE_VOID;
+                    if (irgen_lookup_module_fn(ctx, stmt->right->left->name,
+                                                stmt->right->name, &mod_ret)) {
+                        if (mod_ret != IR_TYPE_VOID) var_type = mod_ret;
+                    }
+                }
             } else {
                 var_type = IR_TYPE_I64; /* default */
             }
@@ -755,8 +2073,22 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
 
         int addr = ir_emit_alloca(ctx->current_fn, ctx->mod, var_type);
 
+        /* L3: detect Json provenance so subsequent `.foo` / `as int`
+         * usages of `stmt->name` lower to vdag:json host calls. */
+        bool json_local = false;
+        if (stmt->type_expr && stmt->type_expr->kind == AST_TYPE_NAMED &&
+            stmt->type_expr->name &&
+            strcmp(stmt->type_expr->name, "Json") == 0) {
+            json_local = true;
+        } else if (stmt->right) {
+            json_local = expr_is_json(ctx, stmt->right);
+        }
+
         if (stmt->name) {
             irgen_scope_add(&ctx->scope, stmt->name, addr, var_type);
+            if (json_local) {
+                ctx->scope.vars[ctx->scope.var_count - 1].is_json = true;
+            }
         }
 
         if (stmt->right) {
@@ -866,30 +2198,26 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
          * For loop: for <pattern> in <iterator> { body }
          * AST_FOR: left=pattern, right=body, params=iterator
          *
-         * IR layout:
-         *   bb_init:  evaluate iterator, init loop var
-         *   bb_cond:  check condition, br to body or exit
-         *   bb_body:  loop body
-         *   bb_inc:   increment, jmp to cond
-         *   bb_exit:  continue
+         * stage0 only supports half-open integer ranges `start..end`.
+         * The CFG matches the classic counted-loop shape:
          *
-         * For range-based loops (e.g. for i in 0..10):
-         *   We check if the iterator is an AST_RANGE and generate
-         *   a classic counted loop.
+         *   bb_init:  store start in the loop var, jmp cond
+         *   bb_cond:  load i; if i < end -> body else exit
+         *   bb_body:  user body  (continue jumps to bb_inc, not bb_cond,
+         *                         so the increment still happens)
+         *   bb_inc:   i = i + 1; jmp cond     (continue target)
+         *   bb_exit:  post-loop                (break target)
          */
         AstNode *pattern = stmt->left;
         AstNode *body = stmt->right;
         AstNode *iterator = stmt->params;
 
-        /* Check for range-based loop */
         bool is_range = iterator && iterator->kind == AST_RANGE;
 
         if (is_range) {
-            /* Range loop: for i in start..end */
             int start_val = irgen_expr(ctx, iterator->left);
-            int end_val = irgen_expr(ctx, iterator->right);
+            int end_val   = irgen_expr(ctx, iterator->right);
 
-            /* Allocate loop variable */
             int loop_var = ir_emit_alloca(ctx->current_fn, ctx->mod, IR_TYPE_I64);
             ir_emit_store(ctx->current_fn, ctx->mod, start_val, loop_var);
 
@@ -901,10 +2229,9 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
             IrBasicBlock *init_bb = ctx->current_fn->current_bb;
             IrBasicBlock *cond_bb = ir_bb_new(ctx->current_fn, ctx->mod, "for.cond");
             IrBasicBlock *body_bb = ir_bb_new(ctx->current_fn, ctx->mod, "for.body");
-            IrBasicBlock *inc_bb = ir_bb_new(ctx->current_fn, ctx->mod, "for.inc");
+            IrBasicBlock *inc_bb  = ir_bb_new(ctx->current_fn, ctx->mod, "for.inc");
             IrBasicBlock *exit_bb = ir_bb_new(ctx->current_fn, ctx->mod, "for.exit");
 
-            /* Jump from init to cond */
             ir_set_current_bb(ctx->current_fn, init_bb);
             ir_emit_jmp(ctx->current_fn, ctx->mod, cond_bb->id);
 
@@ -915,8 +2242,12 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
                                     cur_val, end_val);
             ir_emit_br(ctx->current_fn, ctx->mod, cmp, body_bb->id, exit_bb->id);
 
-            /* Body block */
+            /* Body block.
+             * `continue` targets the INCREMENT block (not cond) so the
+             * loop variable advances even when the iteration is short-
+             * circuited. `break` targets the post-loop exit block. */
             ir_set_current_bb(ctx->current_fn, body_bb);
+            irgen_loop_push(ctx, inc_bb->id, exit_bb->id);
             if (body) {
                 if (body->kind == AST_BLOCK) {
                     AstNode *s;
@@ -926,9 +2257,21 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
                     irgen_stmt(ctx, body);
                 }
             }
-            ir_emit_jmp(ctx->current_fn, ctx->mod, inc_bb->id);
+            irgen_loop_pop(ctx);
 
-            /* Increment block: i = i + 1 */
+            /* If the body didn't already terminate (e.g. via break), jump
+             * to the increment block. */
+            {
+                IrBasicBlock *cur = ctx->current_fn->current_bb;
+                IrInst *last = cur ? cur->last : NULL;
+                if (!last ||
+                    (last->op != IR_RET && last->op != IR_JMP &&
+                     last->op != IR_BR)) {
+                    ir_emit_jmp(ctx->current_fn, ctx->mod, inc_bb->id);
+                }
+            }
+
+            /* Increment block: i = i + 1; jmp cond */
             ir_set_current_bb(ctx->current_fn, inc_bb);
             int cur_val2 = ir_emit_load(ctx->current_fn, ctx->mod, IR_TYPE_I64, loop_var);
             int one = ir_emit_const_int(ctx->current_fn, ctx->mod, 1);
@@ -937,15 +2280,14 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
             ir_emit_store(ctx->current_fn, ctx->mod, next_val, loop_var);
             ir_emit_jmp(ctx->current_fn, ctx->mod, cond_bb->id);
 
-            /* Exit block */
             ir_set_current_bb(ctx->current_fn, exit_bb);
 
             if (pattern && pattern->name) {
                 irgen_scope_pop(&ctx->scope);
             }
         } else {
-            /* Generic for-in loop: emit as iterator call (simplified).
-             * For now, just generate the body once as a placeholder. */
+            /* Non-range for-in (e.g. iterating an array) is not supported
+             * in stage0; emit the body once as a placeholder. */
             if (body) {
                 irgen_scope_push(&ctx->scope);
                 if (body->kind == AST_BLOCK) {
@@ -963,24 +2305,28 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
 
     case AST_WHILE: {
         /* While loop: while <cond> { body }
-         * AST_WHILE: left=condition, right=body */
-        IrBasicBlock *pre_bb = ctx->current_fn->current_bb;
+         * AST_WHILE: left=condition, right=body
+         *
+         * CFG:
+         *   pre  -> cond
+         *   cond -> body (true) | exit (false)
+         *   body -> cond  (and break -> exit, continue -> cond)
+         */
+        IrBasicBlock *pre_bb  = ctx->current_fn->current_bb;
         IrBasicBlock *cond_bb = ir_bb_new(ctx->current_fn, ctx->mod, "while.cond");
         IrBasicBlock *body_bb = ir_bb_new(ctx->current_fn, ctx->mod, "while.body");
         IrBasicBlock *exit_bb = ir_bb_new(ctx->current_fn, ctx->mod, "while.exit");
 
-        /* Jump from current block to cond */
         ir_set_current_bb(ctx->current_fn, pre_bb);
         ir_emit_jmp(ctx->current_fn, ctx->mod, cond_bb->id);
 
-        /* Condition */
         ir_set_current_bb(ctx->current_fn, cond_bb);
         int cond = irgen_expr(ctx, stmt->left);
         ir_emit_br(ctx->current_fn, ctx->mod, cond, body_bb->id, exit_bb->id);
 
-        /* Body */
         ir_set_current_bb(ctx->current_fn, body_bb);
         irgen_scope_push(&ctx->scope);
+        irgen_loop_push(ctx, cond_bb->id, exit_bb->id);
         if (stmt->right) {
             if (stmt->right->kind == AST_BLOCK) {
                 AstNode *s;
@@ -990,11 +2336,122 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
                 irgen_stmt(ctx, stmt->right);
             }
         }
-        ir_emit_jmp(ctx->current_fn, ctx->mod, cond_bb->id);
+        irgen_loop_pop(ctx);
+
+        /* If body didn't terminate (return / break / explicit jmp), close
+         * the back-edge to the cond block. */
+        {
+            IrBasicBlock *cur = ctx->current_fn->current_bb;
+            IrInst *last = cur ? cur->last : NULL;
+            if (!last ||
+                (last->op != IR_RET && last->op != IR_JMP &&
+                 last->op != IR_BR)) {
+                ir_emit_jmp(ctx->current_fn, ctx->mod, cond_bb->id);
+            }
+        }
         irgen_scope_pop(&ctx->scope);
 
-        /* Exit */
         ir_set_current_bb(ctx->current_fn, exit_bb);
+        break;
+    }
+
+    case AST_LOOP: {
+        /* Unconditional loop: loop { body }. Terminates only via `break`
+         * (or a `return` inside the body).
+         *
+         * AST_LOOP: left=body
+         *
+         * CFG:
+         *   pre  -> header (unconditional)
+         *   header -> body (unconditional jmp; we keep them as separate BBs
+         *                   so `continue` always has a well-defined target)
+         *   body -> header (back-edge); break -> exit
+         */
+        IrBasicBlock *pre_bb  = ctx->current_fn->current_bb;
+        IrBasicBlock *head_bb = ir_bb_new(ctx->current_fn, ctx->mod, "loop.header");
+        IrBasicBlock *body_bb = ir_bb_new(ctx->current_fn, ctx->mod, "loop.body");
+        IrBasicBlock *exit_bb = ir_bb_new(ctx->current_fn, ctx->mod, "loop.exit");
+
+        ir_set_current_bb(ctx->current_fn, pre_bb);
+        ir_emit_jmp(ctx->current_fn, ctx->mod, head_bb->id);
+
+        ir_set_current_bb(ctx->current_fn, head_bb);
+        ir_emit_jmp(ctx->current_fn, ctx->mod, body_bb->id);
+
+        ir_set_current_bb(ctx->current_fn, body_bb);
+        irgen_scope_push(&ctx->scope);
+        irgen_loop_push(ctx, head_bb->id, exit_bb->id);
+        AstNode *body = stmt->left;
+        if (body) {
+            if (body->kind == AST_BLOCK) {
+                AstNode *s;
+                for (s = body->params; s; s = s->next)
+                    irgen_stmt(ctx, s);
+            } else {
+                irgen_stmt(ctx, body);
+            }
+        }
+        bool saw_break = irgen_loop_pop(ctx);
+
+        {
+            IrBasicBlock *cur = ctx->current_fn->current_bb;
+            IrInst *last = cur ? cur->last : NULL;
+            if (!last ||
+                (last->op != IR_RET && last->op != IR_JMP &&
+                 last->op != IR_BR)) {
+                ir_emit_jmp(ctx->current_fn, ctx->mod, head_bb->id);
+            }
+        }
+        irgen_scope_pop(&ctx->scope);
+
+        /* Stage0 defensive warning: an unconditional `loop { }` with no
+         * `break` in its lexical body is provably non-terminating. The
+         * dispatch-loop emitter will still produce a valid module, but
+         * the WASM runtime will spin forever. */
+        if (!saw_break) {
+            fprintf(stderr,
+                "warning: %s:%u: `loop { ... }` body has no `break`; "
+                "the loop will never terminate.\n",
+                stmt->loc.filename ? stmt->loc.filename : "<unknown>",
+                stmt->loc.line);
+        }
+
+        ir_set_current_bb(ctx->current_fn, exit_bb);
+        break;
+    }
+
+    case AST_BREAK: {
+        /* `break` jumps to the innermost enclosing loop's exit block.
+         * Outside any loop we silently NOP — the type-checker should have
+         * caught that case earlier; emitting a dangling jmp here would
+         * desync the dispatch table.
+         *
+         * After emitting the jmp we open a fresh "dead" basic block. Any
+         * subsequent statements in this lexical sequence will be lowered
+         * into a block that is unreachable in the dispatch table, which
+         * the WASM emitter handles safely (it just emits an unused bb
+         * body that falls through). */
+        IrGenLoopCtx *top = irgen_loop_top(ctx);
+        if (top) {
+            top->saw_break = true;
+            ir_emit_jmp(ctx->current_fn, ctx->mod, top->break_bb);
+            IrBasicBlock *dead = ir_bb_new(ctx->current_fn, ctx->mod, "after.break");
+            ir_set_current_bb(ctx->current_fn, dead);
+        }
+        break;
+    }
+
+    case AST_CONTINUE: {
+        /* `continue` jumps to the innermost loop's CONTINUE target —
+         * for `while`/`loop` that's the header (the cond check); for
+         * `for-in` that's the increment block so the loop var still
+         * advances. Same dead-block trick as AST_BREAK. */
+        IrGenLoopCtx *top = irgen_loop_top(ctx);
+        if (top) {
+            ir_emit_jmp(ctx->current_fn, ctx->mod, top->continue_bb);
+            IrBasicBlock *dead = ir_bb_new(ctx->current_fn, ctx->mod, "after.continue");
+            ir_set_current_bb(ctx->current_fn, dead);
+        }
         break;
     }
 
@@ -1009,6 +2466,59 @@ static void irgen_stmt(IrGenContext *ctx, AstNode *stmt) {
  * Top-Level Declaration IR Generation
  * ============================================================ */
 
+/* Lower a fn body with tail-expression-as-return semantics.
+ *
+ * Limceron permits a function body whose last statement is a bare
+ * expression (e.g. `fn double(x) -> int { x * 2 }`); the value of that
+ * expression is the function's return value. ir_emit_wasm requires a
+ * concrete IR_RET with a value operand for non-void fns, so we lower
+ * the trailing expression as `irgen_expr` + `ir_emit_ret(val)` rather
+ * than dropping the value via the default AST_EXPR_STMT path.
+ *
+ * Falls back to `ir_emit_ret_void` when:
+ *   - ret_type is void (any tail expr's value is discarded), or
+ *   - the last stmt is not AST_EXPR_STMT (e.g. it already terminates
+ *     via explicit `return`, or it's an if-statement with returns
+ *     in every branch), and the basic block isn't terminated. */
+static void irgen_fn_body(IrGenContext *ctx, AstNode *body, IrType ret_type) {
+    IrFunction *fn = ctx->current_fn;
+    if (!fn) return;
+
+    AstNode *tail = NULL;
+    if (body && body->kind == AST_BLOCK && ret_type != IR_TYPE_VOID) {
+        for (AstNode *s = body->params; s; s = s->next) {
+            if (!s->next && s->kind == AST_EXPR_STMT && s->left) {
+                tail = s;
+            }
+        }
+    }
+
+    if (body) {
+        if (body->kind == AST_BLOCK) {
+            for (AstNode *s = body->params; s; s = s->next) {
+                if (s == tail) {
+                    int val = irgen_expr(ctx, s->left);
+                    if (val >= 0) {
+                        ir_emit_ret(ctx->current_fn, ctx->mod, val);
+                    }
+                } else {
+                    irgen_stmt(ctx, s);
+                }
+            }
+        } else {
+            irgen_stmt(ctx, body);
+        }
+    }
+
+    IrBasicBlock *last_bb = fn->current_bb;
+    if (last_bb) {
+        IrInst *last = last_bb->last;
+        if (!last || (last->op != IR_RET && last->op != IR_JMP && last->op != IR_BR)) {
+            ir_emit_ret_void(fn, ctx->mod);
+        }
+    }
+}
+
 static void irgen_function(IrGenContext *ctx, AstNode *fn_ast) {
     if (!fn_ast || fn_ast->kind != AST_FN) return;
 
@@ -1017,13 +2527,27 @@ static void irgen_function(IrGenContext *ctx, AstNode *fn_ast) {
     /* Determine return type */
     IrType ret_type = ast_type_to_ir(fn_ast->type_expr);
 
-    /* Build function name: lcn_<name> */
+    /* L8: module-scoped mangling. If the loader stashed a module stem
+     * on `val.str_val` (because this top-level fn was merged in from a
+     * `use`d sibling file), build `lcn___<stem>_<name>` so two files
+     * can each declare e.g. `fn greet` without colliding at link time.
+     * The main translation unit's fns retain the bare `lcn_<name>`
+     * form so existing single-file callers and the WASM main-export
+     * logic continue to find them unchanged. */
+    const char *module_stem = fn_ast->val.str_val;
     char fn_name[256];
-    snprintf(fn_name, sizeof(fn_name), "lcn_%s", name);
+    if (module_stem && module_stem[0]) {
+        snprintf(fn_name, sizeof(fn_name), "lcn___%s_%s", module_stem, name);
+    } else {
+        snprintf(fn_name, sizeof(fn_name), "lcn_%s", name);
+    }
 
     IrFunction *fn = ir_function_new(ctx->mod, fn_name, ret_type);
 
-    /* Register for call resolution */
+    /* Register for call resolution. The module-fn registry is
+     * populated up-front by ir_gen_program's pre-walk so forward
+     * references between sibling modules resolve regardless of source
+     * order. */
     irgen_register_fn(ctx, name, ret_type);
 
     /* Add parameters */
@@ -1042,31 +2566,237 @@ static void irgen_function(IrGenContext *ctx, AstNode *fn_ast) {
     IrBasicBlock *entry = ir_bb_new(fn, ctx->mod, "entry");
     (void)entry;
 
-    /* Generate body */
-    AstNode *body = fn_ast->left;
-    if (body) {
-        if (body->kind == AST_BLOCK) {
-            AstNode *s;
-            for (s = body->params; s; s = s->next)
-                irgen_stmt(ctx, s);
-        } else {
-            irgen_stmt(ctx, body);
-        }
-    }
-
-    /* Add implicit return void if the last instruction isn't a terminator */
-    {
-        IrBasicBlock *last_bb = fn->current_bb;
-        if (last_bb) {
-            IrInst *last = last_bb->last;
-            if (!last || (last->op != IR_RET && last->op != IR_JMP && last->op != IR_BR)) {
-                ir_emit_ret_void(fn, ctx->mod);
-            }
-        }
-    }
+    /* Generate body (tail-expression-as-return aware) */
+    irgen_fn_body(ctx, fn_ast->left, ret_type);
 
     irgen_scope_pop(&ctx->scope);
     ctx->current_fn = NULL;
+}
+
+/* ============================================================
+ * Agent-Scoped Function Lowering
+ *
+ * Agents are syntactic containers for capability-scoped functions.
+ * For SSA IR purposes, each `fn` inside an `agent { ... }` block must
+ * be lowered to a top-level IrFunction so the WASM/x86/arm64 emitters
+ * can see them. We mangle the name with the agent identifier so two
+ * agents can declare overlapping fn names without collision.
+ *
+ * Mangling scheme — IR symbol name is `lcn___<agent_kebab>_<fn_name>`:
+ *
+ *   agent SmokeAgent { fn main() ... }   -> IR symbol  lcn___smoke_agent_main
+ *   agent BranchClassify { fn classify } -> IR symbol  lcn___branch_classify_classify
+ *
+ * The leading `lcn_` is shared with the top-level fn convention so the
+ * WASM emitter's call-site rewriter (which prefixes `lcn_` only when
+ * absent) and its export logic (`user_name_for` strips `lcn_`) both
+ * treat agent fns identically to free fns. The remaining `__<kebab>_`
+ * segment is the agent-scope tag that makes intra-program collisions
+ * unambiguous and keeps WASM exports human-readable
+ * (`__smoke_agent_main`, `__branch_classify_classify`).
+ *
+ * For the FIRST agent that declares `fn main`, we additionally emit a
+ * thin trampoline named `lcn_main` that simply calls the mangled symbol.
+ * This preserves the WASM emitter's ability to export `main` and synthesise
+ * the WASI `_start` wrapper, so existing tooling (`wasmtime --invoke main`)
+ * keeps working unchanged.
+ * ============================================================ */
+
+/* Convert a PascalCase or camelCase agent name to snake_case (kebab with
+ * underscores, since WASM symbol names cannot contain `-`).
+ *   "SmokeAgent"     -> "smoke_agent"
+ *   "BranchClassify" -> "branch_classify"
+ *   "URLFetcher"     -> "u_r_l_fetcher"   (acceptable: deterministic)
+ *   "lower_case"     -> "lower_case"
+ *
+ * Writes at most cap-1 chars + NUL into dst. dst must be non-NULL with
+ * cap >= 1. Returns dst. */
+static char *kebab_case(const char *src, char *dst, size_t cap) {
+    if (!dst || cap == 0) return dst;
+    if (!src) { dst[0] = '\0'; return dst; }
+
+    size_t out = 0;
+    bool prev_was_lower = false;
+    size_t i;
+    for (i = 0; src[i] != '\0' && out + 1 < cap; i++) {
+        char c = src[i];
+        bool is_upper = (c >= 'A' && c <= 'Z');
+        bool is_lower = (c >= 'a' && c <= 'z');
+        bool is_digit = (c >= '0' && c <= '9');
+
+        if (is_upper) {
+            /* Insert separator on lower->upper boundary so PascalCase
+             * components are properly delimited. */
+            if (prev_was_lower && out > 0 && out + 1 < cap) {
+                dst[out++] = '_';
+                if (out + 1 >= cap) break;
+            }
+            dst[out++] = (char)(c - 'A' + 'a');
+            prev_was_lower = false;
+        } else if (is_lower || is_digit) {
+            dst[out++] = c;
+            prev_was_lower = is_lower;
+        } else {
+            /* Non-alnum (e.g. '_') passes through verbatim. */
+            dst[out++] = c;
+            prev_was_lower = false;
+        }
+    }
+    dst[out] = '\0';
+    return dst;
+}
+
+/* Lower a single agent-scoped fn into a top-level IrFunction, given the
+ * pre-mangled IR symbol name. Mirrors irgen_function but uses the caller-
+ * provided name verbatim (no automatic `lcn_` prefix). */
+static void irgen_agent_function_named(IrGenContext *ctx, AstNode *fn_ast,
+                                        const char *ir_symbol) {
+    if (!fn_ast || fn_ast->kind != AST_FN || !ir_symbol) return;
+
+    IrType ret_type = ast_type_to_ir(fn_ast->type_expr);
+    IrFunction *fn = ir_function_new(ctx->mod, ir_symbol, ret_type);
+
+    /* Add parameters */
+    AstNode *param;
+    for (param = fn_ast->params; param; param = param->next) {
+        if (param->kind == AST_PARAM && param->name) {
+            IrType ptype = ast_type_to_ir(param->type_expr);
+            ir_function_add_param(fn, ctx->mod, param->name, ptype);
+        }
+    }
+
+    ctx->current_fn = fn;
+    irgen_scope_push(&ctx->scope);
+
+    IrBasicBlock *entry = ir_bb_new(fn, ctx->mod, "entry");
+    (void)entry;
+
+    /* Body (tail-expression-as-return aware). */
+    irgen_fn_body(ctx, fn_ast->left, ret_type);
+
+    irgen_scope_pop(&ctx->scope);
+    ctx->current_fn = NULL;
+}
+
+/* Emit a thin trampoline function `lcn_main` that forwards to the
+ * mangled mangled_symbol. Required so WASM emitters can detect `main`
+ * (via the `lcn_` prefix convention) and synthesise the `_start` export. */
+static void irgen_emit_main_trampoline(IrGenContext *ctx,
+                                        AstNode *fn_ast,
+                                        const char *mangled_symbol) {
+    if (!fn_ast || !mangled_symbol) return;
+
+    IrType ret_type = ast_type_to_ir(fn_ast->type_expr);
+    IrFunction *fn = ir_function_new(ctx->mod, "lcn_main", ret_type);
+
+    /* Forward all declared params verbatim so the trampoline matches the
+     * mangled fn signature. main() typically has zero params, but be safe. */
+    AstNode *param;
+    int forwarded[16];
+    int n_forward = 0;
+    for (param = fn_ast->params; param; param = param->next) {
+        if (param->kind == AST_PARAM && param->name && n_forward < 16) {
+            IrType ptype = ast_type_to_ir(param->type_expr);
+            int pid = ir_function_add_param(fn, ctx->mod, param->name, ptype);
+            forwarded[n_forward++] = pid;
+        }
+    }
+
+    ctx->current_fn = fn;
+    IrBasicBlock *entry = ir_bb_new(fn, ctx->mod, "entry");
+    (void)entry;
+
+    int call_id = ir_emit_call(fn, ctx->mod, mangled_symbol, ret_type,
+                               forwarded, n_forward);
+    if (ret_type == IR_TYPE_VOID) {
+        ir_emit_ret_void(fn, ctx->mod);
+    } else {
+        ir_emit_ret(fn, ctx->mod, call_id);
+    }
+
+    ctx->current_fn = NULL;
+}
+
+/* Walk an AST_AGENT node and lower each fn in agent->left to a top-level
+ * IrFunction with a mangled name. Non-fn agent members (capabilities,
+ * budget, model, prompt, etc.) are metadata handled elsewhere
+ * (typecheck / wit_emit) and are intentionally ignored here. */
+static void irgen_agent(IrGenContext *ctx, AstNode *agent) {
+    if (!agent || agent->kind != AST_AGENT || !agent->name) return;
+
+    /* Compute kebab form of the agent name once. */
+    char kebab[128];
+    kebab_case(agent->name, kebab, sizeof(kebab));
+    /* Stash a stable copy so per-call lookups can use pointer-stable storage. */
+    const char *agent_kebab = arena_strdup(ctx->mod->arena, kebab);
+
+    /* Pass A: pre-register every agent fn so siblings can call each other
+     * regardless of source order (forward references). */
+    AstNode *m;
+    for (m = agent->left; m; m = m->next) {
+        if (m->kind != AST_FN || !m->name) continue;
+        if (ctx->agent_fn_reg_count >= IR_GEN_MAX_AGENT_FNS) break;
+
+        char mangled[256];
+        snprintf(mangled, sizeof(mangled), "lcn___%s_%s", agent_kebab, m->name);
+
+        int idx = ctx->agent_fn_reg_count++;
+        ctx->agent_fn_registry[idx].agent_kebab = agent_kebab;
+        ctx->agent_fn_registry[idx].fn_name =
+            arena_strdup(ctx->mod->arena, m->name);
+        ctx->agent_fn_registry[idx].ir_symbol =
+            arena_strdup(ctx->mod->arena, mangled);
+        ctx->agent_fn_registry[idx].ret_type = ast_type_to_ir(m->type_expr);
+    }
+
+    /* Pass B: lower each fn body. Inside this loop, irgen_call resolves
+     * unqualified callees against the agent-local registry first. */
+    const char *prev_agent = ctx->current_agent_kebab;
+    ctx->current_agent_kebab = agent_kebab;
+
+    AstNode *main_fn = NULL;
+    const char *main_mangled = NULL;
+    for (m = agent->left; m; m = m->next) {
+        if (m->kind != AST_FN || !m->name) continue;
+
+        const char *ir_symbol = irgen_lookup_agent_local(ctx, m->name, NULL);
+        if (!ir_symbol) {
+            /* Registry overflow fallback: derive on the fly. */
+            char fallback[256];
+            snprintf(fallback, sizeof(fallback), "lcn___%s_%s",
+                     agent_kebab, m->name);
+            ir_symbol = arena_strdup(ctx->mod->arena, fallback);
+        }
+
+        irgen_agent_function_named(ctx, m, ir_symbol);
+
+        if (strcmp(m->name, "main") == 0 && !main_fn) {
+            main_fn = m;
+            main_mangled = ir_symbol;
+        }
+    }
+
+    ctx->current_agent_kebab = prev_agent;
+
+    /* Pass C: trampoline. The first agent declaring `fn main` claims the
+     * unmangled `lcn_main` slot; subsequent agents emit only the mangled
+     * form (with a stderr warning) so the WASM module still has exactly
+     * one well-known entrypoint. */
+    if (main_fn && main_mangled) {
+        if (!ctx->has_unmangled_main) {
+            irgen_emit_main_trampoline(ctx, main_fn, main_mangled);
+            ctx->has_unmangled_main = true;
+            /* Also publish in the global registry so any *top-level*
+             * caller writing main() resolves to the trampoline. */
+            irgen_register_fn(ctx, "main", ast_type_to_ir(main_fn->type_expr));
+        } else {
+            fprintf(stderr,
+                "warning: agent '%s' declares fn main but the unmangled "
+                "`main` export is already taken by an earlier agent; only "
+                "%s will be emitted.\n",
+                agent->name, main_mangled);
+        }
+    }
 }
 
 /* ============================================================
@@ -1083,12 +2813,36 @@ IrModule *ir_gen_program(AstNode *program, Arena *arena) {
     ctx.mod = mod;
     irgen_scope_init(&ctx.scope);
 
-    /* First pass: register all function names for forward references */
+    /* First pass: register all function names for forward references.
+     *
+     * L8: top-level fns merged in from a `use`d sibling file carry a
+     * module stem in `val.str_val`. Pre-register them in the module-fn
+     * registry so a cross-module call (e.g. `helpers.greet(name)`) can
+     * resolve to `lcn___helpers_greet` regardless of source order. The
+     * unqualified-name registration (used by the agent-local fallback
+     * path) stays as before; the module-tagged version simply layers
+     * on top so authors can spell the call either way. */
     AstNode *decl;
     for (decl = program->params; decl; decl = decl->next) {
         if (decl->kind == AST_FN && decl->name) {
             IrType ret_type = ast_type_to_ir(decl->type_expr);
             irgen_register_fn(&ctx, decl->name, ret_type);
+
+            const char *module_stem = decl->val.str_val;
+            if (module_stem && module_stem[0] &&
+                ctx.module_fn_reg_count < 256) {
+                char mangled[256];
+                snprintf(mangled, sizeof(mangled), "lcn___%s_%s",
+                         module_stem, decl->name);
+                int idx = ctx.module_fn_reg_count++;
+                ctx.module_fn_registry[idx].module_stem =
+                    arena_strdup(ctx.mod->arena, module_stem);
+                ctx.module_fn_registry[idx].fn_name =
+                    arena_strdup(ctx.mod->arena, decl->name);
+                ctx.module_fn_registry[idx].ir_symbol =
+                    arena_strdup(ctx.mod->arena, mangled);
+                ctx.module_fn_registry[idx].ret_type = ret_type;
+            }
         }
     }
 
@@ -1099,7 +2853,15 @@ IrModule *ir_gen_program(AstNode *program, Arena *arena) {
             irgen_function(&ctx, decl);
             break;
 
-        /* Skip non-function declarations for now (structs, enums, agents, etc.).
+        case AST_AGENT:
+            /* Lower each fn inside the agent block to a top-level IR
+             * function with a mangled name. Non-fn agent members (fields,
+             * capabilities, budget, prompt, etc.) are metadata handled
+             * by typecheck/wit_emit and intentionally produce no IR. */
+            irgen_agent(&ctx, decl);
+            break;
+
+        /* Skip non-function declarations for now (structs, enums, etc.).
          * They don't produce IR directly in this foundation phase. */
         default:
             break;
@@ -1188,6 +2950,19 @@ static void ir_print_inst(IrInst *inst, IrFunction *fn, FILE *out) {
             fprintf(out, "call void @%s(",
                     inst->fn_name ? inst->fn_name : "???");
         }
+        int i;
+        for (i = 0; i < inst->call_arg_count; i++) {
+            if (i > 0) fprintf(out, ", ");
+            ir_print_value(inst->call_args[i], out);
+        }
+        fprintf(out, ")\n");
+        break;
+    }
+
+    case IR_HOST_CALL: {
+        fprintf(out, "%%%d = host_call %s @\"%s\"(",
+                inst->id, ir_type_name(inst->type),
+                inst->fn_name ? inst->fn_name : "???");
         int i;
         for (i = 0; i < inst->call_arg_count; i++) {
             if (i > 0) fprintf(out, ", ");

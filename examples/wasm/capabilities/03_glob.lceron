@@ -1,0 +1,24 @@
+// 03_glob.lceron -- L12 sample: subdomain glob
+//
+// The host pattern `*.suffix:port` is the only wildcard form
+// recognised in v1 -- it matches any subdomain of `suffix` at the
+// given port. A bare `*` or `*:*` is rejected (use the bare form
+// for that). Multiple `*` wildcards or `*` in a non-leading
+// position is also rejected.
+//
+// Expected emitted artifacts:
+//   - .wit advertises:
+//       import http.fetch {
+//           hosts: ["*.example.com:443"]
+//       }
+//   - .wasm carries a custom section whose JSON payload is
+//       [{"verb":"http.fetch","hosts":["*.example.com:443"]}]
+
+agent GlobFetch {
+    capabilities: [http.fetch(["*.example.com:443"])]
+
+    fn main() -> int {
+        // Reaches any subdomain of example.com on port 443.
+        0
+    }
+}

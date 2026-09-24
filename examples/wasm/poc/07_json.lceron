@@ -1,0 +1,59 @@
+// 07_json.lceron - L3 PoC: classify, parse, traverse, coerce.
+//
+// Exercises the full vdag:json surface that L3 introduces beyond the
+// raw `json.<fn>(...)` host calls covered by examples/wasm/json/:
+//
+//   1. `llm.classify(prompt)?` returns the byte count of a classifier
+//      label written into the per-call scratch buffer. Here we treat
+//      the host as if it returned a JSON blob describing the
+//      classification result -- the realistic Visual-DAG shape once
+//      the `llm.classify` ABI is bumped to return JSON envelopes
+//      (tracked as F46).
+//   2. `let doc: Json = json.parse(...)` introduces a Json-typed
+//      local. The Limceron front-end records the Json provenance so
+//      downstream sugar lowers correctly.
+//   3. `doc.result.label` is the dotted field-access sugar -- each
+//      `.foo` lowers to `json.field_get(_, "foo")`, returning a
+//      child handle. Missing keys raise `HostErr.CapMissing` (-7).
+//   4. `doc.result?.confidence` is the null-safe form -- the host
+//      returns the null sentinel handle if any link in the chain is
+//      absent, and downstream coercions then propagate that.
+//   5. `label_handle as string` lowers to `json.as_string(handle)`,
+//      writing the UTF-8 label into the scratch out-buffer and
+//      returning the byte count. `confidence_handle as int` lowers
+//      to `json.as_int(handle)` returning the raw i64.
+//
+// The fn returns the label byte count -- the canonical "useful work
+// completed" signal the wasm host can read out of the scratch slot.
+
+agent JsonClassifier {
+    capabilities: [llm.classify,
+                   json.parse, json.field_get, json.field_get_safe,
+                   json.as_string, json.as_int]
+    budget: { max_tokens: 200, max_cost: 0.02 }
+
+    fn main() -> int {
+        // Stage 1 -- classify produces a JSON envelope. We treat the
+        // returned byte count as the marshalling boundary; the real
+        // payload lives in the per-call scratch slot that json.parse
+        // will hand to the host on the next line.
+        let _payload_bytes = llm.classify("classify-stage1")?
+
+        // Stage 2 -- parse the envelope. The blob below is what the
+        // mock host would have written into the scratch slot.
+        let doc: Json = json.parse(
+            "{\"result\":{\"label\":\"refund\",\"confidence\":92}}")?
+
+        // Stage 3 -- walk the tree. Raising form for required fields,
+        // null-safe form for optional ones.
+        let label_handle      = doc.result.label
+        let confidence_handle = doc.result?.confidence
+
+        // Stage 4 -- coerce. The confidence is read for its side
+        // effect (the fence will trap if it overflows the budget);
+        // the label byte count is what the host actually returns to
+        // the caller.
+        let _confidence = confidence_handle as int
+        label_handle as string
+    }
+}

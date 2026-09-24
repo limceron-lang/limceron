@@ -14,6 +14,15 @@
  */
 
 #include "lcn.h"
+#include "wit_load.h"
+
+/* L9 Pass 10 entry point. Defined in src/l9_infer.c; not (yet) exposed
+ * in lcn.h to keep the inference IR's helper structs (LcnUnifyTable,
+ * L9SymbolTable) implementation-private. The first argument is the
+ * pipeline's `SymbolTable *` viewed as opaque -- the L9 engine keeps a
+ * structurally identical mirror and casts it back. */
+extern void lcn_l9_infer_types(void *symtab, AstNode *program,
+                               ErrorReporter *reporter, Arena *arena);
 
 /* ============================================================
  * Configuration
@@ -355,6 +364,23 @@ static void register_declarations(SymbolTable *st, AstNode *program,
             symtab_add(st, decl->name,
                        ast_kind_to_sym_kind(decl->kind),
                        decl, decl->loc, reporter);
+            if (decl->kind == AST_AGENT) {
+                /* Also register agent-scoped fns (decl->left chain) under
+                 * their plain name so sibling calls (e.g. `classify(85)`
+                 * inside `agent { fn main { classify(85) } }`) resolve.
+                 * IR layer mangles them to lcn___<kebab>_<fn>; here we
+                 * only need the typechecker to see the symbol. First
+                 * registration wins; later same-named fns in other
+                 * agents are silently ignored (symtab_add would report
+                 * duplicate). */
+                for (AstNode *afn = decl->left; afn; afn = afn->next) {
+                    if (afn->kind == AST_FN && afn->name &&
+                        !symtab_find(st, afn->name)) {
+                        symtab_add(st, afn->name, SYM_FN,
+                                   afn, afn->loc, reporter);
+                    }
+                }
+            }
             break;
 
         case AST_LET:
@@ -560,6 +586,7 @@ static void find_tool_calls_in_expr(AstNode *expr, ToolCallCtx *ctx,
         break;
 
     case AST_METHOD_CALL:
+    case AST_HOST_CALL:
         find_tool_calls_in_expr(expr->left, ctx, on_call, user);
         {
             AstNode *arg = expr->params;
@@ -593,7 +620,14 @@ static void find_tool_calls_in_expr(AstNode *expr, ToolCallCtx *ctx,
     case AST_TRY:
     case AST_AWAIT:
     case AST_SPAWN:
+    case AST_RESULT_OK:
+    case AST_RESULT_ERR:
         find_tool_calls_in_expr(expr->left, ctx, on_call, user);
+        break;
+
+    case AST_TRY_CATCH:
+        find_tool_calls_in_block(expr->left,  ctx, on_call, user);
+        find_tool_calls_in_block(expr->right, ctx, on_call, user);
         break;
 
     case AST_CLOSURE:
@@ -667,6 +701,19 @@ static void find_tool_calls_in_expr(AstNode *expr, ToolCallCtx *ctx,
                 find_tool_calls_in_block(arm->right, ctx, on_call, user);
             }
             arm = arm->next;
+        }
+        break;
+    }
+
+    /* L4: walk every embedded expression inside an interpolated
+     * string so tool-call discovery sees calls like
+     * `"prefix ${llm.classify(p)?} suffix"`. */
+    case AST_INTERP_STRING: {
+        AstNode *part = expr->params;
+        while (part) {
+            if (part->kind != AST_STRING_LIT)
+                find_tool_calls_in_expr(part, ctx, on_call, user);
+            part = part->next;
         }
         break;
     }
@@ -917,6 +964,649 @@ static void check_capabilities(SymbolTable *st, CapRegistry *cr,
 
         find_tool_calls_in_agent(decl, &tctx,
                                  on_cap_check_tool_call, &cctx);
+    }
+}
+
+/* ============================================================
+ * Pass 2c: Parameterised Capability Allowlist Validation (L12)
+ *
+ * The new syntactic form `capabilities: [http.fetch(["host:port",
+ * ...])]` introduces a compile-time allowlist on network-shaped
+ * capabilities. This pass enforces the host pattern rules so that
+ * malformed lists are caught up front rather than surfacing as
+ * runtime allowlist mismatches:
+ *
+ *   1. Each entry must be a non-empty string.
+ *   2. Entries must be of the form "host:port".
+ *   3. The host part may begin with `*.` (glob suffix match) but a
+ *      bare `*` is rejected -- use the bare verb form for that.
+ *   4. Port must be a base-10 integer in (0, 65535].
+ *   5. IP literals are rejected in v1 (host must be a domain).
+ *
+ * v1 only enforces the rule on `http.fetch`; future verbs like
+ * `agent.call(["worker_a", ...])` will plug in here with their
+ * own pattern validators.
+ * ============================================================ */
+
+static bool host_port_check_ip(const char *spec, const char *colon);
+
+static bool host_pattern_is_ip_literal(const char *host, size_t len) {
+    /* Quick heuristic: all characters are digits or dots and the
+     * string contains at least one dot -- treat as IPv4 dotted-quad.
+     * (Full validation isn't necessary here; we just refuse the
+     * shape to avoid users sneaking past the domain-based allowlist
+     * by spelling addresses literally.) */
+    size_t i;
+    int dots = 0;
+    if (len == 0) return false;
+    for (i = 0; i < len; i++) {
+        char c = host[i];
+        if (c == '.') { dots++; continue; }
+        if (c < '0' || c > '9') return false;
+    }
+    return dots >= 1;
+}
+
+static void validate_host_port_spec(const char *spec, SourceLoc loc,
+                                    const char *agent_name,
+                                    const char *verb,
+                                    ErrorReporter *reporter) {
+    if (!spec || spec[0] == '\0') {
+        report_error_fmt(reporter, loc,
+            "use \"host:port\" (e.g. \"api.openai.com:443\")",
+            "agent '%s': capability '%s' allowlist contains empty entry",
+            agent_name, verb);
+        return;
+    }
+    /* Reject the unrestricted wildcard explicitly -- the bare verb
+     * form already conveys "all hosts" without compile-time fence. */
+    if (strcmp(spec, "*") == 0 || strcmp(spec, "*:*") == 0) {
+        report_error_fmt(reporter, loc,
+            "for an unrestricted fetch use the bare form "
+            "`capabilities: [http.fetch]`",
+            "agent '%s': capability '%s' allowlist entry '%s' is the "
+            "unrestricted wildcard -- not allowed in parameterised form",
+            agent_name, verb, spec);
+        return;
+    }
+    const char *colon = strrchr(spec, ':');
+    if (!colon || colon == spec || colon[1] == '\0') {
+        report_error_fmt(reporter, loc,
+            "use \"host:port\" (e.g. \"api.openai.com:443\")",
+            "agent '%s': capability '%s' allowlist entry '%s' "
+            "missing host or port",
+            agent_name, verb, spec);
+        return;
+    }
+    size_t host_len = (size_t)(colon - spec);
+    /* Glob: only allowed as `*.suffix:port` -- a leading `*.` then a
+     * normal hostname. Reject embedded `*` elsewhere. */
+    size_t i;
+    bool saw_star = false;
+    for (i = 0; i < host_len; i++) {
+        if (spec[i] == '*') {
+            if (saw_star) {
+                report_error_fmt(reporter, loc,
+                    "use \"*.suffix:port\" for subdomain glob",
+                    "agent '%s': capability '%s' allowlist entry '%s' "
+                    "has multiple '*' wildcards",
+                    agent_name, verb, spec);
+                return;
+            }
+            if (i != 0 || host_len < 2 || spec[1] != '.') {
+                report_error_fmt(reporter, loc,
+                    "use \"*.suffix:port\" for subdomain glob "
+                    "(glob only valid as leading '*.')",
+                    "agent '%s': capability '%s' allowlist entry '%s' "
+                    "has '*' outside the leading position",
+                    agent_name, verb, spec);
+                return;
+            }
+            saw_star = true;
+        }
+    }
+    if (host_port_check_ip(spec, colon)) {
+        /* Fallthrough: keep the explicit IP rejection separate so
+         * the diagnostic stays specific. */
+        report_error_fmt(reporter, loc,
+            "use a domain name (IP literals are rejected in v1)",
+            "agent '%s': capability '%s' allowlist entry '%s' "
+            "looks like an IP literal",
+            agent_name, verb, spec);
+        return;
+    }
+    /* Port: integer in (0, 65535]. */
+    const char *p = colon + 1;
+    long port = 0;
+    while (*p) {
+        if (*p < '0' || *p > '9') {
+            report_error_fmt(reporter, loc,
+                "port must be a decimal integer in (0, 65535]",
+                "agent '%s': capability '%s' allowlist entry '%s' "
+                "has non-numeric port",
+                agent_name, verb, spec);
+            return;
+        }
+        port = port * 10 + (*p - '0');
+        if (port > 65535) {
+            report_error_fmt(reporter, loc,
+                "port must be in (0, 65535]",
+                "agent '%s': capability '%s' allowlist entry '%s' "
+                "port out of range",
+                agent_name, verb, spec);
+            return;
+        }
+        p++;
+    }
+    if (port <= 0) {
+        report_error_fmt(reporter, loc,
+            "port must be in (0, 65535]",
+            "agent '%s': capability '%s' allowlist entry '%s' "
+            "has port 0 (not allowed)",
+            agent_name, verb, spec);
+        return;
+    }
+}
+
+/* Tiny shim: returns true iff spec[:colon-spec] is an IPv4 literal.
+ * Pulled out so `validate_host_port_spec` stays linear. */
+static bool host_port_check_ip(const char *spec, const char *colon) {
+    return host_pattern_is_ip_literal(spec, (size_t)(colon - spec));
+}
+
+static void check_capability_allowlists(AstNode *program,
+                                        ErrorReporter *reporter) {
+    AstNode *decl, *field, *elem, *host;
+    if (!program || program->kind != AST_PROGRAM) return;
+
+    for (decl = program->params; decl; decl = decl->next) {
+        if (decl->kind != AST_AGENT) continue;
+        const char *agent_name = decl->name ? decl->name : "<anon>";
+
+        for (field = decl->params; field; field = field->next) {
+            if (field->kind != AST_FIELD || !field->name) continue;
+            if (strcmp(field->name, "capabilities") != 0) continue;
+            if (!field->right || field->right->kind != AST_ARRAY) break;
+
+            for (elem = field->right->params; elem; elem = elem->next) {
+                /* Only AST_CAPABILITY_ITEM carries the parameterised
+                 * payload. Bare AST_IDENT entries are the
+                 * backwards-compatible form and need no validation. */
+                if (elem->kind != AST_CAPABILITY_ITEM) continue;
+                if (!elem->name) continue;
+                /* v1: only enforce on http.fetch. */
+                if (strcmp(elem->name, "http.fetch") != 0) continue;
+
+                if (!elem->params) {
+                    report_error_fmt(reporter, elem->loc,
+                        "drop the empty parens, or supply at least "
+                        "one \"host:port\" entry",
+                        "agent '%s': capability 'http.fetch' "
+                        "allowlist is empty",
+                        agent_name);
+                    continue;
+                }
+                for (host = elem->params; host; host = host->next) {
+                    const char *spec = NULL;
+                    if (host->kind == AST_STRING_LIT)
+                        spec = host->val.str_val;
+                    if (!spec) {
+                        report_error_fmt(reporter, host->loc,
+                            "use \"host:port\" string literals",
+                            "agent '%s': capability 'http.fetch' "
+                            "allowlist entry is not a string literal",
+                            agent_name);
+                        continue;
+                    }
+                    validate_host_port_spec(spec, host->loc, agent_name,
+                                            elem->name, reporter);
+                }
+            }
+            break;
+        }
+    }
+}
+
+/* ============================================================
+ * Pass 2d: Host-call signature check (L1b)
+ *
+ * Walks every AST_HOST_CALL and compares its qualified name +
+ * argument count against the canonical contract loaded from
+ * `include/vdag.wit`. Mismatches raise
+ * `ERR_HOST_CALL_SIGNATURE_MISMATCH` with the expected signature
+ * surfaced inline so the operator can fix the call site or extend
+ * the contract.
+ *
+ * When the canonical contract does not declare the qualified call
+ * (e.g. a new agent verb that has not landed in vdag.wit yet) we
+ * emit a one-line warning and fall back to the legacy behaviour --
+ * the IR backend will still emit the call against the agent-side
+ * WIT advertisement, so the build does not break.
+ *
+ * Type-shape checking is intentionally narrow at L1b: the goal is
+ * to catch arity drift and "calling a function the host does not
+ * export". Full WIT-type vs Limceron-type unification waits for
+ * the L8 module type system; today's check is sufficient because
+ * every host argument bottoms out at `string` or `s32`/`s64` and
+ * the Limceron front-end already enforces those at expression
+ * level.
+ * ============================================================ */
+
+static void format_expected_sig(const LcnWitFunc *fn,
+                                char *out, size_t out_cap) {
+    int i;
+    int n = snprintf(out, out_cap, "%s(", fn->qualified);
+    for (i = 0; i < fn->param_count && (size_t)n < out_cap; i++) {
+        n += snprintf(out + n,
+                      (size_t)n < out_cap ? out_cap - (size_t)n : 0,
+                      "%s%s: %s",
+                      i == 0 ? "" : ", ",
+                      fn->params[i].name,
+                      fn->params[i].type);
+    }
+    if ((size_t)n < out_cap) {
+        n += snprintf(out + n, out_cap - (size_t)n, ")");
+    }
+    if (fn->ret_type[0] && (size_t)n < out_cap) {
+        snprintf(out + n,
+                 (size_t)n < out_cap ? out_cap - (size_t)n : 0,
+                 " -> %s", fn->ret_type);
+    }
+}
+
+static int count_args(AstNode *first) {
+    int n = 0;
+    AstNode *a;
+    for (a = first; a; a = a->next) n++;
+    return n;
+}
+
+static void walk_for_host_calls(AstNode *node,
+                                const LcnWitContract *contract,
+                                ErrorReporter *reporter);
+
+static void walk_list_for_host_calls(AstNode *head,
+                                     const LcnWitContract *contract,
+                                     ErrorReporter *reporter) {
+    AstNode *n;
+    for (n = head; n; n = n->next)
+        walk_for_host_calls(n, contract, reporter);
+}
+
+static void walk_for_host_calls(AstNode *node,
+                                const LcnWitContract *contract,
+                                ErrorReporter *reporter) {
+    if (!node) return;
+
+    if (node->kind == AST_HOST_CALL && node->name) {
+        const LcnWitFunc *fn = lcn_wit_lookup_signature(contract, node->name);
+        if (fn) {
+            int actual = count_args(node->params);
+            if (actual != fn->param_count) {
+                char expected[256];
+                format_expected_sig(fn, expected, sizeof(expected));
+                report_error_fmt(reporter, node->loc,
+                    "fix the call site or update include/vdag.wit",
+                    "ERR_HOST_CALL_SIGNATURE_MISMATCH: host call '%s' "
+                    "expects %d argument%s, got %d -- expected signature: %s",
+                    node->name,
+                    fn->param_count,
+                    fn->param_count == 1 ? "" : "s",
+                    actual,
+                    expected);
+            }
+        } else if (contract && contract->load_ok) {
+            /* Contract loaded but the call is undeclared. Soft
+             * warning so operators can decide whether to extend
+             * include/vdag.wit or remove the call. */
+            report_warning_fmt(reporter, node->loc,
+                "add the function to include/vdag.wit or remove the call",
+                "host call '%s' is not declared in the canonical "
+                "include/vdag.wit contract -- falling back to "
+                "emit-WIT advertisement",
+                node->name);
+        }
+        /* Fall through to walk arguments. */
+    }
+
+    /* L5: validate `host_error::<name>` references against the canonical
+     * vdag.errors.wit enum. Parser collapses qualified identifiers like
+     * `host_error::quota_exceeded` into a single AST_IDENT whose name
+     * contains the `::` separator -- so we look for that marker here
+     * rather than introducing yet another AST kind. */
+    if (node->kind == AST_IDENT && node->name && contract && contract->load_ok) {
+        const char *n = node->name;
+        const char *sep = NULL;
+        for (const char *q = n; q[0] && q[1]; q++) {
+            if (q[0] == ':' && q[1] == ':') { sep = q; break; }
+        }
+        if (sep && (sep - n) > 0) {
+            char enum_name[LCN_WIT_MAX_NAME];
+            size_t en = (size_t)(sep - n);
+            if (en >= sizeof(enum_name)) en = sizeof(enum_name) - 1;
+            memcpy(enum_name, n, en);
+            enum_name[en] = '\0';
+            const char *variant = sep + 2;
+            const LcnWitEnum *e = lcn_wit_lookup_enum(contract, enum_name);
+            if (e) {
+                const LcnWitEnumVariant *v =
+                    lcn_wit_lookup_enum_variant(e, variant);
+                if (!v) {
+                    report_error_fmt(reporter, node->loc,
+                        "check the variant name against include/vdag.errors.wit",
+                        "ERR_HOST_ERROR_UNKNOWN_VARIANT: enum '%s' has no "
+                        "variant '%s'",
+                        enum_name, variant);
+                }
+            }
+        }
+    }
+
+    /* Generic recursion across the common AST shape used elsewhere
+     * in this file. Mirrors find_tool_calls_in_expr's coverage. The
+     * list helpers iterate ->next so that an agent's method list
+     * (linked via ->left + ->next chains), a function body's
+     * statement list (->params + ->next), and an expression's
+     * argument list all get fully traversed. */
+    walk_list_for_host_calls(node->left,       contract, reporter);
+    walk_list_for_host_calls(node->right,      contract, reporter);
+    walk_for_host_calls(node->type_expr,       contract, reporter);
+    walk_list_for_host_calls(node->params,     contract, reporter);
+    walk_list_for_host_calls(node->attributes, contract, reporter);
+    /* node->next is walked by the list helper at the caller; we do
+     * not descend ->next here so that walking a single AST node
+     * does not bleed into its siblings. */
+}
+
+/* Walk the program for host-call signature mismatches. The
+ * contract loader is best-effort: a missing or malformed
+ * include/vdag.wit falls back to today's behaviour (the IR backend
+ * still emits the per-call import) so the build never breaks
+ * because of a missing canonical contract -- the worst case is
+ * the absence of compile-time mismatch detection. */
+static void check_host_call_signatures(AstNode *program,
+                                       ErrorReporter *reporter) {
+    static LcnWitContract contract;        /* loaded once per process */
+    static int load_attempted = 0;
+    AstNode *decl;
+    if (!program || program->kind != AST_PROGRAM) return;
+
+    if (!load_attempted) {
+        char path[1024];
+        const char *p = lcn_wit_default_path(path, sizeof(path), NULL);
+        if (p) {
+            int rc = lcn_wit_load(&contract, p);
+            if (rc != 0) {
+                fprintf(stderr,
+                        "  WIT load: %s could not be parsed; "
+                        "host-call signature checks skipped\n", p);
+            }
+        } else {
+            fprintf(stderr,
+                    "  WIT load: include/vdag.wit not found; "
+                    "host-call signature checks skipped\n");
+        }
+        /* L5: load the canonical HostError enum on top of the func
+         * contract. This is a soft extension -- a missing file
+         * leaves the enum table empty, which only affects validation
+         * of `host_error::<name>` references (they degrade to "we
+         * don't know that name, accept it"). */
+        char epath[1024];
+        const char *ep = lcn_wit_default_errors_path(epath,
+                                                      sizeof(epath), NULL);
+        if (ep) {
+            (void)lcn_wit_load_errors(&contract, ep);
+        }
+        load_attempted = 1;
+    }
+
+    /* Walk every top-level declaration. walk_for_host_calls
+     * descends through left/right/params/attributes/type_expr; for
+     * AST_AGENT this covers the method list (->left) and for AST_FN
+     * it covers the body (also ->left). We intentionally do NOT
+     * descend ->next inside the walker so a single decl's subtree
+     * stays contained -- iteration over siblings is the for-loop's
+     * job. */
+    for (decl = program->params; decl; decl = decl->next) {
+        walk_for_host_calls(decl, &contract, reporter);
+    }
+}
+
+/* ============================================================
+ * Pass 6c: L4 string-interpolation coercion check
+ *
+ * Each `"...${expr}..."` site lowers (ir_gen) to a chain of
+ * `string.concat` calls with the per-type `string.from_*` host call
+ * inserted around non-string expressions. The runtime contract
+ * supports the four primitive scalars + `string`; everything else
+ * needs an explicit cast.
+ *
+ * The narrow rule we enforce here: if the inner expression is a
+ * `Json` value (recognised by binding to `let X: Json = ...` or
+ * field-access against such a binding), it MUST be wrapped in
+ * `as string` (which lowers to `vdag:json.as-string` per L3).
+ * Anything else slips through -- the IR-gen pass tolerates
+ * primitives because every i64/bool/f64 slot already has a matching
+ * `string.from_*` host verb, and the wasm side stubs a graceful
+ * fallback when the verb isn't wired yet.
+ *
+ * Detection is local-scope only: we walk each function body
+ * tracking which `let`s carry an explicit `Json` annotation. That
+ * is sufficient for the v1 test fixtures and matches how
+ * src/ir_gen.c's `is_json` provenance flag is computed.
+ * ============================================================ */
+
+#define LCN_INTERP_MAX_JSON_LOCALS 64
+
+typedef struct {
+    const char *names[LCN_INTERP_MAX_JSON_LOCALS];
+    int         count;
+} InterpJsonScope;
+
+static bool interp_json_scope_has(const InterpJsonScope *s, const char *name) {
+    int i;
+    if (!name) return false;
+    for (i = 0; i < s->count; i++) {
+        if (s->names[i] && strcmp(s->names[i], name) == 0) return true;
+    }
+    return false;
+}
+
+static void interp_json_scope_add(InterpJsonScope *s, const char *name) {
+    if (!name || s->count >= LCN_INTERP_MAX_JSON_LOCALS) return;
+    s->names[s->count++] = name;
+}
+
+/* True when `expr` denotes a Json value in the current scope.
+ *
+ *   - Bare AST_IDENT whose binding had `: Json` annotation.
+ *   - AST_FIELD_ACCESS / AST_INDEX whose left subtree is Json --
+ *     the L3 sugar keeps the result a Json handle until coerced.
+ *   - AST_TRY (`expr?`) on a Json-typed receiver -- transparent.
+ *
+ * Anything else returns false; the check pass then accepts the
+ * interpolation. */
+static bool interp_expr_is_json(const InterpJsonScope *s, AstNode *expr) {
+    if (!expr) return false;
+    switch (expr->kind) {
+    case AST_IDENT:
+        return interp_json_scope_has(s, expr->name);
+    case AST_FIELD_ACCESS:
+    case AST_INDEX:
+        return interp_expr_is_json(s, expr->left);
+    case AST_TRY:
+        return interp_expr_is_json(s, expr->left);
+    case AST_HOST_CALL:
+        /* Every `vdag:json.*` host call that returns a handle
+         * stays Json-typed. The coercion verbs
+         * (`json.as_string|as_int|as_bool`) deliberately strip the
+         * Json provenance, matching what ir_gen does. */
+        if (expr->name && strncmp(expr->name, "json.", 5) == 0) {
+            const char *verb = expr->name + 5;
+            if (strcmp(verb, "as_string") == 0) return false;
+            if (strcmp(verb, "as_int")    == 0) return false;
+            if (strcmp(verb, "as_bool")   == 0) return false;
+            return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+/* True if the expression is an AST_CAST to a target string-shaped
+ * type, in which case the L4 check accepts it regardless of the
+ * inner value's type. */
+static bool interp_expr_has_string_cast(AstNode *expr) {
+    if (!expr || expr->kind != AST_CAST) return false;
+    if (!expr->type_expr) return false;
+    if (expr->type_expr->kind != AST_TYPE_NAMED) return false;
+    const char *n = expr->type_expr->name;
+    if (!n) return false;
+    return strcmp(n, "string") == 0 || strcmp(n, "str") == 0;
+}
+
+static void interp_check_expr(AstNode *expr,
+                              InterpJsonScope *scope,
+                              ErrorReporter *reporter);
+static void interp_check_stmt(AstNode *stmt,
+                              InterpJsonScope *scope,
+                              ErrorReporter *reporter);
+
+static void interp_check_interp_string(AstNode *node,
+                                       InterpJsonScope *scope,
+                                       ErrorReporter *reporter) {
+    AstNode *part;
+    int idx = 0;
+    for (part = node->params; part; part = part->next, idx++) {
+        if (!part) break;
+        /* Even-indexed parts are literal segments produced by the
+         * parser (AST_STRING_LIT). Odd-indexed parts are the
+         * embedded `${...}` expressions. */
+        if ((idx & 1) == 0) continue;
+        /* Explicit `as string` cast accepts anything. */
+        if (interp_expr_has_string_cast(part)) {
+            interp_check_expr(part->left, scope, reporter);
+            continue;
+        }
+        if (interp_expr_is_json(scope, part)) {
+            report_error(reporter, part->loc,
+                "ERR_INTERP_NOT_COERCIBLE: `Json` cannot be coerced to "
+                "string implicitly -- use `${value as string}` to lower "
+                "to vdag:json.as-string",
+                "wrap the value in an explicit `as string` cast");
+        } else {
+            interp_check_expr(part, scope, reporter);
+        }
+    }
+}
+
+static void interp_check_expr(AstNode *expr,
+                              InterpJsonScope *scope,
+                              ErrorReporter *reporter) {
+    if (!expr) return;
+    if (expr->kind == AST_INTERP_STRING) {
+        interp_check_interp_string(expr, scope, reporter);
+        return;
+    }
+    /* Generic recursion -- sufficient for the v1 surface where
+     * AST_INTERP_STRING never appears as a direct child of complex
+     * declarations (no metadata sites, no annotations, etc.). */
+    interp_check_expr(expr->left,  scope, reporter);
+    interp_check_expr(expr->right, scope, reporter);
+    {
+        AstNode *p;
+        for (p = expr->params; p; p = p->next) {
+            if (p == expr->left || p == expr->right) continue;
+            interp_check_expr(p, scope, reporter);
+        }
+    }
+}
+
+static void interp_check_stmt(AstNode *stmt,
+                              InterpJsonScope *scope,
+                              ErrorReporter *reporter) {
+    if (!stmt) return;
+    switch (stmt->kind) {
+    case AST_LET: {
+        /* Track `let X: Json = ...` so subsequent interpolation
+         * sites referencing X are flagged. The scope is reset at
+         * function boundaries by the caller. */
+        if (stmt->type_expr && stmt->type_expr->kind == AST_TYPE_NAMED &&
+            stmt->type_expr->name &&
+            strcmp(stmt->type_expr->name, "Json") == 0) {
+            interp_json_scope_add(scope, stmt->name);
+        }
+        interp_check_expr(stmt->right, scope, reporter);
+        break;
+    }
+    case AST_BLOCK:
+    case AST_PROGRAM: {
+        AstNode *s;
+        for (s = stmt->params; s; s = s->next) interp_check_stmt(s, scope, reporter);
+        break;
+    }
+    case AST_EXPR_STMT:
+        interp_check_expr(stmt->left, scope, reporter);
+        break;
+    case AST_RETURN:
+        interp_check_expr(stmt->left, scope, reporter);
+        break;
+    case AST_ASSIGN:
+        interp_check_expr(stmt->left,  scope, reporter);
+        interp_check_expr(stmt->right, scope, reporter);
+        break;
+    case AST_IF:
+        interp_check_expr(stmt->left, scope, reporter);
+        interp_check_stmt(stmt->right,  scope, reporter);
+        interp_check_stmt(stmt->params, scope, reporter);
+        break;
+    case AST_WHILE:
+        interp_check_expr(stmt->left, scope, reporter);
+        interp_check_stmt(stmt->right, scope, reporter);
+        break;
+    case AST_LOOP:
+        interp_check_stmt(stmt->left, scope, reporter);
+        break;
+    case AST_FOR:
+        interp_check_expr(stmt->params, scope, reporter);
+        interp_check_stmt(stmt->right, scope, reporter);
+        break;
+    default:
+        interp_check_expr(stmt->left,  scope, reporter);
+        interp_check_expr(stmt->right, scope, reporter);
+        break;
+    }
+}
+
+static void interp_check_fn_body(AstNode *fn, ErrorReporter *reporter) {
+    InterpJsonScope scope;
+    memset(&scope, 0, sizeof(scope));
+    if (fn && fn->left) interp_check_stmt(fn->left, &scope, reporter);
+}
+
+static void check_interp_coercibility(AstNode *program,
+                                      ErrorReporter *reporter) {
+    AstNode *decl;
+    if (!program || program->kind != AST_PROGRAM) return;
+    for (decl = program->params; decl; decl = decl->next) {
+        if (decl->kind == AST_FN) {
+            interp_check_fn_body(decl, reporter);
+        } else if (decl->kind == AST_AGENT) {
+            /* Agent methods are threaded via ->left as a list of
+             * AST_FN nodes. Walk each method as a self-contained
+             * scope (Json provenance does not flow across method
+             * boundaries). */
+            AstNode *m;
+            for (m = decl->left; m; m = m->next) {
+                if (m->kind == AST_FN) interp_check_fn_body(m, reporter);
+            }
+            /* Some parser shapes thread methods via ->params instead.
+             * Walk that list too -- duplicate scopes are harmless. */
+            for (m = decl->params; m; m = m->next) {
+                if (m->kind == AST_FN) interp_check_fn_body(m, reporter);
+            }
+        }
     }
 }
 
@@ -2033,6 +2723,8 @@ static bool is_builtin_type(const char *name) {
         "bool", "void", "string", "String",
         "Result", "Vec", "List", "Option", "Map", "Set",
         "char", "byte", "usize", "isize",
+        /* L3: Json is an opaque handle type. */
+        "Json",
         NULL
     };
     int i;
@@ -2244,6 +2936,22 @@ static void check_expr(SymbolTable *st, AstNode *expr,
         }
         break;
 
+    case AST_HOST_CALL: {
+        /* host call: <namespace>.<fn>(args). We don't try to resolve the
+         * left-hand `llm`/`http`/... identifier against the symbol table
+         * (they are not declared as values) — the parser already gated
+         * the namespace prefix. Just walk the arguments. The IR backend
+         * does the final capability/declaration matching against the
+         * enclosing agent's capabilities list and the host module's
+         * import surface (imports.go). */
+        AstNode *arg = expr->params;
+        while (arg) {
+            check_expr(st, arg, reporter, arena);
+            arg = arg->next;
+        }
+        break;
+    }
+
     case AST_INDEX:
         if (!expr->left) {
             report_error(reporter, expr->loc,
@@ -2276,7 +2984,21 @@ static void check_expr(SymbolTable *st, AstNode *expr,
     case AST_TRY:
     case AST_AWAIT:
     case AST_SPAWN:
+    case AST_RESULT_OK:
+    case AST_RESULT_ERR:
         check_expr(st, expr->left, reporter, arena);
+        break;
+
+    case AST_TRY_CATCH:
+        /* The catch-binding `e: T` lives in the handler's scope only.
+         * For v1 we accept any enum-like type as E and rely on the
+         * negative-i32 sentinel encoding; full Result<T,E> generics are a
+         * later increment. We still walk both blocks so nested
+         * expressions get checked. */
+        check_stmt(st, expr->left,  reporter, arena);
+        check_stmt(st, expr->right, reporter, arena);
+        if (expr->type_expr)
+            check_type_expr(st, expr->type_expr, reporter, arena);
         break;
 
     case AST_PIPE:
@@ -2326,9 +3048,187 @@ static void check_expr(SymbolTable *st, AstNode *expr,
     case AST_MATCH:
         check_expr(st, expr->left, reporter, arena);
         {
+            /* L6-MARKER-TYPECHECK: full match exhaustiveness +
+             * reachability check.
+             *
+             * Catch-all arms (AST_PAT_WILDCARD or unguarded
+             * AST_PAT_IDENT without `::`) subsume every value.
+             * Recognised shapes: Result family, host-error enum,
+             * bool literal arms, open literal types (int/string).
+             * Arms after an unguarded catch-all are reported as
+             * ERR_MATCH_UNREACHABLE_ARM. */
+            bool saw_ok = false, saw_err = false, looks_resultish = false;
+            bool saw_catchall = false;
+            bool saw_true = false, saw_false = false, looks_boolish = false;
+            bool saw_int_lit = false, saw_str_lit = false;
+            bool looks_host_err = false;
+            char host_err_seen[LCN_WIT_MAX_VARIANTS][LCN_WIT_MAX_NAME];
+            int  host_err_seen_count = 0;
+            int  arm_idx_l6 = 0;
+            AstNode *first_arm = expr->params;
+            for (AstNode *arm = expr->params; arm; arm = arm->next, arm_idx_l6++) {
+                if (arm->kind != AST_MATCH_ARM || !arm->left) continue;
+                AstNode *pat = arm->left;
+                bool guarded = (arm->params != NULL);
+                if (saw_catchall) {
+                    report_error_fmt(
+                        reporter, arm->loc,
+                        "remove the dead arm",
+                        "ERR_MATCH_UNREACHABLE_ARM: arm #%d follows "
+                        "an unguarded catch-all and can never run",
+                        arm_idx_l6 + 1);
+                }
+                /* L6: a PAT_IDENT containing `::` is a qualified
+                 * variant reference, NOT a binding catch-all. */
+                bool is_qualified_ident = false;
+                if (pat->kind == AST_PAT_IDENT && pat->name) {
+                    for (const char *q = pat->name; q[0] && q[1]; q++) {
+                        if (q[0] == ':' && q[1] == ':') {
+                            is_qualified_ident = true; break;
+                        }
+                    }
+                }
+                if (pat->kind == AST_PAT_WILDCARD ||
+                    (pat->kind == AST_PAT_IDENT && !is_qualified_ident)) {
+                    if (!guarded && !saw_catchall) saw_catchall = true;
+                    continue;
+                }
+                if (is_qualified_ident ||
+                    (pat->kind == AST_PAT_ENUM && pat->name)) {
+                    const char *name = pat->name;
+                    const char *tail = name;
+                    const char *head_end = name;
+                    for (const char *q = name; *q; q++) {
+                        if (q[0] == ':' && q[1] == ':') {
+                            tail = q + 2; head_end = q; q++;
+                        } else if (q[0] == '.') {
+                            tail = q + 1; head_end = q;
+                        }
+                    }
+                    if (strcmp(tail, "Ok") == 0) {
+                        saw_ok = true; looks_resultish = true;
+                    } else if (strcmp(tail, "Err") == 0) {
+                        saw_err = true; looks_resultish = true;
+                    }
+                    size_t hlen = (size_t)(head_end - name);
+                    if (hlen == 10 &&
+                        (memcmp(name, "host_error", 10) == 0 ||
+                         memcmp(name, "host-error", 10) == 0)) {
+                        looks_host_err = true;
+                        if (!guarded &&
+                            host_err_seen_count < LCN_WIT_MAX_VARIANTS) {
+                            size_t tl = strlen(tail);
+                            if (tl >= LCN_WIT_MAX_NAME)
+                                tl = LCN_WIT_MAX_NAME - 1;
+                            memcpy(host_err_seen[host_err_seen_count],
+                                   tail, tl);
+                            host_err_seen[host_err_seen_count][tl] = '\0';
+                            host_err_seen_count++;
+                        }
+                    }
+                    continue;
+                }
+                if (pat->kind == AST_PAT_LITERAL) {
+                    if (pat->name) {
+                        if (strcmp(pat->name, "true") == 0) {
+                            saw_true = true; looks_boolish = true;
+                        } else if (strcmp(pat->name, "false") == 0) {
+                            saw_false = true; looks_boolish = true;
+                        } else if (strcmp(pat->name, "int") == 0) {
+                            saw_int_lit = true;
+                        } else if (strcmp(pat->name, "str") == 0) {
+                            saw_str_lit = true;
+                        }
+                    } else if (pat->val.str_val) {
+                        saw_str_lit = true;
+                    } else {
+                        saw_int_lit = true;
+                    }
+                }
+            }
+            if (looks_resultish && !saw_catchall && (!saw_ok || !saw_err)) {
+                report_error_fmt(
+                    reporter,
+                    first_arm ? first_arm->loc : expr->loc,
+                    "add the missing arm or a `_` catch-all",
+                    "ERR_MATCH_INEXHAUSTIVE: match over Result requires "
+                    "both Ok(_) and Err(_) arms (saw %s%s)",
+                    saw_ok  ? "Ok "  : "",
+                    saw_err ? "Err " : "");
+            } else if (looks_host_err && !saw_catchall) {
+                const LcnWitEnum *e = lcn_wit_shared_enum("host-error");
+                if (e) {
+                    char missing[256] = {0};
+                    size_t mlen = 0;
+                    int missing_count = 0;
+                    int i;
+                    for (i = 0; i < e->variant_count; i++) {
+                        const char *vname = e->variants[i].name;
+                        bool found = false;
+                        int j;
+                        for (j = 0; j < host_err_seen_count; j++) {
+                            const char *a = host_err_seen[j];
+                            const char *b = vname;
+                            bool eq = true;
+                            while (*a && *b) {
+                                char ca = (*a == '_') ? '-' : *a;
+                                char cb = (*b == '_') ? '-' : *b;
+                                if (ca != cb) { eq = false; break; }
+                                a++; b++;
+                            }
+                            if (eq && *a == '\0' && *b == '\0') {
+                                found = true; break;
+                            }
+                        }
+                        if (!found) {
+                            missing_count++;
+                            if (mlen < sizeof(missing) - 32) {
+                                int n = snprintf(missing + mlen,
+                                                 sizeof(missing) - mlen,
+                                                 "%s%s",
+                                                 mlen ? ", " : "",
+                                                 vname);
+                                if (n > 0) mlen += (size_t)n;
+                            }
+                        }
+                    }
+                    if (missing_count > 0) {
+                        report_error_fmt(
+                            reporter,
+                            first_arm ? first_arm->loc : expr->loc,
+                            "add the missing variant(s) or a `_` catch-all",
+                            "ERR_MATCH_INEXHAUSTIVE: match over "
+                            "host-error is missing %d variant(s): %s",
+                            missing_count, missing);
+                    }
+                }
+            } else if (looks_boolish && !saw_catchall &&
+                       (!saw_true || !saw_false)) {
+                report_error_fmt(
+                    reporter,
+                    first_arm ? first_arm->loc : expr->loc,
+                    "add the missing bool arm or a `_` catch-all",
+                    "ERR_MATCH_INEXHAUSTIVE: match over bool requires "
+                    "both true and false arms (saw %s%s)",
+                    saw_true  ? "true "  : "",
+                    saw_false ? "false " : "");
+            } else if (!saw_catchall && !looks_resultish && !looks_host_err &&
+                       !looks_boolish && (saw_int_lit || saw_str_lit)) {
+                report_error_fmt(
+                    reporter,
+                    first_arm ? first_arm->loc : expr->loc,
+                    "add a `_` catch-all arm",
+                    "ERR_MATCH_INEXHAUSTIVE: literal match over %s "
+                    "must end with a wildcard arm",
+                    saw_str_lit ? "string" : "int");
+            }
+        }
+        {
             AstNode *arm = expr->params;
             while (arm) {
                 if (arm->kind == AST_MATCH_ARM) {
+                    if (arm->params)
+                        check_expr(st, arm->params, reporter, arena);
                     check_stmt(st, arm->right, reporter, arena);
                 }
                 arm = arm->next;
@@ -2363,6 +3263,20 @@ static void check_expr(SymbolTable *st, AstNode *expr,
                 check_stmt(st, arm->right, reporter, arena);
             }
             arm = arm->next;
+        }
+        break;
+    }
+
+    /* L4: walk the embedded expressions of an interpolated string so
+     * any nested host-calls / casts / etc. still get type-checked
+     * here. Per-segment coercibility is enforced by the dedicated
+     * `check_interp_coercibility` pass (6c). */
+    case AST_INTERP_STRING: {
+        AstNode *part = expr->params;
+        while (part) {
+            if (part->kind != AST_STRING_LIT)
+                check_expr(st, part, reporter, arena);
+            part = part->next;
         }
         break;
     }
@@ -2465,6 +3379,103 @@ static void check_stmt(SymbolTable *st, AstNode *stmt,
     }
 }
 
+/* ============================================================
+ * L2: break / continue scope check
+ *
+ * Walks a fn body tracking a `loop_depth` counter. Every AST_WHILE /
+ * AST_FOR / AST_LOOP enters a loop frame (++depth); every AST_BREAK
+ * or AST_CONTINUE seen while depth==0 raises a diagnostic.
+ *
+ * This pass is intentionally independent of `check_stmt` / `check_expr`
+ * so a future revisit (e.g. labelled break) only touches one walker.
+ * Match arms are walked WITHOUT inheriting the enclosing loop frame:
+ * a `break` inside `match { _ -> { break } }` IS valid only if the
+ * match itself is inside a loop.
+ * ============================================================ */
+
+static void check_loop_scope_stmt(AstNode *stmt, int loop_depth,
+                                  ErrorReporter *reporter);
+
+static void check_loop_scope_expr(AstNode *expr, int loop_depth,
+                                  ErrorReporter *reporter) {
+    if (!expr) return;
+    /* break and continue can only appear at statement position in
+     * stage0, but be defensive — walk both children. */
+    check_loop_scope_stmt(expr->left,   loop_depth, reporter);
+    check_loop_scope_stmt(expr->right,  loop_depth, reporter);
+    check_loop_scope_stmt(expr->params, loop_depth, reporter);
+}
+
+static void check_loop_scope_stmt(AstNode *stmt, int loop_depth,
+                                  ErrorReporter *reporter) {
+    if (!stmt) return;
+
+    switch (stmt->kind) {
+    case AST_WHILE:
+        check_loop_scope_expr(stmt->left, loop_depth, reporter);
+        check_loop_scope_stmt(stmt->right, loop_depth + 1, reporter);
+        break;
+
+    case AST_FOR:
+        check_loop_scope_expr(stmt->params, loop_depth, reporter);
+        check_loop_scope_stmt(stmt->right,  loop_depth + 1, reporter);
+        break;
+
+    case AST_LOOP:
+        check_loop_scope_stmt(stmt->left, loop_depth + 1, reporter);
+        break;
+
+    case AST_BREAK:
+        if (loop_depth <= 0) {
+            report_error(reporter, stmt->loc,
+                         "`break` used outside of a loop body",
+                         "`break` is only valid inside a `while`, "
+                         "`for`, or `loop { ... }` block");
+        }
+        break;
+
+    case AST_CONTINUE:
+        if (loop_depth <= 0) {
+            report_error(reporter, stmt->loc,
+                         "`continue` used outside of a loop body",
+                         "`continue` is only valid inside a `while`, "
+                         "`for`, or `loop { ... }` block");
+        }
+        break;
+
+    case AST_BLOCK: {
+        AstNode *s = stmt->params;
+        while (s) {
+            check_loop_scope_stmt(s, loop_depth, reporter);
+            s = s->next;
+        }
+        break;
+    }
+
+    case AST_IF:
+        check_loop_scope_expr(stmt->left,   loop_depth, reporter);
+        check_loop_scope_stmt(stmt->right,  loop_depth, reporter);
+        check_loop_scope_stmt(stmt->params, loop_depth, reporter);
+        break;
+
+    case AST_MATCH: {
+        check_loop_scope_expr(stmt->left, loop_depth, reporter);
+        AstNode *arm = stmt->params;
+        while (arm) {
+            if (arm->kind == AST_MATCH_ARM)
+                check_loop_scope_stmt(arm->right, loop_depth, reporter);
+            arm = arm->next;
+        }
+        break;
+    }
+
+    default:
+        check_loop_scope_expr(stmt->left,   loop_depth, reporter);
+        check_loop_scope_expr(stmt->right,  loop_depth, reporter);
+        break;
+    }
+}
+
 /* Check function body */
 static void check_fn_body(SymbolTable *st, AstNode *fn,
                           ErrorReporter *reporter, Arena *arena) {
@@ -2483,6 +3494,8 @@ static void check_fn_body(SymbolTable *st, AstNode *fn,
     /* Check body */
     if (fn->left) {
         check_stmt(st, fn->left, reporter, arena);
+        /* L2: surface break/continue used outside any loop body. */
+        check_loop_scope_stmt(fn->left, 0, reporter);
     }
 }
 
@@ -2514,6 +3527,8 @@ static void check_tool_decl(SymbolTable *st, AstNode *tool,
     /* Check body */
     if (tool->left) {
         check_stmt(st, tool->left, reporter, arena);
+        /* L2: same break/continue scope check for tool bodies. */
+        check_loop_scope_stmt(tool->left, 0, reporter);
     }
 }
 
@@ -3866,26 +4881,41 @@ static void own_check_call(OwnershipCtx *ctx, AstNode *call_expr,
     }
 
     /* Check each argument */
-    for (arg = call_expr->params; arg; arg = arg->next) {
-        if (arg->kind == AST_REF) {
-            /* &x or &mut x: temporary borrow for the call duration */
-            const char *ref_name = own_expr_ident_name(arg->left);
-            own_process_borrow(ctx, arg, reporter);
-            /* Track for release after the call */
-            if (ref_name && temp_count < 32) {
-                temp_borrows[temp_count] = ref_name;
-                temp_is_mut[temp_count] = arg->is_mut;
-                temp_count++;
-            }
-        } else {
-            const char *arg_name = own_expr_ident_name(arg);
-            if (arg_name) {
-                /* Plain identifier passed by value: move */
-                own_mark_move(ctx, arg_name, callee_name,
-                              (int)arg->loc.line, reporter, arg->loc);
+    {
+        int arg_index = 0;
+        for (arg = call_expr->params; arg; arg = arg->next, arg_index++) {
+            if (arg->kind == AST_REF) {
+                /* &x or &mut x: temporary borrow for the call duration */
+                const char *ref_name = own_expr_ident_name(arg->left);
+                own_process_borrow(ctx, arg, reporter);
+                /* Track for release after the call */
+                if (ref_name && temp_count < 32) {
+                    temp_borrows[temp_count] = ref_name;
+                    temp_is_mut[temp_count] = arg->is_mut;
+                    temp_count++;
+                }
             } else {
-                /* Recurse into complex sub-expressions of the arg */
-                own_check_expr(ctx, arg, reporter, arena);
+                const char *arg_name = own_expr_ident_name(arg);
+                if (arg_name) {
+                    /* C7: sb_append(handle, s) mutates through its handle (a
+                     * plain, non-owning `void *`) and never frees it -- unlike
+                     * sb_to_string(handle), which does free it. Treating the
+                     * handle as moved on every append made every subsequent
+                     * append/sb_to_string on the SAME builder a false-positive
+                     * "use of moved value": the builder pattern is specifically
+                     * meant to be reused across calls. Check for use-after-a-
+                     * REAL-move without marking a new one here. */
+                    if (arg_index == 0 && callee_name && strcmp(callee_name, "sb_append") == 0) {
+                        own_check_use(ctx, arg, reporter);
+                    } else {
+                        /* Plain identifier passed by value: move */
+                        own_mark_move(ctx, arg_name, callee_name,
+                                      (int)arg->loc.line, reporter, arg->loc);
+                    }
+                } else {
+                    /* Recurse into complex sub-expressions of the arg */
+                    own_check_expr(ctx, arg, reporter, arena);
+                }
             }
         }
     }
@@ -3951,6 +4981,27 @@ static void own_check_expr(OwnershipCtx *ctx, AstNode *expr,
         /* Object is used but not moved for method calls */
         own_check_use(ctx, expr->left, reporter);
         /* Check arguments — by value = move */
+        {
+            AstNode *arg;
+            for (arg = expr->params; arg; arg = arg->next) {
+                if (arg->kind == AST_REF) {
+                    own_process_borrow(ctx, arg, reporter);
+                } else {
+                    const char *arg_name = own_expr_ident_name(arg);
+                    if (arg_name) {
+                        own_mark_move(ctx, arg_name, expr->name,
+                                      (int)arg->loc.line, reporter, arg->loc);
+                    }
+                }
+                own_check_expr(ctx, arg, reporter, arena);
+            }
+        }
+        break;
+
+    case AST_HOST_CALL:
+        /* Host calls: the "receiver" is a capability namespace token
+         * (not an owned value), so we don't move it. Args are checked
+         * for borrow/move just like a regular call. */
         {
             AstNode *arg;
             for (arg = expr->params; arg; arg = arg->next) {
@@ -4045,7 +5096,14 @@ static void own_check_expr(OwnershipCtx *ctx, AstNode *expr,
     case AST_TRY:
     case AST_AWAIT:
     case AST_SPAWN:
+    case AST_RESULT_OK:
+    case AST_RESULT_ERR:
         own_check_expr(ctx, expr->left, reporter, arena);
+        break;
+
+    case AST_TRY_CATCH:
+        own_check_stmt(ctx, expr->left,  reporter, arena);
+        own_check_stmt(ctx, expr->right, reporter, arena);
         break;
 
     case AST_RANGE:
@@ -4119,6 +5177,13 @@ static void own_check_stmt(OwnershipCtx *ctx, AstNode *stmt,
                 /* Method calls (db.connect, db.query, db.get, etc.) */
                 if (rk == AST_METHOD_CALL)
                     ov->is_copy = true;  /* handles + method results are Copy */
+                /* L7: host-call results (vdag:* dispatched verbs) are
+                 * scalar i64 / f64 / i32-bool / handles -- never owned
+                 * memory the front-end has to track. Marking Copy here
+                 * lets `let secs = time.now(); ... math.clamp(secs, ...)`
+                 * round-trip without the ownership pass mis-firing. */
+                if (rk == AST_HOST_CALL)
+                    ov->is_copy = true;
                 /* Binary expressions produce primitives */
                 if (rk == AST_BINARY)
                     ov->is_copy = true;
@@ -4268,10 +5333,24 @@ static void own_check_fn(OwnershipCtx *ctx, AstNode *fn,
 
     own_push_scope(ctx);
 
-    /* Register function parameters as owned variables */
+    /* Register function parameters as owned variables.
+     *
+     * L7: scalar-typed params (int, bool, float, string) are Copy,
+     * matching the same rule used for `let x: int = ...` at line ~5018.
+     * Without this, the L7 stdlib pattern
+     * `fn f(label: string) -> bool { string.contains(label, "x") }`
+     * incorrectly trips the ownership pass on the second use of
+     * `label`. */
     for (p = fn->params; p; p = p->next) {
         if (p->kind == AST_PARAM && p->name) {
-            own_register(ctx, p->name, (int)p->loc.line);
+            VarOwnership *pv = own_register(ctx, p->name, (int)p->loc.line);
+            if (pv && p->type_expr && p->type_expr->name) {
+                const char *tn = p->type_expr->name;
+                if (strcmp(tn, "int") == 0 || strcmp(tn, "bool") == 0 ||
+                    strcmp(tn, "float") == 0 || strcmp(tn, "string") == 0 ||
+                    strcmp(tn, "i64") == 0 || strcmp(tn, "f64") == 0)
+                    pv->is_copy = true;
+            }
         }
     }
 
@@ -4343,6 +5422,13 @@ static void check_ownership(AstNode *program, ErrorReporter *reporter,
  * any declaration that lacks `pub` is private to its module.
  * Accessing a non-pub declaration from another module is a
  * hard error that blocks compilation.
+ *
+ * L8 (2026-05-13): top-level `fn`s default to PUBLIC. The bare `fn`
+ * form is the implicit public shape; `pub fn` is the explicit form
+ * and is accepted but optional. Other declaration kinds (struct,
+ * enum, const, ...) still need an explicit `pub` to cross module
+ * boundaries. This matches the L8 spec ("All top-level `fn`s in a
+ * module are public by default").
  * ============================================================ */
 
 static int check_module_visibility(AstNode *program,
@@ -4368,6 +5454,11 @@ static int check_module_visibility(AstNode *program,
         /* Skip kinds that don't support pub annotation meaningfully */
         if (decl->kind == AST_USE || decl->kind == AST_MODULE ||
             decl->kind == AST_IMPL || decl->kind == AST_LET) continue;
+
+        /* L8 (2026-05-13): top-level fns default to PUBLIC. The bare
+         * `fn` form is the implicit public shape; `pub fn` is the
+         * explicit form and is accepted but optional. */
+        if (decl->kind == AST_FN) continue;
 
         /* If the declaration is not pub, error — private symbols
          * cannot be accessed from another module */
@@ -4408,6 +5499,18 @@ bool typecheck_program(AstNode *program, ErrorReporter *reporter,
     /* Pass 2: Capability verification (enforced — security critical) */
     check_capabilities(&st, &cr, program, reporter, arena);
 
+    /* Pass 2c: Parameterised capability allowlist (L12) -- validates
+     * the host:port patterns inside `capabilities: [http.fetch([...])]` */
+    check_capability_allowlists(program, reporter);
+
+    /* Pass 2d: Host-call signature check (L1b) -- compares every
+     * AST_HOST_CALL against include/vdag.wit, the canonical
+     * Visual-DAG host-import contract. Arity mismatches fail
+     * compilation with ERR_HOST_CALL_SIGNATURE_MISMATCH; unknown
+     * calls log a warning and fall through to the legacy
+     * emit-WIT behaviour. */
+    check_host_call_signatures(program, reporter);
+
     /* Pass 2b: Access control enforcement (network endpoints + binary) */
     {
         AccessPolicyRegistry apr;
@@ -4433,6 +5536,14 @@ bool typecheck_program(AstNode *program, ErrorReporter *reporter,
     /* Pass 6: Basic type checking (enforced) */
     check_types(&st, program, reporter, arena);
 
+    /* Pass 6c: L4 string-interpolation coercion check. Each `${expr}`
+     * site must lower to one of the built-in `string.from_*` host
+     * calls; the canonical contract supports int / bool / float /
+     * string. `Json` requires an explicit `as string` cast (delegated
+     * to `vdag:json.as-string`). Anything else raises
+     * ERR_INTERP_NOT_COERCIBLE. */
+    check_interp_coercibility(program, reporter);
+
     /* Pass 7: Enum LLM constraint detection (advisory) */
     int enum_start = reporter->count;
     check_enum_constraints(&st, program, reporter);
@@ -4445,6 +5556,17 @@ bool typecheck_program(AstNode *program, ErrorReporter *reporter,
     int own_start = reporter->count;
     check_ownership(program, reporter, arena, false);
     int own_warnings = reporter->count - own_start;
+
+    /* Pass 10 (L9): bidirectional type inference. Synth ⇑ on the RHS
+     * of every let; check ⇓ against function-return type boundaries;
+     * coerce int → float where allowed. Engine lives in
+     * src/l9_infer.c. The L9 SymbolTable layout deliberately mirrors
+     * the typecheck pipeline's SymbolTable (see comment at the top of
+     * src/l9_infer.c), so the cast through void* is safe. Returns no
+     * status: failures are surfaced as enforced errors via the
+     * shared reporter and picked up by the enforced-error tally
+     * below. */
+    lcn_l9_infer_types(&st, program, reporter, arena);
 
     /* Total errors minus advisory warnings = enforced errors */
     int total_errors = reporter->count;

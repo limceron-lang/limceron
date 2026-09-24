@@ -1,0 +1,34 @@
+// 02_exceeds_budget.lceron -- L13 sample: budget fence trips (Err path)
+//
+// The agent declares `budget: { max_tokens: 50, max_cost: 0.001 }`. A
+// single llm.classify needs 100 tokens but only 50 are available, so
+// the token fence trips before the call is dispatched and returns
+// `HostError.BudgetExceeded = -10` instead of invoking the host.
+//
+// (The cost counter would also have tripped: 0.001 USD = 1000 micro-USD
+// and the call costs 500 micro-USD, which on its own would pass, but
+// the chain order is entropy -> tokens -> cost, so the token fence
+// wins and the cost fence is never reached for this call.)
+//
+// Expected behaviour at the wasm runtime:
+//   - $tokens_remaining        initialised to 50
+//   - $cost_micro_usd_remaining initialised to 1000
+//   - first llm.classify: 50 < 100 -> token fence trips
+//                         function returns i64 -10 BEFORE dispatching
+//
+// The `?` operator on the first call observes the -10 sentinel and
+// propagates it upward unchanged, so main exits with -10 (Err).
+//
+// This is the canonical failure mode `agent.compiled@1.0` will surface
+// in Visual-DAG's ADR-0016 hard-cap budget story.
+
+agent BudgetExceeds {
+    capabilities: [llm.classify]
+    budget: { max_tokens: 50, max_cost: 0.001 }
+
+    fn main() -> int {
+        let a = llm.classify("first")?    // fence trips: returns -10
+        // Never reached: the `?` on `a` short-circuited main with -10.
+        a
+    }
+}

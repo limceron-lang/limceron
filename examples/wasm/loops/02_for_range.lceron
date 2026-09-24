@@ -1,0 +1,35 @@
+// 02_for_range.lceron — WASM PoC sample: sum 1..10 via a for-in range loop.
+//
+// Functionally identical to 01_while_count.lceron, but expressed with the
+// counted-loop syntax `for i in 1..10`. The compiler desugars this at IR
+// level into the equivalent of:
+//
+//     let i = 1
+//     while i < 10 {
+//         <body>
+//         i = i + 1
+//     }
+//
+// `1..10` is half-open: i takes the values 1,2,...,9. Stage 0 only supports
+// half-open integer ranges — inclusive `..=`, step ranges, and reverse
+// ranges are future work.
+//
+// Expected: 1+2+3+...+9 = 45.
+//
+// Compile & run:
+//   ./build/limceron-stage0 build --target wasm32-wasi-preview2 \
+//       -o /tmp/loop_02.wasm examples/wasm/loops/02_for_range.lceron
+//   wasmtime --invoke main /tmp/loop_02.wasm    # => 45
+
+agent LoopFor {
+    capabilities: []
+    budget: { max_tokens: 10, max_cost: 0.01 }
+
+    fn main() -> int {
+        let mut sum = 0
+        for i in 1..10 {
+            sum = sum + i
+        }
+        sum
+    }
+}

@@ -1,0 +1,21 @@
+// 01_open_fetch.lceron -- L12 sample: bare http.fetch (no allowlist)
+//
+// The bare form `capabilities: [http.fetch]` is backwards-compatible
+// with every existing sample: it declares the capability without
+// pinning a compile-time host allowlist. The runtime allowlist
+// (configured on the worker) is still authoritative; this sample
+// just doesn't add an additional compile-time fence.
+//
+// Expected emitted artifacts:
+//   - .wit advertises `import http;` for the prefix (no `hosts:` field).
+//   - .wasm contains NO `vdag.capability.network.allowlist` custom
+//     section, so wazero applies only its runtime allowlist.
+
+agent OpenFetch {
+    capabilities: [http.fetch]
+
+    fn main() -> int {
+        // Bare form: any host the runtime allows is reachable.
+        0
+    }
+}

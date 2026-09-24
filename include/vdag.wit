@@ -1,0 +1,223 @@
+// vdag.wit -- Canonical Visual-DAG host-import contract.
+//
+// This file is the SINGLE source of truth for the signatures that
+// Visual-DAG's `internal/nodes/code/imports.go` exports to wazero
+// guests. The Limceron typechecker loads it (src/wit_load.c) and
+// asserts every `<namespace>.<verb>(args)` host call against the
+// declared shape; mismatches raise ERR_HOST_CALL_SIGNATURE_MISMATCH.
+//
+// Editing rules:
+//
+//   1. Add a function here BEFORE adding it to Visual-DAG's
+//      imports.go. Compile-time mismatches are far cheaper than
+//      runtime linker failures at instantiation.
+//   2. Use the WIT subset the existing emitter (src/wit_emit.c)
+//      understands: `name: func(arg: type, ...) -> type;` lines
+//      inside an `interface <ns>` block.
+//   3. Result-shaped returns are encoded as a single i64 per
+//      ADR-0002 -- non-negative = Ok(v), negative = HostErr*.
+//      We render those as `s64` here; the typechecker treats the
+//      L5 `?` propagator as transparent over `s64` returns.
+//
+// Keep this file checked in. Drift between Visual-DAG's imports.go
+// and this contract is a release-blocking bug.
+
+package limceron:vdag;
+
+// vdag:llm -- LLM dispatch. classify is a length-based label
+// classifier; chat is a full prompt/response round-trip. Both
+// return the bytes-written count in the high nibble of an i64 with
+// negative HostErr* sentinels in the low nibble (Result<i64,_>).
+interface llm {
+    classify: func(text: string) -> s64;
+    chat: func(prompt: string, system: string) -> s64;
+}
+
+// vdag:http -- outbound HTTP. fetch returns the response body byte
+// count; status code is written into an out-of-band scratch slot
+// by the host (see imports.go::httpFetch).
+interface http {
+    fetch: func(url: string, method: string, body: string) -> s64;
+}
+
+// vdag:kb -- tenant-scoped knowledge-base search. search returns a
+// JSON-encoded list<chunk> in the guest's out buffer.
+interface kb {
+    search: func(collection: string, query: string, top-k: s32) -> s64;
+}
+
+// vdag:data -- tenant-scoped read-only SQL. data.read enforces a
+// SELECT-only gate at the host (HostErrDMLRejected = -5 on
+// violation).
+interface data {
+    read: func(query: string, params-json: string) -> s64;
+}
+
+// vdag:json -- per-call arena JSON DOM. parse issues a handle;
+// field / array-index issue child handles; the four value
+// accessors decode. int-value is the documented i64 exception
+// (see docs/language-reference.md "Host calls").
+//
+// L3 surface expansion (2026-05-13): seven additional verbs cover
+// the language-level sugar -- dotted field access (`x.foo`) lowers
+// to `field-get`, null-safe access (`x?.foo`) to `field-get-safe`,
+// and `as int|string|bool` coercions to `as-int|as-string|as-bool`.
+// `array-get` / `array-len` mirror the existing `array-index` /
+// `length` verbs with the names the L3 ROADMAP row pins.
+//
+// TODO(runtime-side): Visual-DAG's internal/nodes/code/imports.go
+// currently declares only the original nine verbs (parse, field,
+// array-index, length, string-value, int-value, bool-value,
+// is-null, stringify). The seven new verbs below must land in
+// imports.go (tracked as F36) before .wasm modules using the L3
+// sugar will instantiate at wazero load time. Until then the
+// signature-mismatch check still passes (the names are declared
+// here), but the missing host stubs will trip linker failures.
+interface json {
+    parse: func(bytes: string) -> s64;
+    field: func(handle: s32, key: string) -> s64;
+    array-index: func(handle: s32, idx: s32) -> s64;
+    length: func(handle: s32) -> s64;
+    string-value: func(handle: s32) -> s64;
+    int-value: func(handle: s32) -> s64;
+    bool-value: func(handle: s32) -> s64;
+    is-null: func(handle: s32) -> s64;
+    stringify: func(handle: s32) -> s64;
+
+    // L3 sugar surface (2026-05-13). Names mirror the language-level
+    // operators the front-end exposes to authors.
+    field-get: func(value: s64, name: string) -> s64;
+    field-get-safe: func(value: s64, name: string) -> s64;
+    as-int: func(value: s64) -> s64;
+    as-string: func(value: s64) -> s64;
+    as-bool: func(value: s64) -> s64;
+    array-get: func(value: s64, index: s32) -> s64;
+    array-len: func(value: s64) -> s32;
+}
+
+// vdag:mcp -- MCP tool dispatch passthrough. Reserved for the
+// future MCP bridge; today only the `call` verb is wired in the
+// Visual-DAG runtime.
+interface mcp {
+    call: func(tool: string, args: string) -> s64;
+}
+
+// vdag:string -- L4 (2026-05-13) lightweight string primitives that
+// back the `"...${expr}..."` interpolation lowering. The IR-gen pass
+// folds each interpolation site into a left-associative chain of
+// `string.concat(prev, next)` calls; non-string segments first route
+// through the matching `string.from-*` coercion verb before they are
+// concatenated. `length` is the inverse query, returning the byte
+// count of a string for callers that want to size scratch slots.
+//
+// Per-segment lowering rules are documented in
+// docs/language-reference.md §String Interpolation.
+//
+// TODO(runtime-side): Visual-DAG's internal/nodes/code/imports.go
+// must export the five verbs before .wasm modules using the L4
+// interpolation lowering will instantiate at wazero load time. Until
+// then the signature-mismatch check still passes (the names are
+// declared here), but the missing host stubs will trip linker
+// failures.
+interface string {
+    concat: func(a: string, b: string) -> string;
+    from-int: func(n: s64) -> string;
+    from-bool: func(b: bool) -> string;
+    from-float: func(f: float64) -> string;
+    length: func(s: string) -> s32;
+
+    // L7 (2026-05-13): stdlib string surface. Mutating verbs (trim,
+    // to-upper, to-lower) return the bytes written into the scratch
+    // slot per the buffer-protocol convention; boolean predicates
+    // (contains, starts-with, ends-with) return 0/1. split / join
+    // operate on list<string> which has no native repr in stage0;
+    // they are placeholders ("TODO L3+list") pending the
+    // L3+collections roadmap row.
+    trim: func(s: string) -> s64;
+    contains: func(s: string, needle: string) -> s64;
+    starts-with: func(s: string, prefix: string) -> s64;
+    ends-with: func(s: string, suffix: string) -> s64;
+    to-upper: func(s: string) -> s64;
+    to-lower: func(s: string) -> s64;
+    split: func(s: string, sep: string) -> s64;
+    join: func(parts: string, sep: string) -> s64;
+}
+
+// vdag:math -- L7 (2026-05-13) standard library math surface. The
+// float-domain verbs (sqrt, sin, cos, tan, log, exp, pow) are real
+// host imports dispatched through Visual-DAG's runtime. The integer
+// helpers (min, max, clamp, abs, sign) are listed here for contract
+// completeness only -- the front-end intercepts them at IR-gen
+// (src/ir_gen.c::AST_HOST_CALL) and lowers them inline as compiler
+// builtins, so `(import "vdag:math" "clamp" ...)` is never emitted.
+//
+// Each float verb takes/returns plain WASM f64s with no scratch
+// buffer (the values fit in registers).
+interface math {
+    sqrt: func(f: float64) -> float64;
+    sin: func(f: float64) -> float64;
+    cos: func(f: float64) -> float64;
+    tan: func(f: float64) -> float64;
+    log: func(f: float64) -> float64;
+    exp: func(f: float64) -> float64;
+    pow: func(base: float64, exponent: float64) -> float64;
+
+    // Pure-int helpers -- compiler builtins, NOT real host imports.
+    min: func(a: s64, b: s64) -> s64;
+    max: func(a: s64, b: s64) -> s64;
+    clamp: func(x: s64, lo: s64, hi: s64) -> s64;
+    abs: func(x: s64) -> s64;
+    sign: func(x: s64) -> s64;
+}
+
+// vdag:time -- L7 (2026-05-13) host-backed clock + RFC3339 formatting.
+// Returns s64 Unix-epoch values; format/parse marshal a layout string
+// into the scratch slot per the buffer-protocol convention from
+// imports.go. `parse` returns Result<s64, host-error> conceptually but
+// at the WASM ABI level it shares the s64-negative-sentinel encoding.
+interface time {
+    now: func() -> s64;
+    now-millis: func() -> s64;
+    format: func(ts: s64, layout: string) -> s64;
+    parse: func(s: string, layout: string) -> s64;
+}
+
+// vdag:state -- per-run scratch state (future). Listed here to
+// reserve the namespace prefix so that capability declarations
+// using `state.*` typecheck against a stable contract once the
+// host side is wired.
+interface state {
+    get: func(key: string) -> s64;
+    put: func(key: string, value: string) -> s64;
+}
+
+// vdag:entropy -- entropy-source bridge (future, paired with L11
+// entropy_budget). Reserved for non-deterministic draws that the
+// runtime accounts against the agent's entropy budget.
+interface entropy {
+    draw: func(bits: s32) -> s64;
+}
+
+// vdag:tool -- tool-registry dispatch. Reserved for the F36d tool
+// registry once it lands; today guests use mcp.call as the bridge.
+interface tool {
+    invoke: func(name: string, args: string) -> s64;
+}
+
+// World assembling every interface a typical Visual-DAG agent may
+// import. The compiler only emits the `import <ns>;` lines for
+// namespaces the agent actually uses (see src/wit_emit.c::emit_agent).
+world vdag-agent {
+    import llm;
+    import http;
+    import kb;
+    import data;
+    import json;
+    import mcp;
+    import state;
+    import entropy;
+    import tool;
+    import string;
+    import math;
+    import time;
+}

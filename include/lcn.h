@@ -59,11 +59,48 @@ typedef struct {
  * Tokens
  * ============================================================ */
 
+/* L4 (2026-05-13): interpolated string literal payload.
+ *
+ * The lexer collapses a quoted string with one or more `${...}`
+ * placeholders into a single TOK_INTERP_STRING whose payload is an
+ * `InterpString` allocated in the per-compile arena. We do NOT emit a
+ * sequence of START / EXPR_START / PART tokens: the parser only ever
+ * sees one token per quoted string, and the embedded expressions are
+ * re-lexed when the parser hits TOK_INTERP_STRING (so existing prefix
+ * / infix parse rules don't need to learn an "I'm inside an interp"
+ * mode).
+ *
+ * Shape: a string with N placeholders has N+1 literal segments. For
+ * `"hello ${name}!"` count=1, literals = {"hello ", "!"},
+ * expr_src = {"name"}. For a plain literal we keep TOK_STRING_LIT --
+ * TOK_INTERP_STRING is only used when count >= 1.
+ */
+#define LCN_INTERP_MAX_PARTS 32
+
+typedef struct {
+    int         count;
+    /* literals[i] is the text that PRECEDES expr_src[i]; literals[count]
+     * is the trailing text after the last placeholder. Empty segments
+     * are interned as "" (never NULL). */
+    const char *literals[LCN_INTERP_MAX_PARTS + 1];
+    const char *expr_src[LCN_INTERP_MAX_PARTS];
+    /* Source-relative location of each `${` so the re-parser can attach
+     * meaningful diagnostics back to the original site. */
+    uint32_t    expr_line[LCN_INTERP_MAX_PARTS];
+    uint32_t    expr_column[LCN_INTERP_MAX_PARTS];
+    uint32_t    expr_offset[LCN_INTERP_MAX_PARTS];
+    /* L4 forbids `${...${...}...}` in v1. Lex-time detection sets this
+     * flag; the parser raises ERR_NESTED_INTERPOLATION before trying to
+     * re-parse the offending segment. */
+    bool        nested_detected;
+} InterpString;
+
 typedef enum {
     /* Literals */
     TOK_INT_LIT,
     TOK_FLOAT_LIT,
     TOK_STRING_LIT,
+    TOK_INTERP_STRING,   /* L4: "...${expr}..." with embedded InterpString* */
     TOK_CHAR_LIT,
     TOK_IDENT,
 
@@ -221,9 +258,10 @@ typedef struct {
     TokenKind   kind;
     SourceLoc   loc;
     union {
-        int64_t     int_val;
-        double      float_val;
-        const char *str_val;
+        int64_t       int_val;
+        double        float_val;
+        const char   *str_val;
+        InterpString *interp;   /* L4: TOK_INTERP_STRING payload */
     } value;
     uint32_t    len;
 } Token;
@@ -251,6 +289,15 @@ typedef struct {
     const char *hint;
     bool        is_warning;
     uint32_t    underline_len;  /* length of ^^^ underline (0 = single ^) */
+    /* Backing storage for `message` when it was produced by
+     * report_error_fmt / report_warning_fmt. Those helpers used to
+     * stash a stack-allocated buffer pointer into `message`, which
+     * dangled the moment the helper returned -- usually harmless
+     * because nothing else ran in between, but the L9 inference pass
+     * (Pass 10) trampled the area on every subsequent function and
+     * left earlier errors observably empty. The formatted message is
+     * now copied here and `message` aliases this slot. */
+    char        message_buf[512];
 } CompileError;
 
 typedef struct {
@@ -342,12 +389,17 @@ typedef enum {
     AST_INT_LIT,
     AST_FLOAT_LIT,
     AST_STRING_LIT,
+    AST_INTERP_STRING,    /* L4: "...${expr}..." lowered to str.concat chain. params=
+                           *  alternating AST_STRING_LIT (literals) and arbitrary
+                           *  expression nodes. Always starts and ends with an
+                           *  AST_STRING_LIT (possibly empty). */
     AST_BOOL_LIT,
     AST_NONE_LIT,
     AST_IDENT,
     AST_BINARY,
     AST_UNARY,
     AST_CALL,
+    AST_HOST_CALL,        /* <namespace>.<fn>(args) — capability-gated host import */
     AST_FIELD_ACCESS,
     AST_INDEX,
     AST_METHOD_CALL,
@@ -368,6 +420,9 @@ typedef enum {
     AST_SELECT,
     AST_SELECT_ARM,
     AST_TRY,
+    AST_RESULT_OK,         /* Ok(expr) — Result<T,E> success variant */
+    AST_RESULT_ERR,        /* Err(code) — Result<T,E> error variant */
+    AST_TRY_CATCH,         /* try { body } catch (e: T) { handler } */
     AST_UNSAFE_BLOCK,
     AST_COMPTIME,
     AST_REF,
@@ -675,6 +730,63 @@ char *read_source_file(Arena *a, const char *path, size_t *out_len);
  * Type Checker & Semantic Analysis
  * ============================================================ */
 
+/* ============================================================
+ * L9: Bidirectional Type Inference
+ *
+ * Each function body is its own unification scope. Synthesis (up)
+ * deduces an expression's type from the inside-out (operators,
+ * literals, callee return types). Checking (down) compares a
+ * synthesised type against an expected type and either succeeds,
+ * applies a coercion (int -> float), or raises a unification failure.
+ *
+ * Type variables (LCN_TYPE_VAR) are reserved for unresolved sites --
+ * every `let` whose RHS cannot be synthesised yields a fresh var, and
+ * the unification table later collapses it (or surfaces a "cannot
+ * unify A and B" diagnostic). Function boundaries (params + return)
+ * must still carry explicit annotations so the wasm/WIT signature
+ * stays stable -- they never become vars.
+ * ============================================================ */
+
+typedef enum {
+    LCN_LIT_NONE = 0,    /* unknown / not yet inferred */
+    LCN_LIT_UNIT,        /* () */
+    LCN_LIT_INT,
+    LCN_LIT_FLOAT,
+    LCN_LIT_BOOL,
+    LCN_LIT_STRING,
+    LCN_LIT_OPAQUE       /* user-defined / non-primitive (struct, enum, Result, ...) */
+} LcnLitKind;
+
+typedef enum {
+    LCN_TYPE_LIT,        /* concrete primitive */
+    LCN_TYPE_VAR,        /* unresolved unification variable */
+    LCN_TYPE_FUNC        /* params + return -- recorded for callee lookups */
+} LcnTypeKind;
+
+typedef struct LcnType LcnType;
+struct LcnType {
+    LcnTypeKind  kind;
+    LcnLitKind   lit;             /* LCN_TYPE_LIT */
+    const char  *opaque_name;     /* LCN_TYPE_LIT(OPAQUE) / LCN_TYPE_FUNC */
+    int          var_id;          /* LCN_TYPE_VAR */
+    LcnType     *func_ret;        /* LCN_TYPE_FUNC */
+};
+
+#define LCN_INFER_MAX_VARS 1024
+
+typedef struct {
+    LcnType *bindings[LCN_INFER_MAX_VARS];
+    int      count;
+    Arena   *arena;
+} LcnUnifyTable;
+
+LcnUnifyTable lcn_unify_table_new(Arena *arena);
+LcnType      *lcn_type_fresh_var(LcnUnifyTable *tbl);
+LcnType      *lcn_type_lit(Arena *arena, LcnLitKind lit);
+LcnType      *lcn_type_resolve(LcnUnifyTable *tbl, LcnType *t);
+bool          lcn_unify(LcnUnifyTable *tbl, LcnType *a, LcnType *b);
+const char   *lcn_type_to_string(LcnUnifyTable *tbl, Arena *arena, LcnType *t);
+
 /* Run all type-checking passes on a parsed program.
  * Returns true if no errors were found. */
 bool typecheck_program(AstNode *program, ErrorReporter *reporter, Arena *arena);
@@ -688,21 +800,24 @@ typedef enum {
     LCN_ARCH_UNKNOWN = 0,
     LCN_ARCH_X86_64,
     LCN_ARCH_AARCH64,
-    LCN_ARCH_ARM
+    LCN_ARCH_ARM,
+    LCN_ARCH_WASM32   /* WebAssembly 32-bit (multi-tenant SaaS target) */
 } LcnArch;
 
 typedef enum {
     LCN_OS_UNKNOWN = 0,
     LCN_OS_LINUX,
     LCN_OS_DARWIN,
-    LCN_OS_WINDOWS
+    LCN_OS_WINDOWS,
+    LCN_OS_WASI       /* WebAssembly System Interface (preview2 / wasip2) */
 } LcnOS;
 
 typedef enum {
     LCN_ABI_NONE = 0,
     LCN_ABI_GNU,
     LCN_ABI_MUSL,
-    LCN_ABI_MSVC
+    LCN_ABI_MSVC,
+    LCN_ABI_PREVIEW2  /* WASI preview 2 with Component Model */
 } LcnABI;
 
 typedef struct {
@@ -779,5 +894,15 @@ char       *lsp_read_message(void);
 void         lsp_send_message(const char *json);
 const char  *lsp_json_get_string(const char *json, const char *key, char *buf, size_t bufsz);
 long         lsp_json_get_int(const char *json, const char *key);
+
+/* L10 test entry points: drive the LSP request handlers against an
+ * in-memory source string and return the textual payload that would
+ * have been sent over the wire. Used by test/test_lsp.c. */
+int lsp_test_diagnostics_for_source(const char *uri, const char *source,
+                                     char *out, size_t out_sz);
+int lsp_test_hover_for_source(const char *source, long line, long col,
+                               char *out, size_t out_sz);
+int lsp_test_completion_for_source(const char *source, long line, long character,
+                                    char *out, size_t out_sz);
 
 #endif /* LCN_H */

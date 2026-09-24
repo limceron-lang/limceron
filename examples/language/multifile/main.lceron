@@ -1,0 +1,28 @@
+// multifile/main.lceron — L8 fixture: real cross-file `use` import.
+//
+// Demonstrates the L8 module system landed 2026-05-13:
+//
+//   * `use helpers;` resolves `helpers.lceron` relative to this file's
+//     directory. The loader merges helpers.lceron's public fns into the
+//     same compilation unit and tags each with the `helpers` module stem
+//     so their C / WASM symbols mangle to `lcn___helpers_<fn>`.
+//   * `helpers.greet(name)` parses as AST_METHOD_CALL (left=ident
+//     `helpers`, name=`greet`) and routes to that mangled symbol at
+//     codegen time. No inter-module wasm import is emitted — all merged
+//     fns share the single output translation unit.
+//
+// The historical placeholder (single-file with `agent Demo`) lived here
+// until L8 shipped; promoted now per ROADMAP.md §L8.
+
+use helpers;
+
+fn build_label(prefix: string, name: string) -> string {
+    // Cross-module direct call. `helpers` is the module stem (basename
+    // of helpers.lceron) and `greet` is its public fn. The C and WASM
+    // back-ends both resolve this to `lcn___helpers_greet(...)`.
+    helpers.greet(name)
+}
+
+fn main() {
+    let _ = build_label("hi", "world")
+}

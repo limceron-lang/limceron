@@ -1,0 +1,30 @@
+// 02_array.lceron — WASM PoC sample: JSON array length + index + int_value
+//
+// Parses the array literal "[1,2,3]" and extracts the second element via
+// `json.array_index`, then converts it from a JSON int handle to a real
+// Limceron i64 via `json.int_value`. The wider point: array traversal
+// composes cleanly with the handle-passing protocol — every sub-handle
+// returned by `json.array_index` is itself a first-class JsonRef.
+//
+// Expected return value (with the host module wired): 2.
+//
+// We also exercise `json.length` to demonstrate it returns the right
+// arity (3 for "[1,2,3]") — the value isn't returned, but the call site
+// is emitted in the generated WAT and visible in IR tests.
+//
+// Until Visual-DAG ships the `vdag:json` host module, the produced
+// .wasm will fail at wazero linking.
+
+agent JsonArray {
+    capabilities: [json.parse, json.length, json.array_index, json.int_value]
+    budget: { max_tokens: 0, max_cost: 0.0 }
+
+    // Returns the second element of [1,2,3], which is 2.
+    fn main() -> int {
+        let handle = json.parse("[1,2,3]")
+        let n = json.length(handle)
+        let second = json.array_index(handle, 1)
+        let _unused = n
+        json.int_value(second)
+    }
+}

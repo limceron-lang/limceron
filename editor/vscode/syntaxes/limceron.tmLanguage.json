@@ -1,0 +1,150 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Limceron",
+  "scopeName": "source.limceron",
+  "fileTypes": ["lceron", "lceron.md"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#agent-keywords" },
+    { "include": "#types" },
+    { "include": "#enum-variants" },
+    { "include": "#host-call" },
+    { "include": "#function-call" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.limceron",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.limceron",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.limceron",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.limceron",
+              "match": "\\\\(n|r|t|\\\\|\"|0|x[0-9A-Fa-f]{2})"
+            },
+            {
+              "name": "meta.interpolation.limceron",
+              "begin": "\\$\\{",
+              "end": "\\}",
+              "patterns": [
+                { "include": "#identifiers" },
+                { "include": "#numbers" },
+                { "include": "#strings" }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.limceron",
+          "match": "'(\\\\.|[^'])'"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.limceron",
+          "match": "\\b\\d+\\.\\d+([eE][+-]?\\d+)?\\b"
+        },
+        {
+          "name": "constant.numeric.hex.limceron",
+          "match": "\\b0x[0-9A-Fa-f_]+\\b"
+        },
+        {
+          "name": "constant.numeric.binary.limceron",
+          "match": "\\b0b[01_]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.limceron",
+          "match": "\\b\\d[\\d_]*\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.limceron",
+          "match": "\\b(if|else|match|for|while|loop|break|continue|return|spawn|await|select|defer|in|as|is)\\b"
+        },
+        {
+          "name": "keyword.declaration.limceron",
+          "match": "\\b(fn|let|mut|const|struct|enum|trait|impl|interface|mod|use|pub|priv|type|chan|unsafe|comptime)\\b"
+        },
+        {
+          "name": "constant.language.limceron",
+          "match": "\\b(true|false|none)\\b"
+        }
+      ]
+    },
+    "agent-keywords": {
+      "patterns": [
+        {
+          "name": "keyword.other.agent.limceron",
+          "match": "\\b(agent|guard|capability|taint|budget|tool|skill|prompt|supervisor|mesh|memory|ask|tell|ensure|invariant|guardset|requires|otherwise|showing|timeout|choices|repeat|times|wait|until|each|keep|where|secret|about|channel|router|route|strategy|allow|deny)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.builtin.limceron",
+          "match": "\\b(int|i8|i16|i32|i64|u8|u16|u32|u64|s64|s32|f32|f64|float|bool|string|char|unit|void|byte|bytes)\\b"
+        },
+        {
+          "name": "entity.name.type.limceron",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "enum-variants": {
+      "patterns": [
+        {
+          "name": "constant.other.enum-variant.limceron",
+          "match": "\\b([A-Z][A-Za-z0-9_]*|[a-z][a-z_-]*)::([A-Z][A-Za-z0-9_]*|[a-z][a-z_-]*)"
+        }
+      ]
+    },
+    "host-call": {
+      "patterns": [
+        {
+          "name": "support.function.host.limceron",
+          "match": "\\b(llm|json|http|mcp|log|time|math|string|file|env)\\.[a-z_][a-z0-9_]*"
+        }
+      ]
+    },
+    "function-call": {
+      "patterns": [
+        {
+          "name": "entity.name.function.limceron",
+          "match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=\\()"
+        }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "name": "variable.other.limceron",
+          "match": "\\b[a-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    }
+  }
+}

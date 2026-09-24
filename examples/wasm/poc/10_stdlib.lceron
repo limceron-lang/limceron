@@ -1,0 +1,54 @@
+// 10_stdlib.lceron -- L7 sample: stdlib minimum (math + string + time).
+//
+// Exercises the three new stdlib namespaces in a single small
+// workflow:
+//
+//   1. `time.now()` reads the host wall-clock (Unix epoch seconds).
+//   2. `math.clamp(secs, 0, 60)` is the pure-Limceron integer helper
+//      defined in stdlib/math.lceron. It lowers inline (no host
+//      call) because the front-end intercepts the `math.<int verb>`
+//      family at IR-gen.
+//   3. `string.contains(label, "alert")` lowers to a host call via
+//      `vdag:string` and returns 0/1 -- we treat any "alert" in the
+//      classifier output as an escalation signal.
+//
+// Verdict mapping (return value):
+//
+//   2 = ESCALATE         (label contains "alert")
+//   1 = PROCEED          (no alert, freshness in tolerance)
+//   0 = ABORT            (freshness out of bucket, no useful signal)
+//   <0 = HostErr* propagated upward via `?`
+
+agent stdlib_demo {
+    capabilities: [llm.classify]
+    budget: { max_tokens: 200, max_cost: 0.02 }
+
+    fn freshness_bucket() -> int {
+        // time.now() returns Unix epoch seconds. We clamp into a
+        // 0..60-second bucket as a stand-in for a real freshness
+        // window the operator would compare against `last_seen`.
+        let secs = time.now()
+        math.clamp(secs, 0, 60)
+    }
+
+    fn label_is_alert(label: string) -> bool {
+        // Host-backed string predicate. Returns 0/1; the front-end
+        // treats the i64 -> bool coercion at the if-condition site.
+        string.contains(label, "alert")
+    }
+
+    fn main() -> int {
+        let label_len = llm.classify("stdlib-demo-prompt")?
+        let bucket    = freshness_bucket()
+
+        if label_is_alert("alert: stdlib-demo") {
+            2
+        } else {
+            if bucket > 0 {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}

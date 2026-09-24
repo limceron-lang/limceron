@@ -1,0 +1,52 @@
+// 12_multifile.lceron — L8 WASM PoC: cross-file `use` import in an agent.
+//
+// Shape:
+//
+//   12_multifile.lceron        (this file, the entry point)
+//   └─ use multifile_lib       (sibling helper that formats the prompt)
+//
+// The loader merges multifile_lib.lceron's public fns into the same
+// compilation unit, tags them with the `multifile_lib` module stem,
+// and emits the wasm function `lcn___multifile_lib_format_prompt`.
+// The agent's main() calls `multifile_lib.format_prompt(role, ctx)`
+// to massage the prompt before dispatching it through `llm.classify`.
+//
+// No inter-module wasm imports are emitted -- every merged fn lives in
+// the same .wasm. Only the per-capability `(import "vdag:llm" ...)`
+// declarations from the host-call surface remain, exactly as the
+// single-file 05_host_call.lceron sample uses them.
+//
+// L8 naming note: `use multifile_lib;` (no leading digit) — the
+// historical poc-numbered sidecar lives in `multifile_lib.lceron`
+// rather than `12_multifile_lib.lceron` because the L8 parser only
+// accepts identifier-shaped paths after `use`. See multifile_lib's
+// header comment for the rationale.
+
+use multifile_lib
+
+agent MultiFileDispatcher {
+    capabilities: [llm.classify]
+    budget: { max_tokens: 200, max_cost: 0.02 }
+
+    // Build the prompt via the sibling module, then hand the result to
+    // the host LLM. `multifile_lib.format_prompt` is the cross-module
+    // call that L8 makes possible; everything downstream (the `?`
+    // propagator, the bucketing) is plain L5 / L6.
+    fn run_with(role: string, ctx: string) -> int {
+        let prompt    = multifile_lib.format_prompt(role, ctx)
+        let label_len = llm.classify(prompt)?
+        if label_len >= 8 {
+            2
+        } else {
+            if label_len >= 3 {
+                1
+            } else {
+                0
+            }
+        }
+    }
+
+    fn main() -> int {
+        run_with("operator", "stage1-classification-target")
+    }
+}

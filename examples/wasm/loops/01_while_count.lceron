@@ -1,0 +1,32 @@
+// 01_while_count.lceron — WASM PoC sample: sum 1..=9 via a while-loop.
+//
+// Limceron stage0 acquired three looping constructs:
+//   while <cond> { body }
+//   for <ident> in <start>..<end> { body }        // half-open
+//   loop { body }                                 // exits via break only
+//
+// This sample uses the most basic form: a counter incremented at the
+// end of the body, checked at the top. The range we sum is 1..=9 (i.e.
+// `i < 10`), which matches `1..10` in for-in form — see 02_for_range.
+//
+// Expected: 1+2+3+4+5+6+7+8+9 = 45.
+//
+// Compile & run:
+//   ./build/limceron-stage0 build --target wasm32-wasi-preview2 \
+//       -o /tmp/loop_01.wasm examples/wasm/loops/01_while_count.lceron
+//   wasmtime --invoke main /tmp/loop_01.wasm    # => 45
+
+agent LoopWhile {
+    capabilities: []
+    budget: { max_tokens: 10, max_cost: 0.01 }
+
+    fn main() -> int {
+        let mut sum = 0
+        let mut i = 1
+        while i < 10 {
+            sum = sum + i
+            i = i + 1
+        }
+        sum
+    }
+}

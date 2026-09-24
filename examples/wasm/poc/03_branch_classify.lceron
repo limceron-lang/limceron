@@ -1,0 +1,21 @@
+// 03_branch_classify.lceron — WASM PoC sample: branching control flow
+//
+// Exercises if-with-explicit-return chain (a common Limceron idiom).
+// Expected to return "B".
+
+agent BranchClassify {
+    capabilities: [data.read]
+    budget: { max_tokens: 100, max_cost: 0.01 }
+
+    fn classify(score: int) -> string {
+        if score >= 90 { return "A" }
+        if score >= 80 { return "B" }
+        if score >= 70 { return "C" }
+        if score >= 60 { return "D" }
+        return "F"
+    }
+
+    fn main() -> string {
+        classify(85)
+    }
+}

@@ -1,0 +1,20 @@
+// multifile/helpers.lceron — sibling module imported by main.lceron via
+// `use helpers;`. All top-level fns are public by default per L8; the
+// explicit `pub fn` form is accepted but not required.
+//
+// At codegen time each fn here picks up the `helpers` module stem (the
+// file's basename) and its symbol mangles to `lcn___helpers_<fn>` so
+// it cannot collide with a same-named fn declared in main.lceron or in
+// some other imported sibling file.
+
+pub fn greet(name: string) -> string {
+    // String interpolation is L4-stable; the result is a plain string
+    // value the caller can pass into further pipeline steps.
+    "hello, ${name}"
+}
+
+fn format_name(first: string, last: string) -> string {
+    // No `pub` keyword — top-level fns default to public in L8, so this
+    // is callable as `helpers.format_name(...)` from any importer.
+    "${first} ${last}"
+}

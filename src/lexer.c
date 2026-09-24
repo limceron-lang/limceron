@@ -193,7 +193,19 @@ static void emit_diagnostic(ErrorReporter *r, SourceLoc loc,
 
     CompileError *e = &r->errors[r->count++];
     e->loc = loc;
-    e->message = message;
+    /* Copy the message into the per-slot buffer so callers that pass a
+     * stack-allocated buffer (e.g. report_error_fmt's local `buf`) do
+     * not leave us with a dangling pointer once they return. */
+    if (message) {
+        size_t n = strlen(message);
+        if (n >= sizeof(e->message_buf)) n = sizeof(e->message_buf) - 1;
+        memcpy(e->message_buf, message, n);
+        e->message_buf[n] = '\0';
+        e->message = e->message_buf;
+    } else {
+        e->message_buf[0] = '\0';
+        e->message = e->message_buf;
+    }
     e->hint = hint;
     e->is_warning = is_warning;
     e->underline_len = underline_len;
@@ -296,6 +308,7 @@ const char *token_kind_name(TokenKind kind) {
     case TOK_INT_LIT:     return "integer";
     case TOK_FLOAT_LIT:   return "float";
     case TOK_STRING_LIT:  return "string";
+    case TOK_INTERP_STRING: return "interpolated string";
     case TOK_CHAR_LIT:    return "char";
     case TOK_IDENT:       return "identifier";
     case TOK_LET:         return "let";
@@ -439,6 +452,7 @@ bool token_ends_stmt(TokenKind kind) {
     case TOK_INT_LIT:
     case TOK_FLOAT_LIT:
     case TOK_STRING_LIT:
+    case TOK_INTERP_STRING:
     case TOK_CHAR_LIT:
     case TOK_RETURN:
     case TOK_BREAK:
@@ -759,28 +773,161 @@ Token lexer_next_raw(Lexer *l) {
         return tok;
     }
 
-    /* Strings */
+    /* Strings -- including L4 ${expr} interpolation.
+     *
+     * The scanner accumulates the current literal segment into `str_buf`
+     * and, when it spots an unescaped `${`, snapshots that segment as
+     * the next `literals[i]` of an `InterpString` and switches into
+     * expression-text-capture mode until the matching `}`.
+     *
+     * `\$` produces a literal `$` (so authors can write a real dollar
+     * sign immediately before a brace). `\{` keeps producing `{` for
+     * backwards compatibility with the legacy `{name}` interpolation
+     * still in src/codegen.c -- L4 only treats `${` (dollar-then-brace)
+     * as an interpolation site, so `\{` is essentially redundant today
+     * but staying conservative avoids breaking pre-existing tests.
+     *
+     * Nested `${...${...}...}` is rejected at the parser level via the
+     * `nested_detected` flag we set when we see another unescaped `${`
+     * inside an open `${...}` body or inside a string literal nested
+     * therein. */
     if (c == '"') {
         advance(l);
-        /* Process escape sequences into a temporary buffer */
         char str_buf[8192];
         size_t si = 0;
+        InterpString *interp = NULL;  /* lazily allocated on first ${  */
+
         while (l->pos < l->source_len && peek(l) != '"') {
             if (peek(l) == '\\') {
                 advance(l); /* consume backslash */
                 if (l->pos >= l->source_len) break;
                 char esc = peek(l);
                 switch (esc) {
-                case 'n':  str_buf[si++] = '\n'; break;
-                case 't':  str_buf[si++] = '\t'; break;
-                case 'r':  str_buf[si++] = '\r'; break;
-                case '0':  str_buf[si++] = '\0'; break;
-                case '\\': str_buf[si++] = '\\'; break;
-                case '"':  str_buf[si++] = '"';  break;
-                case '{':  str_buf[si++] = '{';  break;  /* escape interpolation */
-                default:   str_buf[si++] = '\\'; str_buf[si++] = esc; break;
+                case 'n':  if (si < sizeof(str_buf) - 1) str_buf[si++] = '\n'; break;
+                case 't':  if (si < sizeof(str_buf) - 1) str_buf[si++] = '\t'; break;
+                case 'r':  if (si < sizeof(str_buf) - 1) str_buf[si++] = '\r'; break;
+                case '0':  if (si < sizeof(str_buf) - 1) str_buf[si++] = '\0'; break;
+                case '\\': if (si < sizeof(str_buf) - 1) str_buf[si++] = '\\'; break;
+                case '"':  if (si < sizeof(str_buf) - 1) str_buf[si++] = '"';  break;
+                case '{':  if (si < sizeof(str_buf) - 1) str_buf[si++] = '{';  break;
+                /* L4: `\$` produces a literal `$` (escape the interp
+                 * sigil). Any `\$` we see here is consumed and emits
+                 * the raw byte. */
+                case '$':  if (si < sizeof(str_buf) - 1) str_buf[si++] = '$';  break;
+                default:
+                    if (si < sizeof(str_buf) - 2) {
+                        str_buf[si++] = '\\';
+                        str_buf[si++] = esc;
+                    }
+                    break;
                 }
                 advance(l);
+            } else if (peek(l) == '$' && peek_next(l) == '{') {
+                /* L4: ${ ... } interpolation site. Flush the current
+                 * literal segment, allocate the InterpString on first
+                 * sighting, then capture the expression source text. */
+                if (interp == NULL) {
+                    interp = (InterpString *)arena_alloc(l->intern->arena,
+                                                          sizeof(InterpString));
+                    memset(interp, 0, sizeof(*interp));
+                }
+                if (interp->count >= LCN_INTERP_MAX_PARTS) {
+                    report_error(l->reporter, tok.loc,
+                        "too many interpolation segments",
+                        "split the string -- v1 caps each literal at 32 ${...} sites");
+                    tok.kind = TOK_ERROR;
+                    return tok;
+                }
+                interp->literals[interp->count] = intern_get(l->intern, str_buf, si);
+                si = 0;
+
+                /* Consume the leading `${`. */
+                SourceLoc expr_loc = { l->filename, l->line, l->column,
+                                       (uint32_t)l->pos };
+                advance(l); /* $ */
+                advance(l); /* { */
+                interp->expr_line[interp->count]   = expr_loc.line;
+                interp->expr_column[interp->count] = expr_loc.column;
+                interp->expr_offset[interp->count] = expr_loc.offset;
+
+                /* Capture the expression source verbatim, tracking
+                 * brace depth so `${foo(bar) + baz}` works. We DON'T
+                 * decode escapes here: the captured text is fed back
+                 * into a fresh sub-lexer, which will apply its own
+                 * lexing rules. */
+                size_t expr_start = l->pos;
+                int depth = 1;
+                bool in_str = false;
+                while (l->pos < l->source_len && depth > 0) {
+                    char ec = peek(l);
+                    if (ec == '\n') {
+                        report_error(l->reporter, expr_loc,
+                            "unterminated `${...}` interpolation",
+                            "`${...}` must close on the same line in v1");
+                        tok.kind = TOK_ERROR;
+                        return tok;
+                    }
+                    if (!in_str) {
+                        if (ec == '"') {
+                            in_str = true;
+                            advance(l);
+                            continue;
+                        }
+                        if (ec == '$' && peek_next(l) == '{') {
+                            /* L4: nested ${ inside the expression body
+                             * -- forbidden in v1. We still consume to
+                             * EOL to keep the literal balanced, so the
+                             * parser sees the flag. */
+                            interp->nested_detected = true;
+                            advance(l); advance(l);
+                            depth++;
+                            continue;
+                        }
+                        if (ec == '{') { depth++; advance(l); continue; }
+                        if (ec == '}') {
+                            depth--;
+                            advance(l);
+                            if (depth == 0) break;
+                            continue;
+                        }
+                        advance(l);
+                    } else {
+                        /* Inside a string literal embedded in the
+                         * expression source. Track escapes so a `"`
+                         * inside `\"` does not close the string, and
+                         * flag `${` nesting at this level too. */
+                        if (ec == '\\') {
+                            advance(l);
+                            if (l->pos < l->source_len) advance(l);
+                            continue;
+                        }
+                        if (ec == '"') {
+                            in_str = false;
+                            advance(l);
+                            continue;
+                        }
+                        if (ec == '$' && peek_next(l) == '{') {
+                            interp->nested_detected = true;
+                            advance(l); advance(l);
+                            continue;
+                        }
+                        advance(l);
+                    }
+                }
+                if (depth != 0) {
+                    report_error(l->reporter, expr_loc,
+                        "unterminated `${...}` interpolation",
+                        "add a closing `}`");
+                    tok.kind = TOK_ERROR;
+                    return tok;
+                }
+                /* `l->pos` now points just past the matching `}`. The
+                 * expression text spans [expr_start, l->pos - 1). */
+                size_t expr_end = l->pos - 1;
+                size_t elen = expr_end > expr_start ? expr_end - expr_start : 0;
+                interp->expr_src[interp->count] =
+                    intern_get(l->intern, l->source + expr_start, elen);
+                interp->count++;
             } else if (peek(l) == '\n') {
                 SourceLoc loc = tok.loc;
                 report_error(l->reporter, loc, "unterminated string literal",
@@ -798,8 +945,16 @@ Token lexer_next_raw(Lexer *l) {
             report_error(l->reporter, tok.loc, "unterminated string literal",
                         "add a closing '\"'");
         }
-        tok.kind = TOK_STRING_LIT;
-        tok.value.str_val = intern_get(l->intern, str_buf, si);
+        if (interp == NULL) {
+            /* No ${...} sites -- ordinary string literal. */
+            tok.kind = TOK_STRING_LIT;
+            tok.value.str_val = intern_get(l->intern, str_buf, si);
+        } else {
+            /* Tail literal segment (text after the last `${...}`). */
+            interp->literals[interp->count] = intern_get(l->intern, str_buf, si);
+            tok.kind = TOK_INTERP_STRING;
+            tok.value.interp = interp;
+        }
         tok.len = (uint32_t)(l->pos - (tok.loc.offset));
         return tok;
     }

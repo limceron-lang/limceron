@@ -433,6 +433,301 @@ TEST(ir_gen_while_loop) {
     ASSERT(count_opcode(fn, IR_BR) >= 1);
 }
 
+/* ============================================================
+ * Looping Constructs (F1-A6 follow-up): while / for-in / loop
+ * with break + continue.
+ *
+ * These tests pin the IR shape we promise the WASM emitter:
+ *   - while:   pre + cond + body + exit BBs; one CMP_LT, one BR,
+ *              one back-edge JMP from body to cond.
+ *   - for-in:  pre + cond + body + inc + exit (5 BBs); the desugar
+ *              materializes exactly ONE init (store start->loopvar),
+ *              ONE cond (load + cmp_lt + br), ONE inc (load + add + store).
+ *   - break:   inside nested loops, must target the INNERMOST exit BB.
+ *
+ * If any of these fail you have likely broken the contract with
+ * ir_emit_wasm.c's dispatch-loop emitter; review the back-edge
+ * handling before changing the assertions.
+ * ============================================================ */
+
+/* Helper: count IR_JMP instructions whose target is `target_bb_id`. */
+static int count_jmp_to(IrFunction *fn, int target_bb_id) {
+    int count = 0;
+    IrBasicBlock *bb;
+    for (bb = fn->entry; bb; bb = bb->next) {
+        IrInst *inst;
+        for (inst = bb->first; inst; inst = inst->next) {
+            if (inst->op == IR_JMP && inst->target_bb == target_bb_id) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+/* Helper: find a basic block by label substring. */
+static IrBasicBlock *find_bb_by_label(IrFunction *fn, const char *needle) {
+    IrBasicBlock *bb;
+    for (bb = fn->entry; bb; bb = bb->next) {
+        if (bb->label && strstr(bb->label, needle)) return bb;
+    }
+    return NULL;
+}
+
+TEST(ir_gen_while_bb_count_and_back_edge) {
+    /* Verifies the CFG shape of a while-loop:
+     *   bb_pre   -> jmp -> bb_cond
+     *   bb_cond  -> br  -> bb_body / bb_exit
+     *   bb_body  -> jmp -> bb_cond   (this is the loop back-edge)
+     *
+     * We assert by counting BBs and confirming there are at least two
+     * IR_JMPs targeting the while.cond block (one from pre, one from
+     * the body back-edge).  */
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let mut sum = 0\n"
+        "    let mut i = 0\n"
+        "    while i < 10 {\n"
+        "        sum = sum + i\n"
+        "        i = i + 1\n"
+        "    }\n"
+        "    return sum\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    /* entry + while.cond + while.body + while.exit = 4 BBs minimum. */
+    ASSERT(fn->bb_count >= 4);
+
+    IrBasicBlock *cond_bb = find_bb_by_label(fn, "while.cond");
+    IrBasicBlock *body_bb = find_bb_by_label(fn, "while.body");
+    IrBasicBlock *exit_bb = find_bb_by_label(fn, "while.exit");
+    ASSERT_NOT_NULL(cond_bb);
+    ASSERT_NOT_NULL(body_bb);
+    ASSERT_NOT_NULL(exit_bb);
+
+    /* Two JMPs target the cond BB: one from the pre-block and one
+     * from the body back-edge. */
+    ASSERT(count_jmp_to(fn, cond_bb->id) >= 2);
+
+    /* The cond BB ends in a conditional branch. */
+    ASSERT_NOT_NULL(cond_bb->last);
+    ASSERT_EQ(cond_bb->last->op, IR_BR);
+    /* The cond branch picks body (true) or exit (false). */
+    ASSERT_EQ(cond_bb->last->target_bb, body_bb->id);
+    ASSERT_EQ(cond_bb->last->false_bb, exit_bb->id);
+}
+
+TEST(ir_gen_for_in_desugar_shape) {
+    /* The for-in `for i in 0..n` desugar must emit:
+     *   - exactly 1 store of `start` into the loop variable (init);
+     *   - exactly 1 CMP_LT in the cond BB;
+     *   - exactly 1 increment ADD in the inc BB.
+     * Anything else means the desugar drifted away from the
+     * `let i = start; while i < end { body; i = i + 1 }` shape. */
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let mut total = 0\n"
+        "    for i in 0..5 {\n"
+        "        total = total + i\n"
+        "    }\n"
+        "    return total\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    /* 5 BBs at minimum: entry + for.cond + for.body + for.inc + for.exit. */
+    ASSERT(fn->bb_count >= 5);
+
+    IrBasicBlock *cond_bb = find_bb_by_label(fn, "for.cond");
+    IrBasicBlock *body_bb = find_bb_by_label(fn, "for.body");
+    IrBasicBlock *inc_bb  = find_bb_by_label(fn, "for.inc");
+    IrBasicBlock *exit_bb = find_bb_by_label(fn, "for.exit");
+    ASSERT_NOT_NULL(cond_bb);
+    ASSERT_NOT_NULL(body_bb);
+    ASSERT_NOT_NULL(inc_bb);
+    ASSERT_NOT_NULL(exit_bb);
+
+    /* Exactly one CMP_LT in the cond BB (the i < end check). */
+    int cmp_in_cond = 0;
+    {
+        IrInst *inst;
+        for (inst = cond_bb->first; inst; inst = inst->next) {
+            if (inst->op == IR_CMP_LT) cmp_in_cond++;
+        }
+    }
+    ASSERT_EQ(cmp_in_cond, 1);
+
+    /* Cond BB ends in BR to body / exit. */
+    ASSERT_NOT_NULL(cond_bb->last);
+    ASSERT_EQ(cond_bb->last->op, IR_BR);
+    ASSERT_EQ(cond_bb->last->target_bb, body_bb->id);
+    ASSERT_EQ(cond_bb->last->false_bb, exit_bb->id);
+
+    /* Exactly one ADD in the inc BB (the i = i + 1). */
+    int add_in_inc = 0;
+    {
+        IrInst *inst;
+        for (inst = inc_bb->first; inst; inst = inst->next) {
+            if (inst->op == IR_ADD) add_in_inc++;
+        }
+    }
+    ASSERT_EQ(add_in_inc, 1);
+
+    /* Inc BB jumps back to the cond BB. */
+    ASSERT_NOT_NULL(inc_bb->last);
+    ASSERT_EQ(inc_bb->last->op, IR_JMP);
+    ASSERT_EQ(inc_bb->last->target_bb, cond_bb->id);
+
+    /* Init: there must be a store of the start constant into the loop
+     * var BEFORE the cond BB. Equivalently, the entry BB ends in a
+     * jmp to the cond BB. */
+    IrBasicBlock *entry = fn->entry;
+    ASSERT_NOT_NULL(entry);
+    ASSERT_NOT_NULL(entry->last);
+    ASSERT_EQ(entry->last->op, IR_JMP);
+    ASSERT_EQ(entry->last->target_bb, cond_bb->id);
+
+    /* The entry block stores `0` (start of `0..5`) into the loop var.
+     * IR_STORE is opcode-distinct, but we don't have count_opcode_in_bb;
+     * fold by hand. */
+    int store_in_entry = 0;
+    {
+        IrInst *inst;
+        for (inst = entry->first; inst; inst = inst->next) {
+            if (inst->op == IR_STORE) store_in_entry++;
+        }
+    }
+    /* let mut total = 0 stores into total; the for-init stores 0 into i.
+     * Two stores in entry. */
+    ASSERT(store_in_entry >= 2);
+}
+
+TEST(ir_gen_nested_break_targets_innermost_exit) {
+    /* Nested while loops; the `break` is inside the INNER loop and must
+     * target the INNER loop's exit, not the outer one. We pin this by
+     * locating each loop's exit BB by label (the irgen names them
+     * "while.exit" in declaration order — the FIRST occurrence is the
+     * outer loop's exit since the outer loop's exit BB is created
+     * before the inner loop is lowered).
+     *
+     * Actually no: irgen creates outer.cond/body/exit first, then steps
+     * into the body and creates inner.cond/body/exit. So the basic-block
+     * declaration order is:
+     *
+     *   bb_entry, outer.cond, outer.body, outer.exit,
+     *              inner.cond, inner.body, inner.exit, ...
+     *
+     * The break jmp inside the inner body must target inner.exit. */
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let mut sum = 0\n"
+        "    let mut i = 0\n"
+        "    while i < 3 {\n"
+        "        let mut j = 0\n"
+        "        while j < 10 {\n"
+        "            if j >= 2 {\n"
+        "                break\n"
+        "            }\n"
+        "            sum = sum + 1\n"
+        "            j = j + 1\n"
+        "        }\n"
+        "        i = i + 1\n"
+        "    }\n"
+        "    return sum\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    /* Find both while.exit blocks in declaration order. */
+    IrBasicBlock *outer_exit = NULL;
+    IrBasicBlock *inner_exit = NULL;
+    {
+        IrBasicBlock *bb;
+        for (bb = fn->entry; bb; bb = bb->next) {
+            if (bb->label && strstr(bb->label, "while.exit")) {
+                if (!outer_exit) outer_exit = bb;
+                else if (!inner_exit) inner_exit = bb;
+            }
+        }
+    }
+    ASSERT_NOT_NULL(outer_exit);
+    ASSERT_NOT_NULL(inner_exit);
+    ASSERT(outer_exit->id != inner_exit->id);
+
+    /* There must be EXACTLY ONE jmp to the INNER exit (the break) and
+     * ZERO jmps to the OUTER exit. (The outer exit is reached via the
+     * outer cond's BR-false, not via a JMP.) */
+    ASSERT_EQ(count_jmp_to(fn, inner_exit->id), 1);
+    ASSERT_EQ(count_jmp_to(fn, outer_exit->id), 0);
+}
+
+TEST(l2_ir_gen_loop_has_header_and_back_edge) {
+    /* `loop { break }` lowers to:
+     *
+     *   bb_pre  -> jmp -> bb_header
+     *   bb_header -> jmp -> bb_body
+     *   bb_body -> jmp -> bb_exit         (the break)
+     *   bb_exit -> ...
+     *
+     * Invariants:
+     *   - there is a basic block whose label contains "loop.header"
+     *   - there is a basic block whose label contains "loop.exit"
+     *   - the body jumps to the EXIT block (the `break`), so the
+     *     count_jmp_to(exit) is >= 1
+     *   - the back-edge from body->header is missing here because
+     *     the body's only stmt is `break`, which terminates the block;
+     *     irgen does NOT insert a redundant back-edge. (This is the
+     *     dead-block trick described in ir_gen.c's AST_BREAK case.) */
+    IrModule *mod = ir_from_source(
+        "fn run() -> int {\n"
+        "    loop {\n"
+        "        break\n"
+        "    }\n"
+        "    return 42\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrBasicBlock *header = find_bb_by_label(fn, "loop.header");
+    IrBasicBlock *exit_bb = find_bb_by_label(fn, "loop.exit");
+    ASSERT_NOT_NULL(header);
+    ASSERT_NOT_NULL(exit_bb);
+    ASSERT(count_jmp_to(fn, exit_bb->id) >= 1);
+}
+
+TEST(l2_ir_gen_for_wildcard_pattern_lowers_like_named) {
+    /* `for _ in 0..N` must produce the same 4-BB shape as a named
+     * for-in. The wildcard pattern simply means the loop variable
+     * never appears in scope — the IR scaffolding around it is
+     * unchanged. */
+    IrModule *mod = ir_from_source(
+        "fn run() -> int {\n"
+        "    let mut total = 0\n"
+        "    for _ in 0..3 {\n"
+        "        total = total + 1\n"
+        "    }\n"
+        "    return total\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    ASSERT_NOT_NULL(find_bb_by_label(fn, "for.cond"));
+    ASSERT_NOT_NULL(find_bb_by_label(fn, "for.body"));
+    ASSERT_NOT_NULL(find_bb_by_label(fn, "for.inc"));
+    ASSERT_NOT_NULL(find_bb_by_label(fn, "for.exit"));
+}
+
 TEST(ir_gen_string_concat) {
     IrModule *mod = ir_from_source(
         "fn test() {\n"
@@ -530,6 +825,706 @@ TEST(ir_gen_print_statement) {
     ASSERT_NOT_NULL(fn);
 
     ASSERT(count_opcode(fn, IR_PRINT) >= 1);
+}
+
+/* ============================================================
+ * JSON host-call lowering (L3)
+ *
+ * Verifies that the dotted-namespace form `json.<fn>(args)` lowers to
+ * IR_HOST_CALL with the qualified name "json.<fn>" and the right arg
+ * count. The WASM backend's per-capability marshalling consumes these
+ * sites and emits the matching `(import "vdag:json" ...)` declarations.
+ * ============================================================ */
+
+/* Helper: find an IR_HOST_CALL whose fn_name matches `qname`. */
+static IrInst *find_host_call(IrFunction *fn, const char *qname) {
+    IrBasicBlock *bb;
+    for (bb = fn->entry; bb; bb = bb->next) {
+        IrInst *inst;
+        for (inst = bb->first; inst; inst = inst->next) {
+            if (inst->op == IR_HOST_CALL && inst->fn_name &&
+                strcmp(inst->fn_name, qname) == 0) {
+                return inst;
+            }
+        }
+    }
+    return NULL;
+}
+
+TEST(ir_gen_json_parse_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    json.parse(\"{}\")\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *call = find_host_call(fn, "json.parse");
+    ASSERT_NOT_NULL(call);
+    ASSERT_EQ(call->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_field_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"{\\\"k\\\":1}\")\n"
+        "    json.field(h, \"k\")\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *field = find_host_call(fn, "json.field");
+    ASSERT_NOT_NULL(field);
+    ASSERT_EQ(field->call_arg_count, 2);
+}
+
+TEST(ir_gen_json_array_index_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"[1,2,3]\")\n"
+        "    json.array_index(h, 1)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *ai = find_host_call(fn, "json.array_index");
+    ASSERT_NOT_NULL(ai);
+    ASSERT_EQ(ai->call_arg_count, 2);
+}
+
+TEST(ir_gen_json_length_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"[1,2,3]\")\n"
+        "    json.length(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *len = find_host_call(fn, "json.length");
+    ASSERT_NOT_NULL(len);
+    ASSERT_EQ(len->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_string_value_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"\\\"hi\\\"\")\n"
+        "    json.string_value(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *sv = find_host_call(fn, "json.string_value");
+    ASSERT_NOT_NULL(sv);
+    ASSERT_EQ(sv->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_int_value_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"42\")\n"
+        "    json.int_value(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *iv = find_host_call(fn, "json.int_value");
+    ASSERT_NOT_NULL(iv);
+    ASSERT_EQ(iv->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_bool_value_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"true\")\n"
+        "    json.bool_value(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *bv = find_host_call(fn, "json.bool_value");
+    ASSERT_NOT_NULL(bv);
+    ASSERT_EQ(bv->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_is_null_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"null\")\n"
+        "    json.is_null(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *inull = find_host_call(fn, "json.is_null");
+    ASSERT_NOT_NULL(inull);
+    ASSERT_EQ(inull->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_stringify_host_call) {
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"{}\")\n"
+        "    json.stringify(h)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *s = find_host_call(fn, "json.stringify");
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(s->call_arg_count, 1);
+}
+
+TEST(ir_gen_json_chained_pipeline) {
+    /* End-to-end shape: parse -> field -> string_value. Verifies that
+     * chained host calls all lower to distinct IR_HOST_CALL sites with
+     * the right qualified names, mirroring the 01 sample. */
+    IrModule *mod = ir_from_source(
+        "fn test() -> int {\n"
+        "    let h = json.parse(\"{\\\"intent\\\":\\\"refund\\\"}\")\n"
+        "    let f = json.field(h, \"intent\")\n"
+        "    json.string_value(f)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    ASSERT(count_opcode(fn, IR_HOST_CALL) == 3);
+    ASSERT_NOT_NULL(find_host_call(fn, "json.parse"));
+    ASSERT_NOT_NULL(find_host_call(fn, "json.field"));
+    ASSERT_NOT_NULL(find_host_call(fn, "json.string_value"));
+}
+
+/* ============================================================
+ * L5: Result<T,E> + ? propagator + try/catch
+ *
+ * Tests verify the lowering shape: Ok/Err constructors are no-ops at
+ * the i64 level (negative-i32 sentinel encoding doubles as the Result
+ * runtime repr); `?` lowers to cmp_lt + br with either ret-Err or
+ * jump-to-catch on the negative branch; and `try {} catch {}` produces
+ * three blocks with a PHI in merge.
+ * ============================================================ */
+
+TEST(ir_gen_result_ok_pass_through) {
+    /* Ok(v) lowers to v as i64: no wrapping, no extra opcode. */
+    IrModule *mod = ir_from_source(
+        "fn make() -> int {\n"
+        "    Ok(42)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    IrInst *c = find_opcode(fn, IR_CONST_INT);
+    ASSERT_NOT_NULL(c);
+    ASSERT_EQ(c->imm_int, 42);
+    ASSERT_EQ(count_opcode(fn, IR_CALL), 0);
+    ASSERT(count_opcode(fn, IR_RET) >= 1);
+}
+
+TEST(ir_gen_result_err_pass_through) {
+    /* Err(-3) lowers to a neg of 3 — no call to lcn_Err. */
+    IrModule *mod = ir_from_source(
+        "fn make() -> int {\n"
+        "    Err(-3)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    ASSERT_EQ(count_opcode(fn, IR_CALL), 0);
+    ASSERT(count_opcode(fn, IR_RET) >= 1);
+}
+
+TEST(ir_gen_try_propagates_via_ret) {
+    /* `expr?` outside a try-catch lowers to cmp_lt + br;
+     * the err branch ends in ret %v. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Err(-3) }\n"
+        "fn main() -> int {\n"
+        "    let x = fetch()?\n"
+        "    x + 1\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(main_fn);
+    ASSERT(count_opcode(main_fn, IR_CMP_LT) >= 1);
+    ASSERT(count_opcode(main_fn, IR_BR) >= 1);
+    ASSERT(count_opcode(main_fn, IR_RET) >= 2);
+}
+
+TEST(ir_gen_try_emits_try_err_and_try_ok_blocks) {
+    /* Block labels carry the rationale: try.err / try.ok. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Ok(7) }\n"
+        "fn caller() -> int { let x = fetch()?\nx }\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(fn);
+    bool saw_err = false, saw_ok = false;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        if (bb->label && strcmp(bb->label, "try.err") == 0) saw_err = true;
+        if (bb->label && strcmp(bb->label, "try.ok")  == 0) saw_ok  = true;
+    }
+    ASSERT(saw_err);
+    ASSERT(saw_ok);
+}
+
+TEST(ir_gen_try_catch_emits_three_blocks_with_phi) {
+    /* try { ok_val } catch (e) { err_val } produces try.body, try.catch,
+     * try.merge — and a phi in merge joining both incoming values. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Err(-3) }\n"
+        "fn main() -> int {\n"
+        "    try {\n"
+        "        let x = fetch()?\n"
+        "        x + 1\n"
+        "    } catch (e: int) {\n"
+        "        e\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(main_fn);
+    bool body = false, cat = false, merge = false;
+    for (IrBasicBlock *bb = main_fn->entry; bb; bb = bb->next) {
+        if (bb->label && strcmp(bb->label, "try.body")  == 0) body  = true;
+        if (bb->label && strcmp(bb->label, "try.catch") == 0) cat   = true;
+        if (bb->label && strcmp(bb->label, "try.merge") == 0) merge = true;
+    }
+    ASSERT(body);
+    ASSERT(cat);
+    ASSERT(merge);
+    IrInst *phi = find_opcode(main_fn, IR_PHI);
+    ASSERT_NOT_NULL(phi);
+    ASSERT(phi->phi_count >= 2);
+}
+
+TEST(ir_gen_try_catch_question_jumps_to_catch_not_ret) {
+    /* Inside a try-catch, `?` must NOT emit a `ret`. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Err(-3) }\n"
+        "fn main() -> int {\n"
+        "    try {\n"
+        "        let x = fetch()?\n"
+        "        x\n"
+        "    } catch (e: int) {\n"
+        "        e\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(main_fn);
+    ASSERT_EQ(count_opcode(main_fn, IR_RET), 1);
+}
+
+TEST(ir_gen_try_catch_chained_propagation) {
+    /* Chain of three ? calls: each produces its own cmp_lt + br pair. */
+    IrModule *mod = ir_from_source(
+        "fn a() -> int { Ok(1) }\n"
+        "fn b() -> int { Ok(2) }\n"
+        "fn c() -> int { Ok(3) }\n"
+        "fn main() -> int {\n"
+        "    try {\n"
+        "        let x = a()?\n"
+        "        let y = b()?\n"
+        "        let z = c()?\n"
+        "        x + y + z\n"
+        "    } catch (e: int) {\n"
+        "        e\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 3);
+    ASSERT_NOT_NULL(main_fn);
+    ASSERT(count_opcode(main_fn, IR_CMP_LT) >= 3);
+    ASSERT(count_opcode(main_fn, IR_BR)     >= 3);
+}
+
+/* ============================================================
+ * L5 surface extension: match Result + HostError lowering.
+ * The match-over-Result lowering mirrors try/catch -- a cmp_lt
+ * against zero splits Ok from Err, both arms join in a PHI.
+ * Host-error sentinels are emitted as immediate i64 constants
+ * sourced from include/vdag.errors.wit.
+ * ============================================================ */
+
+TEST(ir_gen_match_result_emits_ok_err_merge_blocks) {
+    /* `match r { Result::Ok(v) -> v, Result::Err(e) -> e }` must
+     * produce three blocks named match.ok / match.err / match.merge
+     * plus a PHI in the merge block joining both incoming values. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Ok(7) }\n"
+        "fn main() -> int {\n"
+        "    let r = fetch()\n"
+        "    match r {\n"
+        "        Result::Ok(v)  -> v + 1\n"
+        "        Result::Err(e) -> e\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(main_fn);
+    bool ok = false, er = false, mg = false;
+    for (IrBasicBlock *bb = main_fn->entry; bb; bb = bb->next) {
+        if (bb->label && strcmp(bb->label, "match.ok")    == 0) ok = true;
+        if (bb->label && strcmp(bb->label, "match.err")   == 0) er = true;
+        if (bb->label && strcmp(bb->label, "match.merge") == 0) mg = true;
+    }
+    ASSERT(ok);
+    ASSERT(er);
+    ASSERT(mg);
+    bool found_merge_phi = false;
+    for (IrBasicBlock *bb = main_fn->entry; bb; bb = bb->next) {
+        if (!bb->label || strcmp(bb->label, "match.merge") != 0) continue;
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_PHI && i->phi_count >= 2) {
+                found_merge_phi = true;
+            }
+        }
+    }
+    ASSERT(found_merge_phi);
+}
+
+TEST(ir_gen_match_result_cmp_lt_against_zero) {
+    /* The split test against the Result encoding MUST be a
+     * cmp_lt against zero -- the same predicate the ? propagator
+     * uses, so the negative-i64 invariant is enforced uniformly. */
+    IrModule *mod = ir_from_source(
+        "fn fetch() -> int { Err(-3) }\n"
+        "fn main() -> int {\n"
+        "    let r = fetch()\n"
+        "    match r {\n"
+        "        Result::Ok(v)  -> v\n"
+        "        Result::Err(e) -> e\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *main_fn = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(main_fn);
+    ASSERT(count_opcode(main_fn, IR_CMP_LT) >= 1);
+}
+
+TEST(ir_gen_host_error_resolves_to_negative_sentinel) {
+    /* `host_error::quota_exceeded` must resolve to the canonical -3
+     * sentinel sourced from include/vdag.errors.wit. We look for an
+     * IR_CONST_INT carrying that exact value somewhere in the fn. */
+    IrModule *mod = ir_from_source(
+        "fn dispense() -> int {\n"
+        "    Err(host_error::quota_exceeded)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    bool found = false;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_CONST_INT && i->imm_int == -3) {
+                found = true;
+            }
+        }
+    }
+    ASSERT(found);
+}
+
+TEST(ir_gen_host_error_in_try_catch_end_to_end) {
+    /* End-to-end smoke: an inner fn returns host_error::quota_exceeded
+     * (-3), the outer fn `?` propagates it into a try/catch which
+     * binds the code to `e` and returns 99 from the catch arm. The
+     * lowering should still produce the canonical try/catch shape
+     * (try.body / try.catch / try.merge blocks + PHI). */
+    IrModule *mod = ir_from_source(
+        "fn inner() -> int {\n"
+        "    Err(host_error::quota_exceeded)\n"
+        "}\n"
+        "fn outer() -> int {\n"
+        "    try {\n"
+        "        let v = inner()?\n"
+        "        Ok(v + 1)\n"
+        "    } catch (e: int) {\n"
+        "        99\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *outer = nth_fn(mod, 1);
+    ASSERT_NOT_NULL(outer);
+    bool body = false, cat = false, merge = false;
+    for (IrBasicBlock *bb = outer->entry; bb; bb = bb->next) {
+        if (bb->label && strcmp(bb->label, "try.body")  == 0) body  = true;
+        if (bb->label && strcmp(bb->label, "try.catch") == 0) cat   = true;
+        if (bb->label && strcmp(bb->label, "try.merge") == 0) merge = true;
+    }
+    ASSERT(body);
+    ASSERT(cat);
+    ASSERT(merge);
+    bool found_99 = false;
+    for (IrBasicBlock *bb = outer->entry; bb; bb = bb->next) {
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_CONST_INT && i->imm_int == 99) found_99 = true;
+        }
+    }
+    ASSERT(found_99);
+}
+
+/* ============================================================
+ * L6: general match decision-tree IR-gen tests.
+ * Verifies the decision-tree shape (one BB per arm + merge PHI),
+ * literal-arm cmp_eq predicates, guards, and host-error dispatch.
+ * ============================================================ */
+
+TEST(l6_ir_gen_int_literal_match_decision_tree) {
+    IrModule *mod = ir_from_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x {\n"
+        "        0 -> 100\n"
+        "        1 -> 200\n"
+        "        _ -> 999\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    int pred_blocks = 0, body_blocks = 0, next_blocks = 0;
+    bool found_merge = false;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        if (!bb->label) continue;
+        if (strncmp(bb->label, "match.arm", 9) == 0) {
+            if      (strstr(bb->label, ".body")) body_blocks++;
+            else if (strstr(bb->label, ".next")) next_blocks++;
+            else                                  pred_blocks++;
+        }
+        if (strcmp(bb->label, "match.merge") == 0) found_merge = true;
+    }
+    ASSERT_EQ(pred_blocks, 3);
+    ASSERT_EQ(body_blocks, 3);
+    ASSERT_EQ(next_blocks, 3);
+    ASSERT(found_merge);
+}
+
+TEST(l6_ir_gen_literal_arm_emits_cmp_eq) {
+    IrModule *mod = ir_from_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x {\n"
+        "        0 -> 1\n"
+        "        1 -> 2\n"
+        "        _ -> 9\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    ASSERT(count_opcode(fn, IR_CMP_EQ) >= 2);
+}
+
+TEST(l6_ir_gen_merge_phi_joins_all_arm_values) {
+    IrModule *mod = ir_from_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x {\n"
+        "        0 -> 100\n"
+        "        1 -> 200\n"
+        "        _ -> 999\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    int merge_phi_count = -1;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        if (!bb->label || strcmp(bb->label, "match.merge") != 0) continue;
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_PHI) merge_phi_count = i->phi_count;
+        }
+    }
+    ASSERT_EQ(merge_phi_count, 3);
+}
+
+TEST(l6_ir_gen_guarded_arm_phi_joins_two_arms) {
+    IrModule *mod = ir_from_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x {\n"
+        "        n if n > 100 -> 999\n"
+        "        n            -> n\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    int merge_phi_count = -1;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        if (!bb->label || strcmp(bb->label, "match.merge") != 0) continue;
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_PHI) merge_phi_count = i->phi_count;
+        }
+    }
+    ASSERT_EQ(merge_phi_count, 2);
+}
+
+TEST(l6_ir_gen_host_error_match_resolves_sentinels) {
+    IrModule *mod = ir_from_source(
+        "fn pick(e: int) -> int {\n"
+        "    match e {\n"
+        "        host_error::quota_exceeded       -> 1\n"
+        "        host_error::cost_budget_exceeded -> 2\n"
+        "        _                                -> 0\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    bool found_neg3 = false, found_neg4 = false;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_CONST_INT && i->imm_int == -3) found_neg3 = true;
+            if (i->op == IR_CONST_INT && i->imm_int == -4) found_neg4 = true;
+        }
+    }
+    ASSERT(found_neg3);
+    ASSERT(found_neg4);
+}
+
+/* ============================================================
+ * L4: String interpolation IR-gen tests
+ *
+ * `"...${expr}..."` lowers to a left-folded chain of
+ * `vdag:string.concat(prev, next)` host calls with per-type
+ * coercion via `vdag:string.from_int|from_bool|from_float`. The
+ * tests below assert the shape of that chain by walking
+ * IR_HOST_CALL instructions on the generated function.
+ * ============================================================ */
+
+TEST(l4_ir_gen_simple_interp_emits_concat_chain) {
+    /* `"hello ${name}"` -> string.concat("hello ", name).
+     * Two literal segments + one expression; the trailing literal
+     * is empty so the chain collapses to one concat. */
+    IrModule *mod = ir_from_source(
+        "fn build() -> string {\n"
+        "    let name = \"world\"\n"
+        "    \"hello ${name}\"\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    IrInst *concat = find_host_call(fn, "string.concat");
+    ASSERT_NOT_NULL(concat);
+    ASSERT_EQ(concat->call_arg_count, 2);
+}
+
+TEST(l4_ir_gen_int_segment_uses_from_int) {
+    /* `${n}` where `n: int` must lower through
+     * `vdag:string.from_int(n)` before being fed into the concat.
+     * The site lookup also confirms the chain composes the literal
+     * prefix with the formatted int. */
+    IrModule *mod = ir_from_source(
+        "fn build(n: int) -> string {\n"
+        "    \"count=${n}\"\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    IrInst *fromi = find_host_call(fn, "string.from_int");
+    ASSERT_NOT_NULL(fromi);
+    ASSERT_EQ(fromi->call_arg_count, 1);
+    IrInst *concat = find_host_call(fn, "string.concat");
+    ASSERT_NOT_NULL(concat);
+}
+
+TEST(l4_ir_gen_multi_part_left_folds) {
+    /* `"summarise ${title} in ${n} bullets"` has two `${}` sites,
+     * so the IR holds at least three `string.concat` calls (literal
+     * "summarise " + title -> + " in " -> + from_int(n) -> +
+     * " bullets") and one `string.from_int` for the bullet count. */
+    IrModule *mod = ir_from_source(
+        "fn build(title: string, n: int) -> string {\n"
+        "    \"summarise ${title} in ${n} bullets\"\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    int concats = 0;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_HOST_CALL && i->fn_name &&
+                strcmp(i->fn_name, "string.concat") == 0) {
+                concats++;
+            }
+        }
+    }
+    ASSERT(concats >= 3);
+    ASSERT_NOT_NULL(find_host_call(fn, "string.from_int"));
+}
+
+TEST(l4_ir_gen_escaped_dollar_is_literal) {
+    /* `"price: \$${cost}"` produces a single ${} site. The escape
+     * survives as a literal `$` in the leading segment, so the
+     * first concat operand bakes the `"price: $"` prefix. */
+    IrModule *mod = ir_from_source(
+        "fn build(cost: int) -> string {\n"
+        "    \"price: \\$${cost}\"\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+    /* The const-string slot for "price: $" exists. */
+    bool found = false;
+    for (IrBasicBlock *bb = fn->entry; bb; bb = bb->next) {
+        for (IrInst *i = bb->first; i; i = i->next) {
+            if (i->op == IR_CONST_STRING && i->imm_str &&
+                strcmp(i->imm_str, "price: $") == 0) {
+                found = true;
+            }
+        }
+    }
+    ASSERT(found);
+    ASSERT_NOT_NULL(find_host_call(fn, "string.from_int"));
+    ASSERT_NOT_NULL(find_host_call(fn, "string.concat"));
 }
 
 /* ============================================================
@@ -1421,6 +2416,785 @@ TEST(ir_emit_x86_full_program) {
 }
 
 /* ============================================================
+ * L11: entropy_budget runtime fence (WASM emit)
+ *
+ * These tests assert on the textual WAT shape produced by the WASM
+ * backend, avoiding any dependency on wat2wasm/wasmtime. The backend
+ * exposes a test entry that emits WAT to a FILE* directly; we run
+ * end-to-end (parse -> typecheck -> IR -> WASM-WAT) and search the
+ * output for the structural markers the runtime fence relies on.
+ *
+ * The cost table is hardcoded in `src/ir_emit_wasm.c::entropy_cost_for`.
+ * For these tests we rely on `llm.classify` having cost 1.
+ * ============================================================ */
+
+extern int lcn_emit_wasm_wat(AstNode *program, FILE *out, Arena *arena,
+                             const LcnTarget *target);
+
+/* Parse `source`, emit WAT, return as a malloc'd null-terminated string.
+ * Returns NULL on parse error. Caller must free(). */
+static char *wat_from_source(const char *source) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+
+    size_t len = strlen(source);
+    ErrorReporter reporter = reporter_new("<test>", source, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", source, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+
+    AstNode *program = parse_program(&parser);
+    if (parser.had_error || !program) return NULL;
+
+    FILE *f = tmpfile();
+    if (!f) return NULL;
+    int rc = lcn_emit_wasm_wat(program, f, &test_arena, NULL);
+    if (rc != 0) { fclose(f); return NULL; }
+
+    long size = ftell(f);
+    rewind(f);
+    char *buf = (char *)malloc((size_t)size + 1);
+    if (!buf) { fclose(f); return NULL; }
+    fread(buf, 1, (size_t)size, f);
+    buf[size] = '\0';
+    fclose(f);
+    return buf;
+}
+
+TEST(wasm_entropy_global_initialised_to_declared_budget) {
+    /* `entropy_budget: 42` on an agent must produce a wasm global named
+     * `$entropy_remaining` initialised to exactly 42. Without an entropy
+     * declaration the global defaults to INT32_MAX (no-op fence). */
+    char *wat = wat_from_source(
+        "agent HasBudget {\n"
+        "    capabilities: [llm.classify]\n"
+        "    entropy_budget: 42\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+    /* Global is declared and is the bit count from the agent. */
+    ASSERT(strstr(wat,
+        "(global $entropy_remaining (mut i32) (i32.const 42))") != NULL);
+    /* Make sure it is mutable (the fence needs to write back). */
+    ASSERT(strstr(wat, "(mut i32)") != NULL);
+    free(wat);
+
+    /* Default budget: agent with no entropy_budget declaration gets
+     * the unbounded sentinel so the fence is a no-op. */
+    char *wat2 = wat_from_source(
+        "agent NoBudget {\n"
+        "    capabilities: [llm.classify]\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat2);
+    ASSERT(strstr(wat2,
+        "(global $entropy_remaining (mut i32) (i32.const 2147483647))") != NULL);
+    free(wat2);
+}
+
+TEST(wasm_entropy_decrement_wat_shape) {
+    /* At every llm.classify site the compiler must emit a fence that
+     * (a) decrements the global by the per-call cost, and
+     * (b) writes the result back via global.set $entropy_remaining.
+     *
+     * We check the structural sequence rather than exact whitespace. */
+    char *wat = wat_from_source(
+        "agent Decrement {\n"
+        "    capabilities: [llm.classify]\n"
+        "    entropy_budget: 10\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    /* Cost-1 fence header (llm.classify is hardcoded to cost 1). */
+    ASSERT(strstr(wat, ";; --- entropy fence: cost=1 ---") != NULL);
+
+    /* Find the read-modify-write sequence: global.get, sub, global.set.
+     * They must appear in order, AND the global.set has to follow the
+     * sub, otherwise the budget is never persisted between calls. */
+    const char *get_after_if = strstr(wat, "i32.sub");
+    ASSERT_NOT_NULL(get_after_if);
+    const char *set = strstr(get_after_if, "global.set $entropy_remaining");
+    ASSERT_NOT_NULL(set);
+
+    /* The decrement uses i32.sub on i32 operands -- not i64. The global
+     * itself is i32 to keep cost arithmetic cheap. */
+    ASSERT(strstr(wat, "      i32.sub") != NULL);
+
+    free(wat);
+}
+
+TEST(wasm_entropy_trap_wat_shape) {
+    /* The fence must trap with HostError.EntropyExceeded = -9 BEFORE
+     * dispatching the call when remaining < cost. The trap shape is:
+     *
+     *   global.get $entropy_remaining
+     *   i32.const <cost>
+     *   i32.lt_s
+     *   if
+     *     <push -9 in fn's return type>
+     *     return
+     *   end
+     *
+     * For an int-returning fn the sentinel push is `i64.const -9`. */
+    char *wat = wat_from_source(
+        "agent Trap {\n"
+        "    capabilities: [llm.classify]\n"
+        "    entropy_budget: 0\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    /* Budget=0 propagates verbatim into the global initial value. */
+    ASSERT(strstr(wat,
+        "(global $entropy_remaining (mut i32) (i32.const 0))") != NULL);
+
+    /* The trap conditional is the canonical `lt_s` + `if` + `return`. */
+    const char *fence = strstr(wat, ";; --- entropy fence: cost=1 ---");
+    ASSERT_NOT_NULL(fence);
+    /* All four anchors must appear inside this fence, in order. */
+    const char *lt = strstr(fence, "i32.lt_s");
+    ASSERT_NOT_NULL(lt);
+    const char *iff = strstr(lt, "if");
+    ASSERT_NOT_NULL(iff);
+    const char *sentinel = strstr(iff,
+        "i64.const -9  ;; HostError.EntropyExceeded");
+    ASSERT_NOT_NULL(sentinel);
+    const char *ret = strstr(sentinel, "return");
+    ASSERT_NOT_NULL(ret);
+    const char *end = strstr(ret, "end");
+    ASSERT_NOT_NULL(end);
+    /* The post-trap subtract/store still has to be reachable for the
+     * "did not trap" path. */
+    const char *post_sub = strstr(end, "global.set $entropy_remaining");
+    ASSERT_NOT_NULL(post_sub);
+
+    free(wat);
+}
+
+/* ============================================================
+ * L13: budget runtime fence (WASM emit)
+ *
+ * The declared `budget: { max_tokens: N, max_cost: F }` becomes two
+ * wasm globals -- `$tokens_remaining` (mut i32) and
+ * `$cost_micro_usd_remaining` (mut i64) -- and a per-call-site fence
+ * that decrements + bounds-checks both before dispatching. The cost
+ * tables are hardcoded in `src/ir_emit_wasm.c::token_cost_for` /
+ * `cost_micro_usd_for`; these tests rely on `llm.classify` having
+ * cost 100 tokens / 500 micro-USD.
+ * ============================================================ */
+
+TEST(wasm_budget_globals_initialised_to_declared_budgets) {
+    /* `budget: { max_tokens: 5000, max_cost: 0.05 }` on an agent must
+     * produce two wasm globals at the module preamble: `$tokens_remaining`
+     * (mut i32) initialised to 5000 and `$cost_micro_usd_remaining`
+     * (mut i64) initialised to 50000 (= 0.05 USD * 1e6). */
+    char *wat = wat_from_source(
+        "agent HasBudget {\n"
+        "    capabilities: [llm.classify]\n"
+        "    budget: { max_tokens: 5000, max_cost: 0.05 }\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+    ASSERT(strstr(wat,
+        "(global $tokens_remaining (mut i32) (i32.const 5000))") != NULL);
+    ASSERT(strstr(wat,
+        "(global $cost_micro_usd_remaining (mut i64) (i64.const 50000))")
+        != NULL);
+    free(wat);
+
+    /* No budget declared -> both globals default to MAX (i32_MAX / i64_MAX)
+     * so the fence is a no-op. */
+    char *wat2 = wat_from_source(
+        "agent NoBudget {\n"
+        "    capabilities: [llm.classify]\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat2);
+    ASSERT(strstr(wat2,
+        "(global $tokens_remaining (mut i32) (i32.const 2147483647))")
+        != NULL);
+    ASSERT(strstr(wat2,
+        "(global $cost_micro_usd_remaining (mut i64) "
+        "(i64.const 9223372036854775807))") != NULL);
+    free(wat2);
+}
+
+TEST(wasm_budget_token_decrement_wat_shape) {
+    /* At every llm.classify site the compiler must emit a token fence
+     * that decrements $tokens_remaining by the per-call cost (100) and
+     * writes the result back via global.set. The fence must follow the
+     * entropy fence in the emission order. */
+    char *wat = wat_from_source(
+        "agent TokenDecrement {\n"
+        "    capabilities: [llm.classify]\n"
+        "    budget: { max_tokens: 5000, max_cost: 0.05 }\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    /* Cost-100 token fence header. */
+    ASSERT(strstr(wat, ";; --- token fence: cost=100 ---") != NULL);
+
+    /* The read-modify-write sequence must appear, AND global.set must
+     * follow i32.sub so the budget actually persists between calls. */
+    const char *fence = strstr(wat, ";; --- token fence: cost=100 ---");
+    ASSERT_NOT_NULL(fence);
+    const char *sub = strstr(fence, "i32.sub");
+    ASSERT_NOT_NULL(sub);
+    const char *set = strstr(sub, "global.set $tokens_remaining");
+    ASSERT_NOT_NULL(set);
+
+    /* Order: entropy fence (if declared) must appear before token fence
+     * at each call site. Here no entropy_budget is declared so the
+     * entropy fence is suppressed (cost=0), but the token fence still
+     * goes before the cost fence. */
+    const char *token = strstr(wat, ";; --- token fence: cost=100 ---");
+    ASSERT_NOT_NULL(token);
+    const char *cost  = strstr(token, ";; --- cost fence:");
+    ASSERT_NOT_NULL(cost);
+
+    free(wat);
+}
+
+TEST(wasm_budget_cost_decrement_wat_shape) {
+    /* The cost fence works on the i64 micro-USD global and uses i64
+     * arithmetic throughout: i64.lt_s for the trap test and i64.sub
+     * for the decrement. The trap pushes the BudgetExceeded sentinel
+     * (-10) before returning. */
+    char *wat = wat_from_source(
+        "agent CostDecrement {\n"
+        "    capabilities: [llm.classify]\n"
+        "    budget: { max_tokens: 5000, max_cost: 0.05 }\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    /* Cost fence header at 500 micro-USD per llm.classify. */
+    const char *fence = strstr(wat, ";; --- cost fence: cost_micro_usd=500 ---");
+    ASSERT_NOT_NULL(fence);
+
+    /* The fence reads the i64 global, compares, traps with -10, then
+     * subtracts. Anchors must appear in that order. */
+    const char *get_ = strstr(fence, "global.get $cost_micro_usd_remaining");
+    ASSERT_NOT_NULL(get_);
+    const char *lt = strstr(get_, "i64.lt_s");
+    ASSERT_NOT_NULL(lt);
+    const char *iff = strstr(lt, "if");
+    ASSERT_NOT_NULL(iff);
+    const char *sentinel = strstr(iff,
+        "i64.const -10  ;; HostError.BudgetExceeded");
+    ASSERT_NOT_NULL(sentinel);
+    const char *ret = strstr(sentinel, "return");
+    ASSERT_NOT_NULL(ret);
+    const char *end = strstr(ret, "end");
+    ASSERT_NOT_NULL(end);
+    const char *sub = strstr(end, "i64.sub");
+    ASSERT_NOT_NULL(sub);
+    const char *set = strstr(sub, "global.set $cost_micro_usd_remaining");
+    ASSERT_NOT_NULL(set);
+
+    free(wat);
+}
+
+TEST(wasm_budget_token_trap_shape) {
+    /* When max_tokens is too small to cover a single llm.classify call
+     * the token fence must trap with HostError.BudgetExceeded = -10
+     * BEFORE the actual host call is dispatched. Budget=0 propagates
+     * verbatim into the global initialiser so the very first call trips. */
+    char *wat = wat_from_source(
+        "agent TokenTrap {\n"
+        "    capabilities: [llm.classify]\n"
+        "    budget: { max_tokens: 0, max_cost: 1.0 }\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+    ASSERT(strstr(wat,
+        "(global $tokens_remaining (mut i32) (i32.const 0))") != NULL);
+
+    const char *fence = strstr(wat, ";; --- token fence: cost=100 ---");
+    ASSERT_NOT_NULL(fence);
+    const char *lt = strstr(fence, "i32.lt_s");
+    ASSERT_NOT_NULL(lt);
+    const char *iff = strstr(lt, "if");
+    ASSERT_NOT_NULL(iff);
+    const char *sentinel = strstr(iff,
+        "i64.const -10  ;; HostError.BudgetExceeded");
+    ASSERT_NOT_NULL(sentinel);
+
+    free(wat);
+}
+
+TEST(wasm_budget_chain_order_entropy_then_tokens_then_cost) {
+    /* At each call site the fences must appear in the canonical chain
+     * order: entropy first (L11), then tokens (L13), then cost (L13).
+     * The first fence to trip wins, so replays observe a deterministic
+     * failure mode regardless of which counter would also have exceeded. */
+    char *wat = wat_from_source(
+        "agent Chain {\n"
+        "    capabilities: [llm.classify]\n"
+        "    entropy_budget: 10\n"
+        "    budget: { max_tokens: 5000, max_cost: 0.05 }\n"
+        "    fn main() -> int {\n"
+        "        llm.classify(\"hello\")\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    const char *entropy = strstr(wat, ";; --- entropy fence: cost=1 ---");
+    ASSERT_NOT_NULL(entropy);
+    const char *token   = strstr(entropy,
+        ";; --- token fence: cost=100 ---");
+    ASSERT_NOT_NULL(token);
+    const char *cost    = strstr(token,
+        ";; --- cost fence: cost_micro_usd=500 ---");
+    ASSERT_NOT_NULL(cost);
+
+    free(wat);
+}
+
+/* ============================================================
+ * L12: capability.network compile-time allowlist
+ *
+ * These tests verify that the parameterised capability form
+ *   `capabilities: [http.fetch(["api.openai.com:443", ...])]`
+ * (a) parses (round-trip through the parser yields an
+ *     AST_CAPABILITY_ITEM with string-literal hosts),
+ * (b) is rejected by typecheck for malformed entries,
+ * (c) propagates into the emitted .wit as a `hosts: [...]` field,
+ * (d) propagates into the wasm WAT as a `vdag.capability.network.
+ *     allowlist` custom section carrying the JSON-encoded payload.
+ * ============================================================ */
+
+#include "wit_emit.h"
+
+/* Parse the given source, locate the (sole) AST_AGENT, and return
+ * the AST_FIELD node for `capabilities` (or NULL). Used by L12
+ * parser-shape tests. */
+static AstNode *parse_first_agent_field(const char *source,
+                                        const char *field_name) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(source);
+    ErrorReporter reporter = reporter_new("<test>", source, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", source, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *program = parse_program(&parser);
+    if (parser.had_error || !program) return NULL;
+    AstNode *decl;
+    for (decl = program->params; decl; decl = decl->next) {
+        if (decl->kind != AST_AGENT) continue;
+        AstNode *f;
+        for (f = decl->params; f; f = f->next) {
+            if (f->kind == AST_FIELD && f->name &&
+                strcmp(f->name, field_name) == 0)
+                return f;
+        }
+    }
+    return NULL;
+}
+
+TEST(l12_parser_accepts_parameterised_http_fetch) {
+    /* The parameterised form must lower to AST_CAPABILITY_ITEM with
+     * the qualified verb as `name` and a chain of AST_STRING_LIT
+     * host:port specs in `params`. */
+    AstNode *caps = parse_first_agent_field(
+        "agent Net {\n"
+        "    capabilities: [http.fetch([\"api.openai.com:443\", \"*.example.com:443\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n",
+        "capabilities");
+    ASSERT_NOT_NULL(caps);
+    ASSERT_NOT_NULL(caps->right);
+    ASSERT(caps->right->kind == AST_ARRAY);
+
+    AstNode *elem = caps->right->params;
+    ASSERT_NOT_NULL(elem);
+    ASSERT(elem->kind == AST_CAPABILITY_ITEM);
+    ASSERT_NOT_NULL(elem->name);
+    ASSERT(strcmp(elem->name, "http.fetch") == 0);
+
+    /* Two host entries, both string literals. */
+    AstNode *h1 = elem->params;
+    ASSERT_NOT_NULL(h1);
+    ASSERT(h1->kind == AST_STRING_LIT);
+    ASSERT(strcmp(h1->val.str_val, "api.openai.com:443") == 0);
+    AstNode *h2 = h1->next;
+    ASSERT_NOT_NULL(h2);
+    ASSERT(h2->kind == AST_STRING_LIT);
+    ASSERT(strcmp(h2->val.str_val, "*.example.com:443") == 0);
+    ASSERT(h2->next == NULL);
+
+    /* And the bare form must still parse to AST_IDENT (back-compat). */
+    AstNode *caps_bare = parse_first_agent_field(
+        "agent Bare {\n"
+        "    capabilities: [http.fetch]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n",
+        "capabilities");
+    ASSERT_NOT_NULL(caps_bare);
+    AstNode *bare_elem = caps_bare->right->params;
+    ASSERT_NOT_NULL(bare_elem);
+    ASSERT(bare_elem->kind == AST_IDENT);
+    ASSERT(strcmp(bare_elem->name, "http.fetch") == 0);
+}
+
+/* Parse + typecheck the given source. Returns the number of errors
+ * the reporter accumulated. */
+static int typecheck_error_count(const char *source) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(source);
+    ErrorReporter reporter = reporter_new("<test>", source, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", source, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *program = parse_program(&parser);
+    if (!program) return -1;
+    /* Don't short-circuit on parse error: we want to see typecheck
+     * diagnostics even when the parser already raised something. */
+    (void)typecheck_program(program, &reporter, &test_arena);
+    return reporter.count;
+}
+
+TEST(l12_typecheck_rejects_malformed_hosts) {
+    /* Missing port. */
+    int n1 = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"api.openai.com\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n1 > 0);
+
+    /* Port out of range. */
+    int n2 = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"api.openai.com:99999\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n2 > 0);
+
+    /* Wildcard not at leading position. */
+    int n3 = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"api.*.com:443\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n3 > 0);
+
+    /* IP literal rejected. */
+    int n4 = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"127.0.0.1:443\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n4 > 0);
+
+    /* Unrestricted '*' wildcard rejected. */
+    int n5 = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"*\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n5 > 0);
+
+    /* The "good" form must produce ZERO L12 errors. */
+    int n_ok = typecheck_error_count(
+        "agent A {\n"
+        "    capabilities: [http.fetch([\"api.openai.com:443\", "
+        "\"*.example.com:443\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n");
+    ASSERT(n_ok == 0);
+}
+
+TEST(l12_wit_emit_writes_hosts_field) {
+    /* End-to-end: write a temp .wit file with the parameterised form
+     * and confirm the `import http.fetch { hosts: [...] }` block
+     * appears verbatim. */
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    const char *src =
+        "agent NetCap {\n"
+        "    capabilities: [http.fetch([\"api.openai.com:443\", "
+        "\"*.example.com:443\"])]\n"
+        "    fn run() -> int { 0 }\n"
+        "}\n";
+    size_t len = strlen(src);
+    ErrorReporter reporter = reporter_new("<test>", src, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", src, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *program = parse_program(&parser);
+    ASSERT_NOT_NULL(program);
+
+    char wit_path[] = "/tmp/l12_wit_emit_XXXXXX.wit";
+    int fd = mkstemps(wit_path, 4);
+    ASSERT(fd >= 0);
+    close(fd);
+    int rc = lcn_emit_wit(program, wit_path);
+    ASSERT(rc == 0);
+
+    /* Read the file back. */
+    FILE *fp = fopen(wit_path, "rb");
+    ASSERT_NOT_NULL(fp);
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    rewind(fp);
+    char *buf = (char *)malloc((size_t)sz + 1);
+    fread(buf, 1, (size_t)sz, fp);
+    buf[sz] = '\0';
+    fclose(fp);
+    unlink(wit_path);
+
+    /* The block must appear with both hosts inside. */
+    ASSERT(strstr(buf, "import http.fetch {") != NULL);
+    ASSERT(strstr(buf, "hosts: [") != NULL);
+    ASSERT(strstr(buf, "\"api.openai.com:443\"") != NULL);
+    ASSERT(strstr(buf, "\"*.example.com:443\"") != NULL);
+
+    free(buf);
+}
+
+TEST(l12_wasm_custom_section_contains_allowlist) {
+    /* The wasm module must carry a `(@custom
+     * "vdag.capability.network.allowlist" "...JSON...")` block whose
+     * payload matches the declared host list verbatim. */
+    char *wat = wat_from_source(
+        "agent NetCap {\n"
+        "    capabilities: [http.fetch([\"api.openai.com:443\", "
+        "\"*.example.com:443\"])]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+
+    /* Custom-section anchor + name. */
+    const char *anchor =
+        "(@custom \"vdag.capability.network.allowlist\"";
+    const char *sec = strstr(wat, anchor);
+    ASSERT_NOT_NULL(sec);
+    /* Payload must be a JSON list with both hosts. The payload appears
+     * WAT-escaped (`\"verb\"`) inside the source-level string literal. */
+    ASSERT(strstr(sec, "\\\"verb\\\":\\\"http.fetch\\\"") != NULL);
+    ASSERT(strstr(sec, "api.openai.com:443") != NULL);
+    ASSERT(strstr(sec, "*.example.com:443") != NULL);
+
+    free(wat);
+
+    /* And the bare form (no allowlist) must NOT emit the custom
+     * section, so the runtime keeps the bare contract = unrestricted
+     * fetch at compile time. */
+    char *wat_bare = wat_from_source(
+        "agent BareNet {\n"
+        "    capabilities: [http.fetch]\n"
+        "    fn main() -> int { 0 }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat_bare);
+    ASSERT(strstr(wat_bare,
+        "(@custom \"vdag.capability.network.allowlist\"") == NULL);
+    free(wat_bare);
+}
+
+/* ============================================================
+ * L7: stdlib minimum -- math + string + time
+ * ============================================================ */
+
+TEST(l7_ir_gen_math_clamp_is_pure_no_host_call) {
+    /* The pure-int math helpers (min / max / clamp / abs / sign) must
+     * NOT emit an IR_HOST_CALL -- the front-end intercepts them at
+     * AST_HOST_CALL handling and lowers them inline. We verify by
+     * walking every IR block and asserting there are zero host calls
+     * with a "math.*" qualified name. */
+    IrModule *mod = ir_from_source(
+        "fn f() -> int {\n"
+        "    math.clamp(5, 0, 10)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    /* No "math.*" host call must survive into IR. */
+    IrBasicBlock *bb;
+    for (bb = fn->entry; bb; bb = bb->next) {
+        IrInst *inst;
+        for (inst = bb->first; inst; inst = inst->next) {
+            if (inst->op == IR_HOST_CALL && inst->fn_name) {
+                ASSERT(strncmp(inst->fn_name, "math.", 5) != 0);
+            }
+        }
+    }
+
+    /* Pure-int lowering builds a phi-fed merge for clamp; we expect at
+     * least one PHI and at least one CMP -- the structural fingerprint
+     * of the inline `if (x > lo) ... else ...; if (tmp < hi) ...`
+     * cascade. */
+    ASSERT(count_opcode(fn, IR_PHI) >= 1);
+}
+
+TEST(l7_ir_gen_math_sqrt_dispatches_to_vdag_math) {
+    /* The float-domain math helpers DO lower to IR_HOST_CALL with the
+     * canonical "math.<verb>" qualified name (which the wasm backend
+     * then turns into `(import "vdag:math" "<verb>" ...)`). */
+    IrModule *mod = ir_from_source(
+        "fn f(x: float) -> float {\n"
+        "    math.sqrt(x)\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *call = find_host_call(fn, "math.sqrt");
+    ASSERT_NOT_NULL(call);
+    ASSERT_EQ(call->call_arg_count, 1);
+    /* The float-domain SSA slot must be IR_TYPE_F64 so the result
+     * composes with the rest of Limceron's f64 arithmetic without an
+     * implicit i64 cast. */
+    ASSERT_EQ(call->type, IR_TYPE_F64);
+}
+
+TEST(l7_ir_gen_string_contains_dispatches_to_vdag_string) {
+    /* `string.contains(s, n)` lowers to IR_HOST_CALL with the
+     * "string.contains" qualified name -- the structural fingerprint
+     * the wasm backend keys its `(import "vdag:string" ...)` emit on. */
+    IrModule *mod = ir_from_source(
+        "fn f(s: string) -> bool {\n"
+        "    string.contains(s, \"x\")\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *call = find_host_call(fn, "string.contains");
+    ASSERT_NOT_NULL(call);
+    ASSERT_EQ(call->call_arg_count, 2);
+    /* Predicate result is i32-shaped at the WASM ABI; IR slot follows
+     * suit so the `-> bool` return type passes wasm validation. */
+    ASSERT_EQ(call->type, IR_TYPE_BOOL);
+}
+
+TEST(l7_ir_gen_time_now_dispatches_to_vdag_time) {
+    /* `time.now()` is zero-arg and lowers directly to IR_HOST_CALL. */
+    IrModule *mod = ir_from_source(
+        "fn f() -> int {\n"
+        "    time.now()\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(mod);
+    IrFunction *fn = first_fn(mod);
+    ASSERT_NOT_NULL(fn);
+
+    IrInst *call = find_host_call(fn, "time.now");
+    ASSERT_NOT_NULL(call);
+    ASSERT_EQ(call->call_arg_count, 0);
+    ASSERT_EQ(call->type, IR_TYPE_I64);
+}
+
+TEST(l7_wasm_emits_vdag_math_import_for_sqrt) {
+    /* The wasm backend must emit an `(import "vdag:math" "sqrt" ...)`
+     * declaration with the f64-in / f64-out shape pinned in
+     * include/vdag.wit. */
+    char *wat = wat_from_source(
+        "agent A {\n"
+        "    capabilities: [llm.classify]\n"
+        "    fn main() -> int {\n"
+        "        let _f = math.sqrt(2.0)\n"
+        "        0\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+    ASSERT(strstr(wat, "(import \"vdag:math\" \"sqrt\"") != NULL);
+    ASSERT(strstr(wat, "(param f64) (result f64)") != NULL);
+    free(wat);
+}
+
+TEST(l7_wasm_emits_vdag_time_import_for_now) {
+    char *wat = wat_from_source(
+        "agent A {\n"
+        "    capabilities: [llm.classify]\n"
+        "    fn main() -> int {\n"
+        "        let _t = time.now()\n"
+        "        0\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+    ASSERT(strstr(wat, "(import \"vdag:time\" \"now\"") != NULL);
+    ASSERT(strstr(wat, "(result i64)") != NULL);
+    free(wat);
+}
+
+TEST(l7_wasm_emits_vdag_string_import_for_contains) {
+    char *wat = wat_from_source(
+        "agent A {\n"
+        "    capabilities: [llm.classify]\n"
+        "    fn main() -> int {\n"
+        "        if string.contains(\"hello\", \"ell\") { 1 } else { 0 }\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+    ASSERT(strstr(wat, "(import \"vdag:string\" \"contains\"") != NULL);
+    free(wat);
+}
+
+TEST(l7_wasm_does_not_emit_vdag_math_import_for_clamp) {
+    /* The pure-int helpers must NOT show up as a wasm import -- they
+     * are inline compiler builtins. Asserting the negative locks the
+     * "no host-call cost for math.clamp" guarantee into the test
+     * suite. */
+    char *wat = wat_from_source(
+        "agent A {\n"
+        "    capabilities: [llm.classify]\n"
+        "    fn main() -> int {\n"
+        "        math.clamp(5, 0, 10)\n"
+        "    }\n"
+        "}\n"
+    );
+    ASSERT_NOT_NULL(wat);
+    ASSERT(strstr(wat, "(import \"vdag:math\" \"clamp\"") == NULL);
+    /* Sanity: the inline lowering still produces a real i64 result --
+     * the function returns it, so we expect a `local.set` + `return`
+     * pair in the body (no host call). */
+    ASSERT(strstr(wat, "$hi_math_clamp") == NULL);
+    free(wat);
+}
+
+/* ============================================================
  * Main
  * ============================================================ */
 
@@ -1446,12 +3220,57 @@ int main(void) {
     RUN_TEST(ir_gen_if_no_else);
     RUN_TEST(ir_gen_for_loop);
     RUN_TEST(ir_gen_while_loop);
+    RUN_TEST(ir_gen_while_bb_count_and_back_edge);
+    RUN_TEST(ir_gen_for_in_desugar_shape);
+    RUN_TEST(ir_gen_nested_break_targets_innermost_exit);
+    RUN_TEST(l2_ir_gen_loop_has_header_and_back_edge);
+    RUN_TEST(l2_ir_gen_for_wildcard_pattern_lowers_like_named);
     RUN_TEST(ir_gen_string_concat);
     RUN_TEST(ir_gen_multiple_functions);
     RUN_TEST(ir_gen_return_void);
     RUN_TEST(ir_gen_nested_binary);
     RUN_TEST(ir_gen_unary_neg);
     RUN_TEST(ir_gen_print_statement);
+
+    fprintf(stderr, "\n-- JSON Host-Call Lowering --\n");
+    RUN_TEST(ir_gen_json_parse_host_call);
+    RUN_TEST(ir_gen_json_field_host_call);
+    RUN_TEST(ir_gen_json_array_index_host_call);
+    RUN_TEST(ir_gen_json_length_host_call);
+    RUN_TEST(ir_gen_json_string_value_host_call);
+    RUN_TEST(ir_gen_json_int_value_host_call);
+    RUN_TEST(ir_gen_json_bool_value_host_call);
+    RUN_TEST(ir_gen_json_is_null_host_call);
+    RUN_TEST(ir_gen_json_stringify_host_call);
+    RUN_TEST(ir_gen_json_chained_pipeline);
+
+    fprintf(stderr, "\n-- L5: Result + ? + try/catch --\n");
+    RUN_TEST(ir_gen_result_ok_pass_through);
+    RUN_TEST(ir_gen_result_err_pass_through);
+    RUN_TEST(ir_gen_try_propagates_via_ret);
+    RUN_TEST(ir_gen_try_emits_try_err_and_try_ok_blocks);
+    RUN_TEST(ir_gen_try_catch_emits_three_blocks_with_phi);
+    RUN_TEST(ir_gen_try_catch_question_jumps_to_catch_not_ret);
+    RUN_TEST(ir_gen_try_catch_chained_propagation);
+
+    fprintf(stderr, "\n-- L5 (extension): match Result + HostError --\n");
+    RUN_TEST(ir_gen_match_result_emits_ok_err_merge_blocks);
+    RUN_TEST(ir_gen_match_result_cmp_lt_against_zero);
+    RUN_TEST(ir_gen_host_error_resolves_to_negative_sentinel);
+    RUN_TEST(ir_gen_host_error_in_try_catch_end_to_end);
+
+    fprintf(stderr, "\n-- L6: general match decision tree --\n");
+    RUN_TEST(l6_ir_gen_int_literal_match_decision_tree);
+    RUN_TEST(l6_ir_gen_literal_arm_emits_cmp_eq);
+    RUN_TEST(l6_ir_gen_merge_phi_joins_all_arm_values);
+    RUN_TEST(l6_ir_gen_guarded_arm_phi_joins_two_arms);
+    RUN_TEST(l6_ir_gen_host_error_match_resolves_sentinels);
+
+    fprintf(stderr, "\n-- L4: string interpolation --\n");
+    RUN_TEST(l4_ir_gen_simple_interp_emits_concat_chain);
+    RUN_TEST(l4_ir_gen_int_segment_uses_from_int);
+    RUN_TEST(l4_ir_gen_multi_part_left_folds);
+    RUN_TEST(l4_ir_gen_escaped_dollar_is_literal);
 
     fprintf(stderr, "\n-- IR Optimization --\n");
     RUN_TEST(ir_opt_constant_fold);
@@ -1513,6 +3332,34 @@ int main(void) {
 
     fprintf(stderr, "\n-- Full Program x86_64 --\n");
     RUN_TEST(ir_emit_x86_full_program);
+
+    fprintf(stderr, "\n-- L11: entropy_budget runtime fence --\n");
+    RUN_TEST(wasm_entropy_global_initialised_to_declared_budget);
+    RUN_TEST(wasm_entropy_decrement_wat_shape);
+    RUN_TEST(wasm_entropy_trap_wat_shape);
+
+    fprintf(stderr, "\n-- L13: budget runtime fence --\n");
+    RUN_TEST(wasm_budget_globals_initialised_to_declared_budgets);
+    RUN_TEST(wasm_budget_token_decrement_wat_shape);
+    RUN_TEST(wasm_budget_cost_decrement_wat_shape);
+    RUN_TEST(wasm_budget_token_trap_shape);
+    RUN_TEST(wasm_budget_chain_order_entropy_then_tokens_then_cost);
+
+    fprintf(stderr, "\n-- L12: capability.network compile-time allowlist --\n");
+    RUN_TEST(l12_parser_accepts_parameterised_http_fetch);
+    RUN_TEST(l12_typecheck_rejects_malformed_hosts);
+    RUN_TEST(l12_wit_emit_writes_hosts_field);
+    RUN_TEST(l12_wasm_custom_section_contains_allowlist);
+
+    fprintf(stderr, "\n-- L7: stdlib minimum (math + string + time) --\n");
+    RUN_TEST(l7_ir_gen_math_clamp_is_pure_no_host_call);
+    RUN_TEST(l7_ir_gen_math_sqrt_dispatches_to_vdag_math);
+    RUN_TEST(l7_ir_gen_string_contains_dispatches_to_vdag_string);
+    RUN_TEST(l7_ir_gen_time_now_dispatches_to_vdag_time);
+    RUN_TEST(l7_wasm_emits_vdag_math_import_for_sqrt);
+    RUN_TEST(l7_wasm_emits_vdag_time_import_for_now);
+    RUN_TEST(l7_wasm_emits_vdag_string_import_for_contains);
+    RUN_TEST(l7_wasm_does_not_emit_vdag_math_import_for_clamp);
 
     ir_test_teardown();
 

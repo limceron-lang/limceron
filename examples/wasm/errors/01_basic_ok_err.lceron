@@ -1,0 +1,43 @@
+// 01_basic_ok_err.lceron — L5 sample: Result<T, E> constructors
+//
+// Demonstrates the two Result variants:
+//   - Ok(value: T)         carries a success value
+//   - Err(code: HostError) carries a sentinel error code
+//
+// At runtime (v1) Result<i64, HostError> is encoded as a single i64:
+//   non-negative i64 -> Ok(v)
+//   negative     i64 -> Err(code)
+//
+// This is the same shape as host-call return values in Visual-DAG's
+// imports.go (positive = bytes written, negative = HostErr*), so any
+// vdag:* call composes seamlessly with Ok/Err / ? / try-catch.
+//
+// HostError sentinel codes (mirror imports.go):
+//   Generic        = -1
+//   URLNotAllowed  = -2
+//   BudgetExceeded = -3
+//   NoTenant       = -4
+//   DMLRejected    = -5
+//   TooLarge       = -6
+//   CapMissing     = -7
+//   InvalidArg     = -8
+//
+// Expected return: 42  (the Ok path is the tail expression)
+
+fn produce_ok() -> int {
+    Ok(42)
+}
+
+fn produce_err() -> int {
+    // BudgetExceeded -> -3
+    Err(-3)
+}
+
+fn main() -> int {
+    let success = produce_ok()
+    let failure = produce_err()
+    // Pick the Ok value as the program result. The failure is held in
+    // `failure` (= -3) but never observed by the verdict, mirroring the
+    // "evaluate but don't propagate" idiom.
+    success
+}

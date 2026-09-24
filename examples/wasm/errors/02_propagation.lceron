@@ -1,0 +1,60 @@
+// 02_propagation.lceron — L5 sample: chained `?` propagation
+//
+// Each call may return Err; `?` short-circuits the entire function
+// when any link in the chain fails, returning the (negative) error
+// code unchanged. This is the Limceron equivalent of Rust's `?`.
+//
+// Lowering shape per `?`:
+//   bbN:  %v = <expr>
+//         %neg = cmp_lt %v, 0
+//         br %neg, @try.err, @try.ok
+//   try.err:  ret %v
+//   try.ok:   (continue with %v)
+//
+// Three `?` operators in `pipeline` lower to three br pairs. If any
+// stage returns negative, `pipeline` itself returns that negative code
+// without inventing a fresh error.
+//
+// Expected return for the default seed:
+//   stage_a(7)  = 7   (Ok)
+//   stage_b(7)  = 14  (Ok)
+//   stage_c(14) = -3  (Err — BudgetExceeded if input >= 10)
+//   pipeline(7) = -3
+//
+// Swapping the seed to 2 keeps every stage on the Ok path:
+//   stage_a(2)  = 2
+//   stage_b(2)  = 4
+//   stage_c(4)  = 4
+//   pipeline(2) = 4
+
+fn stage_a(x: int) -> int {
+    if x < 0 {
+        Err(-8)        // InvalidArg
+    } else {
+        Ok(x)
+    }
+}
+
+fn stage_b(x: int) -> int {
+    Ok(x + x)
+}
+
+fn stage_c(x: int) -> int {
+    if x >= 10 {
+        Err(-3)        // BudgetExceeded
+    } else {
+        Ok(x)
+    }
+}
+
+fn pipeline(seed: int) -> int {
+    // Three `?` operators chained: each short-circuits if its caller errs.
+    let a = stage_a(seed)?
+    let b = stage_b(a)?
+    let c = stage_c(b)?
+    Ok(c)
+}
+
+fn main() -> int {
+    pipeline(7)
+}

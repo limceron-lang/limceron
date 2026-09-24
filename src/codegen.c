@@ -11,6 +11,7 @@
  */
 
 #include "lcn.h"
+#include "wit_load.h"
 
 /* ============================================================
  * Builtin Function Names (skip codegen for these — runtime provides them)
@@ -303,6 +304,18 @@ typedef struct {
     /* Health probe: collected from AST_HEALTH node */
     bool        has_health;
     int         health_port;        /* port for /healthz and /readyz endpoints */
+
+    /* L8: module registry for cross-file `use` imports. Populated up-front
+     * from each top-level fn whose `val.str_val` was tagged by the loader
+     * (in main.c::resolve_imports). Lets AST_METHOD_CALL detect a call of
+     * the form `<module>.<fn>(args)` and route to the module-mangled C
+     * symbol `lcn___<module>_<fn>` instead of falling through to the
+     * struct-method / driver / mcp shapes. */
+    struct {
+        const char *stem;           /* e.g. "helpers" */
+        const char *fn_name;        /* e.g. "greet" */
+    } module_fns[256];
+    int         module_fn_count;
 } CodeGen;
 
 static void cg_grow(CodeGen *g, size_t need) {
@@ -2242,6 +2255,107 @@ static void cg_expr(CodeGen *g, AstNode *expr) {
         break;
     }
 
+    /* L4: AST_INTERP_STRING emits a nested lcn_str_concat chain
+     * in the C99 backend, mirroring the wasm IR-gen lowering but
+     * targetting the runtime helper. Each literal segment becomes
+     * a quoted C string; each expression segment is recursively
+     * code-generated. Non-string expressions are wrapped in
+     * lcn_str_from_int when the codegen can't prove they are
+     * string-typed. */
+    case AST_INTERP_STRING: {
+        AstNode *part = expr->params;
+        (void)part;  /* L4-WIP: reserved by sibling; silenced for L7 build */
+        int total = 0;
+        AstNode *first_emit = NULL;
+        int idx = 0;
+        for (AstNode *p = expr->params; p; p = p->next, idx++) {
+            if ((idx & 1) == 0) {
+                const char *s = p->val.str_val ? p->val.str_val : "";
+                if (s[0] == '\0' && first_emit) continue;
+            }
+            if (!first_emit) first_emit = p;
+            total++;
+        }
+        if (total == 0) { cg_str(g, "\"\""); break; }
+        if (total == 1) {
+            /* Single segment -- emit it without the concat wrapper. */
+            int i = 0;
+            for (AstNode *p = expr->params; p; p = p->next, i++) {
+                if ((i & 1) == 0) {
+                    const char *s = p->val.str_val ? p->val.str_val : "";
+                    if (s[0] == '\0' && p != first_emit) continue;
+                }
+                if (p == first_emit) {
+                    if ((i & 1) == 0) {
+                        cg_str(g, "\"");
+                        for (const char *q = p->val.str_val; q && *q; q++) {
+                            switch (*q) {
+                            case '\n': cg_str(g, "\\n"); break;
+                            case '"':  cg_str(g, "\\\""); break;
+                            case '\\': cg_str(g, "\\\\"); break;
+                            default: { char buf[2] = { *q, 0 }; cg_str(g, buf); }
+                            }
+                        }
+                        cg_str(g, "\"");
+                    } else {
+                        cg_str(g, "lcn_str_from_int((int64_t)(");
+                        cg_expr(g, p);
+                        cg_str(g, "))");
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+        /* Multi-segment: emit nested lcn_str_concat. */
+        for (int i = 0; i < total - 1; i++) cg_str(g, "lcn_str_concat(");
+        bool first = true;
+        idx = 0;
+        for (AstNode *p = expr->params; p; p = p->next, idx++) {
+            if ((idx & 1) == 0) {
+                const char *s = p->val.str_val ? p->val.str_val : "";
+                if (s[0] == '\0' && !first) continue;
+            }
+            if (!first) cg_str(g, ", ");
+            if ((idx & 1) == 0) {
+                cg_str(g, "\"");
+                for (const char *q = p->val.str_val; q && *q; q++) {
+                    switch (*q) {
+                    case '\n': cg_str(g, "\\n"); break;
+                    case '"':  cg_str(g, "\\\""); break;
+                    case '\\': cg_str(g, "\\\\"); break;
+                    default: { char buf[2] = { *q, 0 }; cg_str(g, buf); }
+                    }
+                }
+                cg_str(g, "\"");
+            } else {
+                /* Heuristic: if the inner expression is a bare
+                 * AST_IDENT and not a known string variable, wrap
+                 * in lcn_str_from_int; otherwise emit directly. */
+                bool is_str_var = false;
+                if (p->kind == AST_IDENT && p->name) {
+                    int si;
+                    for (si = 0; si < g->string_var_count; si++) {
+                        if (strcmp(g->string_vars[si], p->name) == 0) {
+                            is_str_var = true; break;
+                        }
+                    }
+                }
+                if (p->kind == AST_STRING_LIT || p->kind == AST_INTERP_STRING ||
+                    is_str_var) {
+                    cg_expr(g, p);
+                } else {
+                    cg_str(g, "lcn_str_from_int((int64_t)(");
+                    cg_expr(g, p);
+                    cg_str(g, "))");
+                }
+            }
+            if (!first) cg_str(g, ")");
+            first = false;
+        }
+        break;
+    }
+
     case AST_BOOL_LIT:
         cg_str(g, expr->val.bool_val ? "true" : "false");
         break;
@@ -2260,6 +2374,34 @@ static void cg_expr(CodeGen *g, AstNode *expr) {
             else if (cg_lookup_budget(g, expr->name)) {
                 cg_fmt(g, "lcn_budget_%s()", expr->name);
             } else {
+                /* L5: HostError enum constants like `host_error::quota_exceeded`
+                 * are collapsed into a single AST_IDENT by the parser. Resolve
+                 * them against include/vdag.errors.wit and emit the signed
+                 * sentinel literal; valid C identifiers cannot contain `::`,
+                 * so leaving the joined name in the source would generate
+                 * broken C anyway. */
+                const char *n = expr->name;
+                const char *sep = NULL;
+                for (const char *q = n; q[0] && q[1]; q++) {
+                    if (q[0] == ':' && q[1] == ':') { sep = q; break; }
+                }
+                if (sep && (sep - n) > 0) {
+                    char enum_name[64];
+                    size_t en = (size_t)(sep - n);
+                    if (en >= sizeof(enum_name)) en = sizeof(enum_name) - 1;
+                    memcpy(enum_name, n, en);
+                    enum_name[en] = '\0';
+                    int64_t val = 0;
+                    if (lcn_wit_resolve_host_error(enum_name, sep + 2, &val)) {
+                        cg_fmt(g, "((int64_t)%lld)", (long long)val);
+                        break;
+                    }
+                    /* Unknown -> emit 0 so the C compiler still accepts the
+                     * file; the typechecker already raised
+                     * ERR_HOST_ERROR_UNKNOWN_VARIANT. */
+                    cg_str(g, "0");
+                    break;
+                }
                 cg_str(g, expr->name);
             }
         }
@@ -3178,6 +3320,32 @@ static void cg_expr(CodeGen *g, AstNode *expr) {
         break;
 
     case AST_METHOD_CALL: {
+        /* L8: cross-module call `<stem>.<fn>(args)` → `lcn___<stem>_<fn>(args)`.
+         * Intercepts BEFORE every existing dispatch shape (metrics,
+         * mcp alias, driver alias, model alias, channel ops, struct
+         * method) so the module-mangled path never gets accidentally
+         * caught by a fallback. The stem must be a bare identifier
+         * that matches a fn merged in from an imported sibling file
+         * (recorded during the pre-registration pass above). */
+        if (expr->left && expr->left->kind == AST_IDENT && expr->left->name &&
+            expr->name) {
+            int mi;
+            for (mi = 0; mi < g->module_fn_count; mi++) {
+                if (strcmp(g->module_fns[mi].stem, expr->left->name) == 0 &&
+                    strcmp(g->module_fns[mi].fn_name, expr->name) == 0) {
+                    cg_fmt(g, "lcn___%s_%s(", expr->left->name, expr->name);
+                    AstNode *arg = expr->params;
+                    while (arg) {
+                        cg_expr(g, arg);
+                        if (arg->next) cg_str(g, ", ");
+                        arg = arg->next;
+                    }
+                    cg_str(g, ")");
+                    goto method_done;
+                }
+            }
+        }
+
         /* Metrics histogram observe: metrics.field.observe(val) */
         if (g->has_metrics && expr->name && strcmp(expr->name, "observe") == 0 &&
             expr->left && expr->left->kind == AST_FIELD_ACCESS &&
@@ -3479,6 +3647,22 @@ static void cg_expr(CodeGen *g, AstNode *expr) {
     case AST_TRY:
         /* expr? → simplified: just evaluate expr */
         cg_expr(g, expr->left);
+        break;
+
+    case AST_RESULT_OK:
+    case AST_RESULT_ERR:
+        /* L5: Result<T,E> constructors. In the C transpiler we use the
+         * negative-i32 sentinel encoding (same as the WASM ABI): Ok(v)
+         * is just v, Err(code) is just code (already negative). */
+        if (expr->left) cg_expr(g, expr->left);
+        else cg_str(g, "0");
+        break;
+
+    case AST_TRY_CATCH:
+        /* L5: try/catch — in the C transpiler we just evaluate the try
+         * block (no early-exit semantics here; full lowering lives in
+         * the IR backend used by the WASM target). */
+        if (expr->left) cg_expr(g, expr->left);
         break;
 
     case AST_TRY_OTHERWISE: {
@@ -6406,7 +6590,18 @@ static void cg_fn(CodeGen *g, AstNode *fn) {
 
     cg_str(g, "static ");
     cg_type(g, fn->type_expr);
-    cg_fmt(g, " lcn_%s(", fn->name ? fn->name : "anon");
+    /* L8: top-level fns merged from a `use`d sibling file emit as
+     * `lcn___<stem>_<fn>` so two modules can each declare a fn with the
+     * same name without colliding at the C symbol level. Bodies in the
+     * MAIN file keep the bare `lcn_<fn>` shape so existing single-file
+     * call-site lowering (`lcn_<callee>(...)`) keeps resolving without
+     * any additional aliasing layer. */
+    if (fn->val.str_val && fn->val.str_val[0]) {
+        cg_fmt(g, " lcn___%s_%s(", fn->val.str_val,
+               fn->name ? fn->name : "anon");
+    } else {
+        cg_fmt(g, " lcn_%s(", fn->name ? fn->name : "anon");
+    }
 
     AstNode *p = fn->params;
     if (!p) cg_str(g, "void");
@@ -8538,6 +8733,19 @@ static void cg_agent(CodeGen *g, AstNode *agent) {
         cg_nl(g);
         /* Auto-record entropy if entropy_budget is configured */
         if (has_entropy_budget) {
+            /* C5: confidence < 0.0 is the "no logprobs from this provider" sentinel
+             * (runtime/llm.c). An agent that declared entropy_budget is asking the
+             * runtime to enforce on that signal -- silently treating its absence as
+             * confidence 1.0 would mean the fence never trips. Fail loud instead. */
+            cg_line(g, "if (_llm.confidence < 0.0) {");
+            g->indent++;
+            cg_line(g, "fprintf(stderr, \"entropy_budget requires logprobs or a local ONNX model; "
+                       "endpoint '%%s' (model '%%s') returned none.\\n\", "
+                       "self->endpoint ? self->endpoint : \"(default)\", self->model ? self->model : \"(default)\");");
+            cg_line(g, "if (_llm.content) free(_llm.content);");
+            cg_line(g, "return LCN_ERR(\"entropy_budget requires logprobs or a local ONNX model; provider returned none\");");
+            g->indent--;
+            cg_line(g, "}");
             cg_line(g, "/* Record entropy for budget tracking */");
             cg_line(g, "if (self->_entropy_tracker) {");
             g->indent++;
@@ -8545,7 +8753,7 @@ static void cg_agent(CodeGen *g, AstNode *agent) {
             cg_line(g, "const char *_eb_err = lcn_entropy_check_budget(self->_entropy_tracker, &self->entropy_budget);");
             cg_line(g, "if (_eb_err) {");
             g->indent++;
-            cg_line(g, "fprintf(stderr, \"entropy budget violated: %s\\n\", _eb_err);");
+            cg_line(g, "fprintf(stderr, \"entropy budget violated: %%s\\n\", _eb_err);");
             cg_line(g, "if (_llm.content) free(_llm.content);");
             cg_line(g, "return LCN_ERR(_eb_err);");
             g->indent--;
@@ -8970,17 +9178,17 @@ static void cg_preamble(CodeGen *g, const char *source_file) {
         "    if (!sup || ci < 0 || ci >= sup->child_count || sup->state != LCN_SUPERVISOR_RUNNING) return -1;\n"
         "    sup->children[ci].state = LCN_CHILD_FAILED;\n"
         "    sup->children[ci].consecutive_failures++;\n"
-        "    { int idx = (sup->history.head + sup->history.count) %% LCN_SUPERVISOR_MAX_RESTARTS;\n"
+        "    { int idx = (sup->history.head + sup->history.count) % LCN_SUPERVISOR_MAX_RESTARTS;\n"
         "      sup->history.timestamps[idx] = time(NULL);\n"
         "      if (sup->history.count < LCN_SUPERVISOR_MAX_RESTARTS) sup->history.count++;\n"
-        "      else sup->history.head = (sup->history.head + 1) %% LCN_SUPERVISOR_MAX_RESTARTS; }\n"
+        "      else sup->history.head = (sup->history.head + 1) % LCN_SUPERVISOR_MAX_RESTARTS; }\n"
         "    sup->total_restarts++;\n"
         "    sup->last_restart_at = time(NULL);\n"
         "    if (sup->max_restarts > 0) {\n"
         "        time_t cutoff = time(NULL) - (time_t)sup->window_seconds;\n"
         "        int recent = 0;\n"
         "        for (int i = 0; i < sup->history.count; i++) {\n"
-        "            int idx = (sup->history.head + i) %% LCN_SUPERVISOR_MAX_RESTARTS;\n"
+        "            int idx = (sup->history.head + i) % LCN_SUPERVISOR_MAX_RESTARTS;\n"
         "            if (sup->history.timestamps[idx] >= cutoff) recent++;\n"
         "        }\n"
         "        if (recent > sup->max_restarts) {\n"
@@ -9897,6 +10105,18 @@ static char *codegen_internal_ex(AstNode *program, const char *source_file, Aren
             cg_register_fn_ret(&g, decl->name, arena_strdup(arena, ctype));
             (void)raw;
         }
+        /* L8: top-level fn merged in from a `use`d sibling file. The
+         * loader stashes the module stem on `val.str_val`; record it so
+         * AST_METHOD_CALL can rewrite `helpers.greet(x)` to
+         * `lcn___helpers_greet(x)` and the fn definition itself is
+         * emitted under the same mangled C symbol. */
+        if (decl->kind == AST_FN && decl->name &&
+            decl->val.str_val && decl->val.str_val[0] &&
+            g.module_fn_count < 256) {
+            g.module_fns[g.module_fn_count].stem = decl->val.str_val;
+            g.module_fns[g.module_fn_count].fn_name = decl->name;
+            g.module_fn_count++;
+        }
     }
 
     /* 3. Walk declarations in order, grouped by type */
@@ -10044,14 +10264,23 @@ static char *codegen_internal_ex(AstNode *program, const char *source_file, Aren
             cg_extern_fn(&g, decl);
     }
 
-    /* Pass 5e: forward declarations for all user functions (enables mutual recursion) */
+    /* Pass 5e: forward declarations for all user functions (enables mutual recursion).
+     * L8: respect the module-scoped mangler — a fn carrying a `val.str_val`
+     * module stem must forward-declare under the same `lcn___<stem>_<fn>`
+     * symbol that cg_fn will emit for its body, or the C compiler hits
+     * "static declaration follows non-static" and "implicit declaration"
+     * errors when call-sites resolve through the mangled name. */
     for (decl = program->params; decl; decl = decl->next) {
         if (decl->kind == AST_FN && decl->name
             && !is_codegen_builtin(decl->name)
             && !(decl->is_unsafe && !decl->left)) {
             cg_str(&g, "static ");
             cg_type(&g, decl->type_expr);
-            cg_fmt(&g, " lcn_%s(", decl->name);
+            if (decl->val.str_val && decl->val.str_val[0]) {
+                cg_fmt(&g, " lcn___%s_%s(", decl->val.str_val, decl->name);
+            } else {
+                cg_fmt(&g, " lcn_%s(", decl->name);
+            }
             AstNode *fp = decl->params;
             if (!fp) cg_str(&g, "void");
             while (fp) {

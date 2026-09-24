@@ -1,0 +1,45 @@
+// 03_try_catch.lceron — L5 sample: explicit recovery via try/catch
+//
+// Inside a `try { ... } catch (e: HostError) { ... }` block, the `?`
+// operator does NOT return from the enclosing function on Err. Instead
+// it jumps to the catch handler with `e` bound to the (negative) error
+// code. The catch handler's tail expression becomes the value of the
+// whole try-catch expression — which then flows out as a normal Ok
+// (a sentinel "recovered" value here) or any other Result.
+//
+// Lowering shape:
+//   pre:        %err_addr = alloca i64; jmp @try.body
+//   try.body:   <body lowered with catch-frame pushed>
+//               <tail expr ok_val>
+//               jmp @try.merge
+//   try.catch:  %e = load %err_addr
+//               <handler with `e` in scope>
+//               jmp @try.merge
+//   try.merge:  %r = phi [ok_val, body_pred] [catch_val, catch_pred]
+//
+// Expected return: 99
+//   - inner_call() returns Err(-2) (URLNotAllowed)
+//   - `?` redirects to the catch handler instead of returning -2
+//   - handler returns 99 as a recovery sentinel
+//   - merge's phi yields 99 to main()
+
+fn inner_call() -> int {
+    Err(-2)          // URLNotAllowed
+}
+
+fn outer() -> int {
+    try {
+        let v = inner_call()?
+        // Never reached when inner_call errs; would be the Ok tail.
+        Ok(v + 1)
+    } catch (e: int) {
+        // Recover with a fixed sentinel. In a real agent the handler
+        // would log `e`, decrement a budget, or retry on a different
+        // capability before deciding what to surface.
+        99
+    }
+}
+
+fn main() -> int {
+    outer()
+}

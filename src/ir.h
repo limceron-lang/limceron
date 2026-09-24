@@ -74,6 +74,7 @@ typedef enum {
 
     /* Control flow */
     IR_CALL,            /* %3 = call @fn(%0, %1)          */
+    IR_HOST_CALL,       /* %3 = host_call "ns" "fn"(%0..) — capability-gated import */
     IR_RET,             /* ret %0                         */
     IR_BR,              /* br %cond, @true, @false        */
     IR_JMP,             /* jmp @target                    */
@@ -237,6 +238,9 @@ void ir_emit_store(IrFunction *fn, IrModule *mod, int value, int addr);
 
 int  ir_emit_call(IrFunction *fn, IrModule *mod, const char *callee,
                   IrType ret_type, int *args, int arg_count);
+int  ir_emit_host_call(IrFunction *fn, IrModule *mod,
+                       const char *qualified_name,
+                       int *args, int arg_count);
 void ir_emit_ret(IrFunction *fn, IrModule *mod, int value);
 void ir_emit_ret_void(IrFunction *fn, IrModule *mod);
 void ir_emit_br(IrFunction *fn, IrModule *mod, int cond, int true_bb, int false_bb);

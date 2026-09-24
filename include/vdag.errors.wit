@@ -1,0 +1,46 @@
+// vdag.errors.wit -- Canonical HostError sentinel enum for L5
+// Result<T, HostError>.
+//
+// The Visual-DAG host runtime returns negative i64 sentinel codes
+// from every vdag:* call when the call fails. ADR-0002 makes those
+// sentinels the IS-an Err encoding for stage0's Result<T,_> type;
+// this file gives those sentinels symbolic names so that guest code
+// can write `Result::Err(host_error::quota_exceeded)` instead of
+// hand-coding `-3` everywhere.
+//
+// The typechecker (src/wit_load.c + src/typecheck.c) loads this enum
+// at compile time and validates `host_error::<name>` references at
+// every call site. The values listed here ARE the contract: changing
+// a number is a release-blocking ABI break.
+//
+// Editing rules:
+//
+//   1. NEVER reuse a number. New sentinels MUST take the next lower
+//      negative slot (-13, -14, ...). Visual-DAG's
+//      internal/nodes/code/imports.go uses these numbers directly,
+//      so a renumbering would silently miscategorise host errors as
+//      a different class.
+//   2. Keep the names kebab-case (WIT convention). The compiler
+//      accepts both kebab-case (`quota-exceeded`) and snake_case
+//      (`quota_exceeded`) at the lookup site; the canonical form
+//      here is kebab.
+//   3. This enum is intentionally separate from vdag.wit (the
+//      interface contract). Don't merge them -- the world block in
+//      vdag.wit reserves namespaces, this file defines values.
+
+package limceron:vdag-errors;
+
+enum host-error {
+    not-found              = -1,
+    permission-denied      = -2,
+    quota-exceeded         = -3,
+    cost-budget-exceeded   = -4,
+    dml-rejected           = -5,
+    sandbox-violation      = -6,
+    json-field-missing     = -7,
+    json-type-mismatch     = -8,
+    entropy-budget-exceeded = -9,
+    limceron-budget-exceeded = -10,
+    network-not-allowed    = -11,
+    invalid-arg            = -12,
+}

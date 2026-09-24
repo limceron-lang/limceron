@@ -78,8 +78,10 @@ endif
 
 # Source files (order matters for dependencies)
 S0_SRCS    := $(S0_SRC)/arena.c $(S0_SRC)/lexer.c $(S0_SRC)/parser.c \
-              $(S0_SRC)/markdown.c $(S0_SRC)/typecheck.c $(S0_SRC)/codegen.c \
+              $(S0_SRC)/markdown.c $(S0_SRC)/typecheck.c \
+              $(S0_SRC)/l9_infer.c $(S0_SRC)/codegen.c \
               $(S0_SRC)/ir_gen.c $(S0_SRC)/ir_emit_arm64.c $(S0_SRC)/ir_emit_x86.c \
+              $(S0_SRC)/ir_emit_wasm.c $(S0_SRC)/wit_emit.c $(S0_SRC)/wit_load.c \
               $(S0_SRC)/lsp.c $(S0_SRC)/package.c \
               $(S0_SRC)/target.c $(S0_SRC)/security.c $(S0_SRC)/main.c
 S0_OBJS    := $(patsubst $(S0_SRC)/%.c,build/stage0/%.o,$(S0_SRCS))
@@ -88,13 +90,16 @@ S0_OBJS    := $(patsubst $(S0_SRC)/%.c,build/stage0/%.o,$(S0_SRCS))
 S0_LIB_OBJS := $(filter-out build/stage0/main.o,$(S0_OBJS))
 
 # Test sources
-S0_TEST_SRC    := $(S0_TEST)/test_runner.c
-S0_TEST_IR_SRC := $(S0_TEST)/test_ir.c
+S0_TEST_SRC     := $(S0_TEST)/test_runner.c
+S0_TEST_IR_SRC  := $(S0_TEST)/test_ir.c
+S0_TEST_LSP_SRC := $(S0_TEST)/test_lsp.c
 
 # Output
-S0_BIN     := build/limceron-stage0
-TEST_BIN   := build/test-stage0
-TEST_IR_BIN := build/test-ir
+S0_BIN       := build/limceron-stage0
+S0_LSP_BIN   := build/limceron-lsp
+TEST_BIN     := build/test-stage0
+TEST_IR_BIN  := build/test-ir
+TEST_LSP_BIN := build/test-lsp
 
 # Stage 1 & 2
 S1_DIR     := stage1
@@ -109,9 +114,10 @@ BUILD_DIR  := build
 # ============================================================
 
 .PHONY: all bootstrap stage0 stage1 stage1-build stage2 stage2-build verify clean install test test-stage0 \
-        test-ir test-stage1 test-parity test-multifile test-bootstrap lex parse emit build-lceron run runtime dashboard
+        test-ir test-lsp test-stage1 test-parity test-multifile test-bootstrap lex parse emit build-lceron run runtime dashboard \
+        poc-wasm lsp
 
-all: stage0
+all: stage0 lsp
 
 # Full bootstrap: Stage 0 (C) -> Stage 1 (self-hosted) -> Stage 2 (self-compiled) -> verify
 bootstrap: stage0 stage1-build stage2-build test-bootstrap
@@ -148,7 +154,7 @@ build/runtime/sqlite3.o: $(RT_DIR)/sqlite3.c | build/runtime
 
 # -- Tests --
 
-test: test-stage0 test-ir test-multifile
+test: test-stage0 test-ir test-lsp test-multifile test-stage1-compiles
 
 test-stage0: $(TEST_BIN)
 	@./$(TEST_BIN)
@@ -166,6 +172,29 @@ $(TEST_IR_BIN): $(S0_TEST_IR_SRC) $(S0_LIB_OBJS) $(S0_INC)/lcn.h $(S0_SRC)/ir.h 
 	@xattr -dr com.apple.quarantine $@ 2>/dev/null || true
 	@xattr -dr com.apple.provenance $@ 2>/dev/null || true
 
+# -- L10: LSP test suite + standalone LSP binary --
+
+test-lsp: $(TEST_LSP_BIN)
+	@./$(TEST_LSP_BIN)
+
+$(TEST_LSP_BIN): $(S0_TEST_LSP_SRC) $(S0_LIB_OBJS) $(S0_INC)/lcn.h $(S0_TEST)/test.h | $(BUILD_DIR)
+	$(CC) $(S0_CFLAGS) -I$(S0_TEST) -o $@ $(S0_TEST_LSP_SRC) $(S0_LIB_OBJS) $(LDFLAGS)
+	@xattr -dr com.apple.quarantine $@ 2>/dev/null || true
+	@xattr -dr com.apple.provenance $@ 2>/dev/null || true
+
+# `make lsp` builds the standalone limceron-lsp binary. The LSP code
+# ships inside limceron-stage0 (the `lsp` subcommand) so the standalone
+# is a tiny wrapper that drives cmd_lsp() directly.
+lsp: $(S0_LSP_BIN)
+	@echo "=== limceron-lsp ready: $(S0_LSP_BIN) ==="
+
+$(S0_LSP_BIN): $(S0_LIB_OBJS) $(S0_INC)/lcn.h | $(BUILD_DIR)
+	@printf '#include "lcn.h"\nint main(int argc, char **argv) { (void)argc; (void)argv; return cmd_lsp(); }\n' > build/lsp_main.c
+	$(CC) $(S0_CFLAGS) -o $@ build/lsp_main.c $(S0_LIB_OBJS) $(LDFLAGS)
+	@xattr -dr com.apple.quarantine $@ 2>/dev/null || true
+	@xattr -dr com.apple.provenance $@ 2>/dev/null || true
+	@rm -f build/lsp_main.c
+
 # -- Multi-file integration test --
 
 test-multifile: $(S0_BIN)
@@ -173,6 +202,24 @@ test-multifile: $(S0_BIN)
 	@./$(S0_BIN) build examples/language/multifile/main.lceron -o /tmp/lcn_multifile_test 2>&1
 	@rm -f /tmp/lcn_multifile_test
 	@echo "  PASS: multi-file example compiles"
+
+# -- C1.c: cheap compile-only guard for stage1/*.lceron in the default `test`
+# target. The full bootstrap (stage1 -> stage2 self-hosting) is expensive and
+# lives in `make bootstrap`; this just catches "stage1 doesn't compile"
+# regressions (like C1.a/C1.b) without waiting for a nightly run.
+test-stage1-compiles: $(S0_BIN)
+	@echo "── Stage 1 compile-only guard (C1.c) ──"
+	@for f in lexer parser typecheck codegen; do \
+		./$(S0_BIN) build $(S1_DIR)/$$f.lceron -o /tmp/lcn_stage1_guard_$$f >/tmp/lcn_stage1_guard_$$f.log 2>&1; \
+		if [ $$? -ne 0 ]; then \
+			echo "  FAIL: stage1/$$f.lceron failed to compile"; \
+			tail -20 /tmp/lcn_stage1_guard_$$f.log; \
+			rm -f /tmp/lcn_stage1_guard_$$f /tmp/lcn_stage1_guard_$$f.log; \
+			exit 1; \
+		fi; \
+		rm -f /tmp/lcn_stage1_guard_$$f /tmp/lcn_stage1_guard_$$f.log; \
+	done
+	@echo "  PASS: stage1/*.lceron compiles"
 
 # -- Stage 1 self-hosted compiler tests --
 
@@ -219,10 +266,10 @@ dashboard: runtime
 
 stage1-build: stage0
 	@echo "=== Building Stage 1 components with Stage 0 ==="
-	@$(S0_BIN) build $(S1_DIR)/lexer.lceron -o $(BUILD_DIR)/stage1-lexer 2>&1 | tail -1
-	@$(S0_BIN) build $(S1_DIR)/parser.lceron -o $(BUILD_DIR)/stage1-parser 2>&1 | tail -1
-	@$(S0_BIN) build $(S1_DIR)/typecheck.lceron -o $(BUILD_DIR)/stage1-typecheck 2>&1 | tail -1
-	@$(S0_BIN) build $(S1_DIR)/codegen.lceron -o $(BUILD_DIR)/stage1-codegen 2>&1 | tail -1
+	@$(S0_BIN) build $(S1_DIR)/lexer.lceron -o $(BUILD_DIR)/stage1-lexer > /tmp/lcn_stage1lexer.log 2>&1 || { cat /tmp/lcn_stage1lexer.log; exit 1; }; tail -1 /tmp/lcn_stage1lexer.log
+	@$(S0_BIN) build $(S1_DIR)/parser.lceron -o $(BUILD_DIR)/stage1-parser > /tmp/lcn_stage1parser.log 2>&1 || { cat /tmp/lcn_stage1parser.log; exit 1; }; tail -1 /tmp/lcn_stage1parser.log
+	@$(S0_BIN) build $(S1_DIR)/typecheck.lceron -o $(BUILD_DIR)/stage1-typecheck > /tmp/lcn_stage1typecheck.log 2>&1 || { cat /tmp/lcn_stage1typecheck.log; exit 1; }; tail -1 /tmp/lcn_stage1typecheck.log
+	@$(S0_BIN) build $(S1_DIR)/codegen.lceron -o $(BUILD_DIR)/stage1-codegen > /tmp/lcn_stage1codegen.log 2>&1 || { cat /tmp/lcn_stage1codegen.log; exit 1; }; tail -1 /tmp/lcn_stage1codegen.log
 	@cp $(S1_DIR)/limceron-stage1.sh $(BUILD_DIR)/limceron-stage1.sh
 	@chmod +x $(BUILD_DIR)/limceron-stage1.sh
 	@echo "=== Stage 1 build complete ==="
@@ -309,3 +356,77 @@ build/stage0:
 
 build/runtime:
 	mkdir -p build/runtime
+
+# ============================================================
+# WASM PoC: build samples in examples/wasm/poc/ to shared handoff dir
+# ============================================================
+
+POC_HANDOFF      := /Users/mikelcarozzi/Documents/poc-handoff
+POC_ARTIFACTS    := $(POC_HANDOFF)/artifacts
+POC_SAMPLES_DIR  := examples/wasm/poc
+POC_TARGET       := wasm32-wasi-preview2
+
+# ANSI color codes
+POC_C_RESET := \033[0m
+POC_C_GREEN := \033[32m
+POC_C_RED   := \033[31m
+POC_C_YEL   := \033[33m
+POC_C_CYAN  := \033[36m
+POC_C_BOLD  := \033[1m
+
+poc-wasm: $(S0_BIN)
+	@mkdir -p "$(POC_ARTIFACTS)"
+	@samples="$$(ls $(POC_SAMPLES_DIR)/*.lceron 2>/dev/null || true)"; \
+	if [ -z "$$samples" ]; then \
+		printf "$(POC_C_YEL)[poc-wasm]$(POC_C_RESET) no samples found in $(POC_SAMPLES_DIR) — waiting on agent C\n"; \
+		exit 0; \
+	fi; \
+	printf "$(POC_C_BOLD)$(POC_C_CYAN)=== Limceron WASM PoC build ===$(POC_C_RESET)\n"; \
+	printf "  target:      %s\n" "$(POC_TARGET)"; \
+	printf "  out:         %s\n" "$(POC_ARTIFACTS)"; \
+	printf "  samples dir: %s\n\n" "$(POC_SAMPLES_DIR)"; \
+	ts="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+	manifest="$(POC_ARTIFACTS)/manifest.json"; \
+	printf '{\n  "build_timestamp": "%s",\n  "target": "%s",\n  "artifacts": [\n' "$$ts" "$(POC_TARGET)" > "$$manifest"; \
+	first=1; ok=0; fail=0; \
+	for src in $$samples; do \
+		base="$$(basename "$$src" .lceron)"; \
+		out="$(POC_ARTIFACTS)/$$base.wasm"; \
+		printf "  [%s] compiling…\n" "$$base"; \
+		if ./$(S0_BIN) build "$$src" -o "$$out" --target $(POC_TARGET) > /tmp/poc-wasm-$$base.log 2>&1; then \
+			if [ -f "$$out" ]; then \
+				size="$$(wc -c < "$$out" | tr -d ' ')"; \
+				if command -v wasm-validate >/dev/null 2>&1; then \
+					if wasm-validate "$$out" > /tmp/poc-wasm-$$base.validate 2>&1; then \
+						vstatus="valid"; \
+						printf "    $(POC_C_GREEN)OK$(POC_C_RESET)        %s  (%s bytes)\n" "$$out" "$$size"; \
+						ok=$$((ok + 1)); \
+					else \
+						vstatus="invalid"; \
+						printf "    $(POC_C_RED)INVALID$(POC_C_RESET)   %s  (%s bytes)\n" "$$out" "$$size"; \
+						printf "    %s\n" "$$(head -1 /tmp/poc-wasm-$$base.validate)"; \
+						fail=$$((fail + 1)); \
+					fi; \
+				else \
+					vstatus="unchecked"; \
+					printf "    $(POC_C_YEL)BUILT$(POC_C_RESET)     %s  (%s bytes, wasm-validate not installed)\n" "$$out" "$$size"; \
+					ok=$$((ok + 1)); \
+				fi; \
+				sha="$$(shasum -a 256 "$$out" | awk '{print $$1}')"; \
+				if [ $$first -eq 1 ]; then first=0; else printf ',\n' >> "$$manifest"; fi; \
+				printf '    {\n      "filename": "%s.wasm",\n      "size": %s,\n      "sha256": "%s",\n      "source": "%s",\n      "validation": "%s",\n      "build_timestamp": "%s"\n    }' "$$base" "$$size" "$$sha" "$$src" "$$vstatus" "$$ts" >> "$$manifest"; \
+			else \
+				printf "    $(POC_C_RED)NO OUTPUT$(POC_C_RESET) %s — compiler did not produce file\n" "$$src"; \
+				printf "    %s\n" "$$(tail -1 /tmp/poc-wasm-$$base.log 2>/dev/null)"; \
+				fail=$$((fail + 1)); \
+			fi; \
+		else \
+			printf "    $(POC_C_RED)FAIL$(POC_C_RESET)      %s\n" "$$src"; \
+			printf "    %s\n" "$$(tail -1 /tmp/poc-wasm-$$base.log 2>/dev/null)"; \
+			fail=$$((fail + 1)); \
+		fi; \
+	done; \
+	printf '\n  ]\n}\n' >> "$$manifest"; \
+	printf "\n$(POC_C_BOLD)Summary:$(POC_C_RESET) "; \
+	printf "$(POC_C_GREEN)%d ok$(POC_C_RESET), $(POC_C_RED)%d failed$(POC_C_RESET)\n" "$$ok" "$$fail"; \
+	printf "  manifest: %s\n" "$$manifest"

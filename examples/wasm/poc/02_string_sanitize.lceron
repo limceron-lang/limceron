@@ -1,0 +1,22 @@
+// 02_string_sanitize.lceron — WASM PoC sample: string handling
+//
+// Exercises string ops + conditional return.
+// Uses linear-memory-resident string values.
+// Expected to return "hello world".
+
+agent StringSanitize {
+    capabilities: [data.read]
+    budget: { max_tokens: 100, max_cost: 0.01 }
+
+    fn sanitize(input: string) -> string {
+        if len(input) > 100 {
+            "REJECTED"
+        } else {
+            input
+        }
+    }
+
+    fn main() -> string {
+        sanitize("hello world")
+    }
+}

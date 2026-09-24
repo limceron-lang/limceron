@@ -131,7 +131,8 @@ typedef struct {
     int64_t  completion_tokens;
     int64_t  total_tokens;
     double   entropy;       /* Shannon entropy of first token logprobs */
-    double   confidence;    /* 1.0 - normalized_entropy [0.0, 1.0] */
+    double   confidence;    /* 1.0 - normalized_entropy [0.0, 1.0]; -1.0 = no logprobs
+                              * available from this provider (see runtime/llm.c C5 note) */
     bool     ok;
     char    *error;
 } LcnLlmResult;
@@ -166,7 +167,9 @@ typedef struct {
 
     /* Entropy-aware fields (Shannon entropy of LLM response) */
     double    entropy;     /* H = -sum(p * log2(p)), raw Shannon entropy */
-    double    confidence;  /* 1.0 - normalized_entropy, range [0.0, 1.0] */
+    double    confidence;  /* 1.0 - normalized_entropy, range [0.0, 1.0];
+                             * -1.0 = provider returned no logprobs (no signal,
+                             * NOT certainty -- see runtime/llm.c C5 note) */
 } LcnLlmOutput;
 
 /* Constructors */

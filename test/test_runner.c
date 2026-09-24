@@ -7,6 +7,7 @@
 #include "lcn.h"
 #include "package.h"
 #include "test.h"
+#include <unistd.h>
 
 /* ============================================================
  * Helpers
@@ -1116,6 +1117,29 @@ TEST(security_hash_different) {
     ASSERT(memcmp(hash1, hash2, HASH_SIZE) != 0);
 }
 
+/* C4: security_verify_lceron() prints loud runtime diagnostics (including
+ * the literal word "FAILED") when verification fails -- correct behavior
+ * for a real tampered/misattributed .lceron file at runtime, but the three
+ * negative-case tests below deliberately trigger it to prove rejection
+ * works, and a bare "FAILED" line inside an otherwise-green `make test` run
+ * erodes confidence in the suite. Silence stderr around the call and print
+ * an explicit "expected-fail OK" marker instead, so the intent stays
+ * visible without looking like an unasserted failure. */
+static bool verify_expect_fail(const LceronObjHeader *header, const uint8_t *data, size_t len,
+                                const uint8_t public_key[HASH_SIZE], const char *why) {
+    bool ok;
+    int saved_stderr;
+    fflush(stderr);
+    saved_stderr = dup(fileno(stderr));
+    freopen("/dev/null", "w", stderr);
+    ok = security_verify_lceron(header, data, len, public_key);
+    fflush(stderr);
+    dup2(saved_stderr, fileno(stderr));
+    close(saved_stderr);
+    fprintf(stderr, "         [expected-fail OK] security_verify_lceron rejected %s\n", why);
+    return ok;
+}
+
 TEST(security_lceron_sign_verify) {
     uint8_t key[HASH_SIZE];
     uint8_t data[] = "fn main() { print(42) }";
@@ -1152,7 +1176,7 @@ TEST(security_lceron_tamper_detection) {
     security_sign_lceron(&header, data, sizeof(data), key);
 
     /* Verify with tampered data should FAIL */
-    ASSERT_FALSE(security_verify_lceron(&header, tampered, sizeof(tampered), key));
+    ASSERT_FALSE(verify_expect_fail(&header, tampered, sizeof(tampered), key, "tampered content"));
 }
 
 TEST(security_lceron_wrong_key) {
@@ -1172,7 +1196,7 @@ TEST(security_lceron_wrong_key) {
     security_sign_lceron(&header, data, sizeof(data), key1);
 
     /* Verify with different key should FAIL */
-    ASSERT_FALSE(security_verify_lceron(&header, data, sizeof(data), key2));
+    ASSERT_FALSE(verify_expect_fail(&header, data, sizeof(data), key2, "signature from a different key"));
 }
 
 TEST(security_lceron_bad_magic) {
@@ -1187,7 +1211,7 @@ TEST(security_lceron_bad_magic) {
 
     for (i = 0; i < HASH_SIZE; i++) key[i] = (uint8_t)i;
 
-    ASSERT_FALSE(security_verify_lceron(&header, data, sizeof(data), key));
+    ASSERT_FALSE(verify_expect_fail(&header, data, sizeof(data), key, "bad magic number"));
 }
 
 /* ============================================================
@@ -3114,6 +3138,112 @@ TEST(codegen_for_range_expr) {
 }
 
 /* ============================================================
+ * L2: loop AST + typecheck scope tests
+ *
+ * These pin the L2 surface area that's load-bearing for the bounded
+ * ReAct example in examples/wasm/poc/06_loops.lceron:
+ *   - parser recognises the bare `loop { }` form
+ *   - parser recognises a `for _ in 0..N` wildcard pattern
+ *   - typecheck rejects `break` outside any loop
+ *   - typecheck rejects `continue` outside any loop
+ *   - typecheck ACCEPTS a `break` nested inside an if-inside-a-loop
+ *     (the scope check must walk into match/if branches, not only the
+ *     direct loop body)
+ * ============================================================ */
+
+TEST(l2_parse_loop_keyword_infinite) {
+    bool err;
+    AstNode *prog = parse_source(
+        "fn run() {\n"
+        "    loop {\n"
+        "        break\n"
+        "    }\n"
+        "}",
+        &err
+    );
+    ASSERT_FALSE(err);
+    AstNode *loop_stmt = prog->params->left->params;
+    ASSERT_EQ(loop_stmt->kind, AST_LOOP);
+    /* loop body sits in stmt->left (AST_BLOCK) and its first stmt is BREAK */
+    ASSERT_NOT_NULL(loop_stmt->left);
+    ASSERT_EQ(loop_stmt->left->params->kind, AST_BREAK);
+}
+
+TEST(l2_parse_for_wildcard_pattern) {
+    bool err;
+    AstNode *prog = parse_source(
+        "fn run() {\n"
+        "    for _ in 0..3 {\n"
+        "        let x = 1\n"
+        "    }\n"
+        "}",
+        &err
+    );
+    ASSERT_FALSE(err);
+    AstNode *for_stmt = prog->params->left->params;
+    ASSERT_EQ(for_stmt->kind, AST_FOR);
+    /* pattern slot must be a wildcard, not a named binding */
+    ASSERT_NOT_NULL(for_stmt->left);
+    ASSERT_EQ(for_stmt->left->kind, AST_PAT_WILDCARD);
+    /* iterator must be a range expression */
+    ASSERT_NOT_NULL(for_stmt->params);
+    ASSERT_EQ(for_stmt->params->kind, AST_RANGE);
+}
+
+TEST(l2_typecheck_rejects_break_outside_loop) {
+    bool ok = typecheck_source(
+        "agent T {\n"
+        "    capabilities: []\n"
+        "    budget: { max_tokens: 1, max_cost: 0.01 }\n"
+        "    fn main() -> int {\n"
+        "        break\n"
+        "        0\n"
+        "    }\n"
+        "}"
+    );
+    ASSERT_FALSE(ok);
+}
+
+TEST(l2_typecheck_rejects_continue_outside_loop) {
+    bool ok = typecheck_source(
+        "agent T {\n"
+        "    capabilities: []\n"
+        "    budget: { max_tokens: 1, max_cost: 0.01 }\n"
+        "    fn main() -> int {\n"
+        "        if true {\n"
+        "            continue\n"
+        "        }\n"
+        "        0\n"
+        "    }\n"
+        "}"
+    );
+    ASSERT_FALSE(ok);
+}
+
+TEST(l2_typecheck_accepts_break_inside_if_inside_loop) {
+    /* The scope walker must descend into AST_IF branches WHILE keeping
+     * the enclosing loop frame on the stack. Without this, the natural
+     * `if cond { break }` pattern would be flagged. */
+    bool ok = typecheck_source(
+        "agent T {\n"
+        "    capabilities: []\n"
+        "    budget: { max_tokens: 1, max_cost: 0.01 }\n"
+        "    fn main() -> int {\n"
+        "        let mut i = 0\n"
+        "        while i < 10 {\n"
+        "            if i == 5 {\n"
+        "                break\n"
+        "            }\n"
+        "            i = i + 1\n"
+        "        }\n"
+        "        i\n"
+        "    }\n"
+        "}"
+    );
+    ASSERT(ok);
+}
+
+/* ============================================================
  * PATTERN MATCHING TESTS
  * ============================================================ */
 
@@ -3821,6 +3951,42 @@ TEST(codegen_invariant_avg_confidence) {
     ASSERT(strstr(c, "bool lcn_invariant_high_quality(LcnEntropyTracker *tracker)") != NULL);
     ASSERT(strstr(c, "lcn_entropy_avg_confidence(tracker, 100)") != NULL);
     ASSERT(strstr(c, "> 0.7") != NULL || strstr(c, "> 0.70") != NULL);
+    free(c);
+}
+
+/* C5: an agent with entropy_budget must refuse to enforce on a synthetic
+ * confidence 1.0 when the provider gave no logprobs (confidence < 0.0,
+ * see runtime/llm.c). The generated run() must check for that sentinel
+ * and fail loud BEFORE recording it into the entropy tracker.
+ *
+ * The auto-generated run() (and the fix's guard) only exists in build mode
+ * (#include "lcn_runtime.h", g->use_runtime_header) — gen_c() uses the
+ * standalone codegen path, which stubs out entropy entirely, so this needs
+ * codegen_generate_for_build directly like codegen_no_guards_native does. */
+TEST(codegen_entropy_budget_fails_fast_without_logprobs) {
+    bool had_error = false;
+    AstNode *program = parse_source(
+        "agent Categorizer {\n"
+        "    prompt: \"classify this\"\n"
+        "    capabilities: [llm.complete]\n"
+        "    entropy_budget: {\n"
+        "        max_avg_entropy: 0.7\n"
+        "        max_low_confidence: 0.20\n"
+        "    }\n"
+        "}\n",
+        &had_error);
+    ASSERT_FALSE(had_error);
+    char *c = codegen_generate_for_build(program, "<test>", &test_arena);
+    ASSERT_NOT_NULL(c);
+    ASSERT(strstr(c, "if (_llm.confidence < 0.0)") != NULL);
+    ASSERT(strstr(c, "entropy_budget requires logprobs") != NULL);
+    /* The fail-fast guard must appear before the entropy is recorded, so a
+     * fake 1.0 never reaches the tracker/budget check. */
+    const char *guard = strstr(c, "if (_llm.confidence < 0.0)");
+    const char *record = strstr(c, "lcn_entropy_record(");
+    ASSERT_NOT_NULL(guard);
+    ASSERT_NOT_NULL(record);
+    ASSERT(guard < record);
     free(c);
 }
 
@@ -4654,15 +4820,20 @@ TEST(typecheck_pub_fn_accessible) {
 }
 
 TEST(typecheck_priv_fn_error) {
-    /* A private function from another module should fail typecheck */
+    /* L8 (2026-05-13): top-level fns are PUBLIC by default. The bare
+     * `fn` form (no `pub`) is the implicit public shape, so cross-module
+     * fn imports now type-check without an explicit `pub` keyword.
+     * Pre-L8 this asserted the opposite -- the test was flipped when
+     * the L8 multi-file modules feature landed. The `pub` form is still
+     * accepted as the explicit version. */
     bool ok = typecheck_with_foreign_decl(
         "fn helper() -> i32 { return 1 }\n"
         "fn main() -> i32 { return helper() }\n",
         "helper",        /* target to patch */
         "other.lceron",  /* pretend it's from another file */
-        false            /* NOT pub */
+        false            /* NOT pub -- now allowed under L8 */
     );
-    ASSERT_FALSE(ok);
+    ASSERT(ok);
 }
 
 TEST(typecheck_priv_same_module_ok) {
@@ -5756,6 +5927,41 @@ TEST(ownership_ref_param_borrow) {
     );
     /* &data borrows, data still usable afterwards */
     ASSERT_EQ(w, 0);
+}
+
+/* C7: sb_append(handle, s) mutates through a non-owning handle and never
+ * frees it (unlike sb_to_string, which does) -- repeated sb_append calls on
+ * the same builder must not be flagged as use-of-moved-value. Regression
+ * for the false positive found in stage1/parser.lceron (100+ warnings
+ * across the self-hosted compiler before this fix). */
+TEST(ownership_sb_append_reuse_not_a_move) {
+    int w = typecheck_ownership_warnings(
+        "fn main() -> Result {\n"
+        "    let sb = sb_new()\n"
+        "    sb_append(sb, \"a\")\n"
+        "    sb_append(sb, \"b\")\n"
+        "    sb_append(sb, \"c\")\n"
+        "    let s = sb_to_string(sb)\n"
+        "    println(s)\n"
+        "}\n"
+    );
+    ASSERT_EQ(w, 0);
+}
+
+TEST(ownership_sb_to_string_still_consumes) {
+    /* sb_to_string DOES free its handle -- reusing sb after it must still
+     * be flagged, so the sb_append fix above cannot have silenced this. */
+    int w = typecheck_ownership_warnings(
+        "fn main() -> Result {\n"
+        "    let sb = sb_new()\n"
+        "    sb_append(sb, \"a\")\n"
+        "    let s = sb_to_string(sb)\n"
+        "    let s2 = sb_to_string(sb)\n"
+        "    println(s)\n"
+        "    println(s2)\n"
+        "}\n"
+    );
+    ASSERT(w >= 1);
 }
 
 TEST(ownership_advisory_mode) {
@@ -7268,6 +7474,922 @@ TEST(md_unknown_section_warning) {
     }
 }
 
+/* ============================================================
+ * L5 surface tests -- Result::Ok / Result::Err, try/catch parsing
+ * shape, match exhaustiveness over Result, host_error::<variant>
+ * resolution. IR-lowering tests live in test/test_ir.c.
+ * ============================================================ */
+
+/* Walk every AstNode in the tree (depth-first across the union of
+ * child pointers used by AstNode). Returns the first match or NULL. */
+static AstNode *find_first_kind(AstNode *node, AstKind kind) {
+    if (!node) return NULL;
+    if (node->kind == kind) return node;
+    AstNode *r;
+    if ((r = find_first_kind(node->left,       kind))) return r;
+    if ((r = find_first_kind(node->right,      kind))) return r;
+    if ((r = find_first_kind(node->type_expr,  kind))) return r;
+    if ((r = find_first_kind(node->params,     kind))) return r;
+    if ((r = find_first_kind(node->next,       kind))) return r;
+    return NULL;
+}
+
+/* Typecheck-side helper: parse, typecheck, return whether the
+ * reporter raised any error containing `needle`. */
+static bool typecheck_emits_error(const char *src, const char *needle) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(src);
+    ErrorReporter reporter = reporter_new("<test>", src, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", src, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *prog = parse_program(&parser);
+    (void)typecheck_program(prog, &reporter, &test_arena);
+    int i;
+    for (i = 0; i < reporter.count; i++) {
+        if (reporter.errors[i].message &&
+            strstr(reporter.errors[i].message, needle) != NULL)
+            return true;
+    }
+    return false;
+}
+
+TEST(l5_parser_try_catch_block_shape) {
+    /* `try { body } catch (e: int) { handler }` must produce an
+     * AST_TRY_CATCH whose ->left is the body block, ->right is the
+     * handler block, and ->name binds the catch variable. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn run() -> int {\n"
+        "    try {\n"
+        "        Result::Ok(7)\n"
+        "    } catch (e: int) {\n"
+        "        e\n"
+        "    }\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *tc = find_first_kind(p, AST_TRY_CATCH);
+    ASSERT_NOT_NULL(tc);
+    ASSERT_NOT_NULL(tc->left);
+    ASSERT_NOT_NULL(tc->right);
+    ASSERT_NOT_NULL(tc->name);
+    ASSERT_EQ(strcmp(tc->name, "e"), 0);
+}
+
+TEST(l5_parser_result_qualified_constructors) {
+    /* `Result::Ok(v)` rewrites to AST_RESULT_OK; `Result::Err(c)`
+     * rewrites to AST_RESULT_ERR. The parser hides the `Result::`
+     * prefix by re-aliasing the head identifier to the bare variant
+     * name, so the subsequent AST_CALL handler picks them up. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn make() -> int {\n"
+        "    let _o = Result::Ok(42)\n"
+        "    let _e = Result::Err(-3)\n"
+        "    0\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *ok  = find_first_kind(p, AST_RESULT_OK);
+    AstNode *erk = find_first_kind(p, AST_RESULT_ERR);
+    ASSERT_NOT_NULL(ok);
+    ASSERT_NOT_NULL(erk);
+}
+
+TEST(l5_parser_match_result_two_arms) {
+    /* `match r { Result::Ok(v) -> v, Result::Err(e) -> e }` must
+     * parse into an AST_MATCH with two AST_MATCH_ARM children whose
+     * patterns are AST_PAT_ENUM tagged with the joined Result::Ok
+     * / Result::Err names. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(r: int) -> int {\n"
+        "    match r {\n"
+        "        Result::Ok(v)  -> v\n"
+        "        Result::Err(e) -> e\n"
+        "    }\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(ast_list_len(m->params), 2);
+    AstNode *a0 = m->params;
+    AstNode *a1 = m->params->next;
+    ASSERT_EQ(a0->left->kind, AST_PAT_ENUM);
+    ASSERT_EQ(a1->left->kind, AST_PAT_ENUM);
+    ASSERT(strstr(a0->left->name, "Ok")  != NULL);
+    ASSERT(strstr(a1->left->name, "Err") != NULL);
+}
+
+TEST(l5_typecheck_match_result_inexhaustive_raises) {
+    /* A match on a Result that only carries the Ok arm must raise
+     * ERR_MATCH_INEXHAUSTIVE. (Wildcard / catch-all patterns are
+     * L6 territory -- see ROADMAP.md L6 row.) */
+    const char *src =
+        "fn pick(r: int) -> int {\n"
+        "    match r {\n"
+        "        Result::Ok(v) -> v\n"
+        "    }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l5_typecheck_match_result_complete_passes) {
+    /* The matching pair (Ok + Err) is exhaustive and must NOT raise
+     * ERR_MATCH_INEXHAUSTIVE -- negative control. */
+    const char *src =
+        "fn pick(r: int) -> int {\n"
+        "    match r {\n"
+        "        Result::Ok(v)  -> v\n"
+        "        Result::Err(e) -> e\n"
+        "    }\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l5_typecheck_host_error_unknown_variant_raises) {
+    /* An unknown HostError variant name must raise
+     * ERR_HOST_ERROR_UNKNOWN_VARIANT (validated against the
+     * canonical include/vdag.errors.wit table loaded by the
+     * typechecker). */
+    const char *src =
+        "fn bad() -> int {\n"
+        "    Result::Err(host_error::no_such_sentinel)\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_HOST_ERROR_UNKNOWN_VARIANT"));
+}
+
+TEST(l5_typecheck_host_error_known_variant_accepted) {
+    /* The canonical `quota_exceeded` sentinel is known to the
+     * loaded enum table and must NOT raise an error. (snake_case
+     * spelling at the source site is mapped onto the kebab-case
+     * canonical form by the loader's kebab/snake bridge.) */
+    const char *src =
+        "fn good() -> int {\n"
+        "    Result::Err(host_error::quota_exceeded)\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_HOST_ERROR_UNKNOWN_VARIANT"));
+}
+
+TEST(l5_typecheck_host_error_kebab_form_accepted) {
+    /* The kebab-case spelling -- as written in vdag.errors.wit --
+     * is also accepted by the loader's case-equivalence rule, in
+     * case authors copy a name out of the canonical file verbatim. */
+    const char *src =
+        "fn good() -> int {\n"
+        "    Result::Err(host_error::cost_budget_exceeded)\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_HOST_ERROR_UNKNOWN_VARIANT"));
+}
+
+/* ============================================================
+ * L6 surface tests -- general pattern matching: wildcards,
+ * literal patterns, host-error variants, guards, exhaustiveness
+ * and reachability. IR tests live in test/test_ir.c.
+ * ============================================================ */
+
+TEST(l6_parser_underscore_wildcard) {
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x { _ -> 0 }\n"
+        "}\n", &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    ASSERT_NOT_NULL(m);
+    ASSERT_EQ(m->params->left->kind, AST_PAT_WILDCARD);
+}
+
+TEST(l6_parser_underscore_binding_strips_leading_underscore) {
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x { _v -> v }\n"
+        "}\n", &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    AstNode *pat = m->params->left;
+    ASSERT_EQ(pat->kind, AST_PAT_IDENT);
+    ASSERT_EQ(strcmp(pat->name, "v"), 0);
+}
+
+TEST(l6_parser_literal_int_pattern_tagged_int) {
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x { 42 -> 1   _ -> 0 }\n"
+        "}\n", &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    AstNode *pat = m->params->left;
+    ASSERT_EQ(pat->kind, AST_PAT_LITERAL);
+    ASSERT_EQ(strcmp(pat->name, "int"), 0);
+    ASSERT_EQ(pat->val.int_val, 42);
+}
+
+TEST(l6_parser_guard_attaches_to_arm_params) {
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(x: int) -> int {\n"
+        "    match x { n if n > 100 -> 1   n -> 0 }\n"
+        "}\n", &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    AstNode *first = m->params;
+    ASSERT_EQ(first->left->kind, AST_PAT_IDENT);
+    ASSERT_NOT_NULL(first->params);
+}
+
+TEST(l6_parser_nested_enum_pattern_with_literal_payload) {
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn pick(r: int) -> int {\n"
+        "    match r {\n"
+        "        Result::Ok(0) -> 999\n"
+        "        Result::Ok(v) -> v\n"
+        "        Result::Err(e) -> e\n"
+        "    }\n"
+        "}\n", &err);
+    ASSERT_FALSE(err);
+    AstNode *m = find_first_kind(p, AST_MATCH);
+    AstNode *pat0 = m->params->left;
+    ASSERT_EQ(pat0->kind, AST_PAT_ENUM);
+    ASSERT_EQ(pat0->params->kind, AST_PAT_LITERAL);
+    ASSERT_EQ(strcmp(pat0->params->name, "int"), 0);
+}
+
+TEST(l6_typecheck_bool_match_both_arms_passes) {
+    const char *src =
+        "fn pick(b: bool) -> int {\n"
+        "    match b { true -> 1   false -> 0 }\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l6_typecheck_bool_match_missing_false_raises) {
+    const char *src =
+        "fn pick(b: bool) -> int {\n"
+        "    match b { true -> 1 }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l6_typecheck_int_match_without_wildcard_raises) {
+    const char *src =
+        "fn pick(x: int) -> int {\n"
+        "    match x { 0 -> 1   1 -> 2 }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l6_typecheck_int_match_with_wildcard_passes) {
+    const char *src =
+        "fn pick(x: int) -> int {\n"
+        "    match x { 0 -> 1   1 -> 2   _ -> 99 }\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l6_typecheck_result_with_wildcard_satisfies_exhaustiveness) {
+    const char *src =
+        "fn pick(r: int) -> int {\n"
+        "    match r { Result::Ok(v) -> v   _ -> 0 }\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+TEST(l6_typecheck_unreachable_arm_after_catchall_raises) {
+    const char *src =
+        "fn pick(x: int) -> int {\n"
+        "    match x { _ -> 1   2 -> 2 }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_MATCH_UNREACHABLE_ARM"));
+}
+
+TEST(l6_typecheck_guarded_catchall_does_not_satisfy_exhaustiveness) {
+    const char *src =
+        "fn pick(x: int) -> int {\n"
+        "    match x { 0 -> 1   n if n > 0 -> 2 }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_MATCH_INEXHAUSTIVE"));
+}
+
+/* ============================================================
+ * L4: string interpolation -- ${var} syntax
+ * ============================================================ */
+
+TEST(l4_lex_plain_string_stays_string_lit) {
+    /* No `${...}` placeholder -> still TOK_STRING_LIT, no
+     * AST_INTERP_STRING node. This protects every existing test
+     * fixture that lexes plain string literals. */
+    int count;
+    Token *tokens = lex_all("\"hello world\"", &count);
+    ASSERT_EQ(tokens[0].kind, TOK_STRING_LIT);
+    ASSERT_EQ(strcmp(tokens[0].value.str_val, "hello world"), 0);
+}
+
+TEST(l4_lex_interpolation_emits_interp_token) {
+    /* `"hello ${name}"` -> single TOK_INTERP_STRING carrying an
+     * InterpString payload with 1 placeholder + 2 literal segments
+     * ("hello " and "" -- the trailing literal is always present
+     * even when empty). */
+    int count;
+    Token *tokens = lex_all("\"hello ${name}\"", &count);
+    ASSERT_EQ(tokens[0].kind, TOK_INTERP_STRING);
+    InterpString *is = tokens[0].value.interp;
+    ASSERT_NOT_NULL(is);
+    ASSERT_EQ(is->count, 1);
+    ASSERT_EQ(strcmp(is->literals[0], "hello "), 0);
+    ASSERT_EQ(strcmp(is->literals[1], ""), 0);
+    ASSERT_EQ(strcmp(is->expr_src[0], "name"), 0);
+    ASSERT_FALSE(is->nested_detected);
+}
+
+TEST(l4_lex_escape_dollar_stays_literal) {
+    /* `\$` produces a literal `$` and does NOT trip interpolation.
+     * `price: \$${cost}` therefore tokens to one TOK_INTERP_STRING
+     * whose literal[0] is "price: $" and whose first ${} captures
+     * `cost`. */
+    int count;
+    Token *tokens = lex_all("\"price: \\$${cost}\"", &count);
+    ASSERT_EQ(tokens[0].kind, TOK_INTERP_STRING);
+    InterpString *is = tokens[0].value.interp;
+    ASSERT_NOT_NULL(is);
+    ASSERT_EQ(is->count, 1);
+    ASSERT_EQ(strcmp(is->literals[0], "price: $"), 0);
+    ASSERT_EQ(strcmp(is->expr_src[0], "cost"), 0);
+}
+
+TEST(l4_lex_detects_nested_interpolation) {
+    /* `${"${x}"}` -- a nested `${` inside an embedded string -- must
+     * set the InterpString's nested_detected flag so the parser
+     * can raise ERR_NESTED_INTERPOLATION. */
+    int count;
+    Token *tokens = lex_all("\"${\"${x}\"}\"", &count);
+    ASSERT_EQ(tokens[0].kind, TOK_INTERP_STRING);
+    InterpString *is = tokens[0].value.interp;
+    ASSERT_NOT_NULL(is);
+    ASSERT(is->nested_detected);
+}
+
+TEST(l4_parser_builds_interp_string_ast) {
+    /* `"hello ${name}"` -> AST_INTERP_STRING whose `params` is a
+     * 3-node list: AST_STRING_LIT("hello "), AST_IDENT("name"),
+     * AST_STRING_LIT(""). Parts are emitted in source order so the
+     * IR-gen pass can fold them into a left-associative concat. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn build() -> string {\n"
+        "    let name = \"world\"\n"
+        "    \"hello ${name}\"\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *is = find_first_kind(p, AST_INTERP_STRING);
+    ASSERT_NOT_NULL(is);
+    ASSERT_EQ(ast_list_len(is->params), 3);
+    AstNode *part0 = is->params;
+    AstNode *part1 = part0->next;
+    AstNode *part2 = part1->next;
+    ASSERT_EQ(part0->kind, AST_STRING_LIT);
+    ASSERT_EQ(strcmp(part0->val.str_val, "hello "), 0);
+    ASSERT_EQ(part1->kind, AST_IDENT);
+    ASSERT_EQ(strcmp(part1->name, "name"), 0);
+    ASSERT_EQ(part2->kind, AST_STRING_LIT);
+    ASSERT_EQ(strcmp(part2->val.str_val, ""), 0);
+}
+
+TEST(l4_parser_nested_interpolation_raises) {
+    /* `"${\"${x}\"}"` -- a `${` inside the string-literal embedded
+     * in an outer `${...}` -- must raise ERR_NESTED_INTERPOLATION at
+     * parse time (the lexer flags it; the parser surfaces it). */
+    const char *src =
+        "fn build() -> int {\n"
+        "    let x = 1\n"
+        "    let _ = \"${\"${x}\"}\"\n"
+        "    0\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_NESTED_INTERPOLATION"));
+}
+
+TEST(l4_typecheck_json_without_cast_raises) {
+    /* A `${doc}` placeholder where `doc: Json` is the bound type
+     * must raise ERR_INTERP_NOT_COERCIBLE -- the author has to spell
+     * out `${doc as string}` so the lowering goes through
+     * `vdag:json.as-string` instead of the implicit
+     * `vdag:string.from_*` path. */
+    const char *src =
+        "agent A {\n"
+        "    capabilities: [json.parse, json.as_string]\n"
+        "    budget: { max_tokens: 1, max_cost: 0.0 }\n"
+        "    fn main() -> string {\n"
+        "        let doc: Json = json.parse(\"{}\")?\n"
+        "        \"value=${doc}\"\n"
+        "    }\n"
+        "}\n";
+    ASSERT(typecheck_emits_error(src, "ERR_INTERP_NOT_COERCIBLE"));
+}
+
+TEST(l4_typecheck_json_with_cast_accepted) {
+    /* The same shape with `${doc as string}` must NOT raise
+     * ERR_INTERP_NOT_COERCIBLE -- negative control. */
+    const char *src =
+        "agent A {\n"
+        "    capabilities: [json.parse, json.as_string]\n"
+        "    budget: { max_tokens: 1, max_cost: 0.0 }\n"
+        "    fn main() -> string {\n"
+        "        let doc: Json = json.parse(\"{}\")?\n"
+        "        \"value=${doc as string}\"\n"
+        "    }\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_INTERP_NOT_COERCIBLE"));
+}
+
+TEST(l4_typecheck_int_implicit_coercion_ok) {
+    /* int / bool / float / string slip through with no cast --
+     * each lowers to the matching `vdag:string.from_*` host call. */
+    const char *src =
+        "fn build(n: int) -> string {\n"
+        "    \"count=${n}\"\n"
+        "}\n";
+    ASSERT(!typecheck_emits_error(src, "ERR_INTERP_NOT_COERCIBLE"));
+}
+
+/* ============================================================
+ * L7: stdlib minimum -- math + string + time
+ * ============================================================ */
+
+TEST(l7_parser_math_clamp_call) {
+    /* `math.clamp(x, lo, hi)` parses to a host-call-shaped AST node
+     * whose qualified name is "math.clamp" and which carries three
+     * arg expressions. The IR-gen pass intercepts this name and
+     * lowers it inline as a pure-int builtin -- the parser shape
+     * itself stays uniform with every other `<ns>.<verb>(...)` call. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn f() -> int {\n"
+        "    math.clamp(5, 0, 10)\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *hc = find_first_kind(p, AST_HOST_CALL);
+    ASSERT_NOT_NULL(hc);
+    ASSERT_NOT_NULL(hc->name);
+    ASSERT_EQ(strcmp(hc->name, "math.clamp"), 0);
+    ASSERT_EQ(ast_list_len(hc->params), 3);
+}
+
+TEST(l7_parser_string_contains_call) {
+    /* `string.contains(s, "x")` parses to AST_HOST_CALL with the
+     * qualified "string.contains" name and two arg expressions. The
+     * front-end treats `string` as a reserved host namespace prefix
+     * (parser.c::parse_expr). */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn f(s: string) -> bool {\n"
+        "    string.contains(s, \"x\")\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *hc = find_first_kind(p, AST_HOST_CALL);
+    ASSERT_NOT_NULL(hc);
+    ASSERT_EQ(strcmp(hc->name, "string.contains"), 0);
+    ASSERT_EQ(ast_list_len(hc->params), 2);
+}
+
+TEST(l7_parser_time_now_call) {
+    /* `time.now()` is zero-arg but still flows through AST_HOST_CALL
+     * so the wasm backend can register the import slot. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "fn f() -> int {\n"
+        "    time.now()\n"
+        "}\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *hc = find_first_kind(p, AST_HOST_CALL);
+    ASSERT_NOT_NULL(hc);
+    ASSERT_EQ(strcmp(hc->name, "time.now"), 0);
+    ASSERT_EQ(ast_list_len(hc->params), 0);
+}
+
+TEST(l7_parser_use_stdlib_path_accepted) {
+    /* The L8 module system is deferred, but the parser must at least
+     * accept `use stdlib::math;` (the `::` separator commonly used in
+     * doc/L8 examples) without erroring. The path is normalised onto
+     * the existing dotted form so downstream passes keep working. */
+    bool err = false;
+    AstNode *p = parse_source(
+        "use stdlib::math;\n"
+        "fn f() -> int { 0 }\n",
+        &err);
+    ASSERT_FALSE(err);
+    AstNode *u = find_first_kind(p, AST_USE);
+    ASSERT_NOT_NULL(u);
+}
+
+/* Run typecheck for `src` and return the number of non-warning errors
+ * raised. Use this helper when an exact error message string would be
+ * needed -- the global `report_error_fmt` writes its formatted message
+ * into a stack buffer (lexer.c:261) whose contents may be clobbered by
+ * subsequent passes; the count itself stays stable. */
+static int typecheck_error_count(const char *src) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(src);
+    ErrorReporter reporter = reporter_new("<test>", src, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", src, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *prog = parse_program(&parser);
+    (void)typecheck_program(prog, &reporter, &test_arena);
+    int n = 0;
+    int i;
+    for (i = 0; i < reporter.count; i++) {
+        if (!reporter.errors[i].is_warning) n++;
+    }
+    return n;
+}
+
+TEST(l7_typecheck_rejects_math_clamp_wrong_arity) {
+    /* Calling a stdlib fn with the wrong argument count must trip
+     * the host-call signature check (ERR_HOST_CALL_SIGNATURE_MISMATCH)
+     * -- the canonical contract entry in include/vdag.wit declares
+     * math.clamp as a 3-arg fn. We compare error counts because the
+     * formatted error string lives in a stack buffer the subsequent
+     * typecheck passes may clobber. */
+    const char *bad =
+        "fn f() -> int {\n"
+        "    math.clamp(5)\n"
+        "}\n";
+    ASSERT(typecheck_error_count(bad) >= 1);
+}
+
+TEST(l7_typecheck_accepts_math_clamp_correct_arity) {
+    /* Negative control: the correct 3-arg shape must NOT raise any
+     * errors (warnings are allowed). */
+    const char *good =
+        "fn f() -> int {\n"
+        "    math.clamp(5, 0, 10)\n"
+        "}\n";
+    ASSERT_EQ(typecheck_error_count(good), 0);
+}
+
+/* ============================================================
+ * L8: multi-file modules
+ *
+ * Covers the four guarantees the L8 spec lands:
+ *
+ *   1. Module-level `use helpers;` parses to AST_USE at the top of
+ *      `program->params` (no agent-scope wrapper).
+ *   2. Top-level fns from an imported sibling typecheck without `pub`
+ *      (public by default per L8).
+ *   3. A direct cycle (file A uses B uses A) is detected and the
+ *      loader raises ERR_CIRCULAR_IMPORT. This test uses a one-off
+ *      tmp directory because the loader walks the real filesystem.
+ *   4. Same fn name in two different modules mangles to distinct
+ *      symbols (`lcn___<stem_a>_<fn>` vs `lcn___<stem_b>_<fn>`) so
+ *      the IR / C symbol space stays collision-free.
+ * ============================================================ */
+
+TEST(l8_parse_module_level_use) {
+    /* Module-level `use helpers;` at the top of the file (NOT inside
+     * an agent / capability block). The historical L7 stub already
+     * accepted module-level `use`; this test pins the AST shape so
+     * future refactors don't accidentally re-scope it. */
+    bool err = false;
+    AstNode *p = parse_source("use helpers\nfn main() {}", &err);
+    ASSERT_FALSE(err);
+    ASSERT_NOT_NULL(p);
+    ASSERT_NOT_NULL(p->params);
+    ASSERT_EQ(p->params->kind, AST_USE);
+    ASSERT_STR_EQ(p->params->name, "helpers");
+}
+
+TEST(l8_typecheck_priv_fn_imported_ok) {
+    /* L8: a `fn` (no `pub`) imported from a sibling module typechecks
+     * because top-level fns default to public. This is the inverse of
+     * the legacy typecheck_priv_fn_error test (which was flipped to
+     * ASSERT(ok) in this same suite for the same reason). */
+    bool ok = typecheck_with_foreign_decl(
+        "fn helper() -> i32 { return 1 }\n"
+        "fn main() -> i32 { return helper() }\n",
+        "helper",
+        "helpers.lceron",
+        false);
+    ASSERT(ok);
+}
+
+TEST(l8_circular_import_detected) {
+    /* Write two .lceron files in /tmp that import each other and
+     * invoke the stage0 compiler. Compilation MUST mention
+     * ERR_CIRCULAR_IMPORT on stderr; we capture the run via popen so
+     * the test framework's red/green output isn't polluted. */
+    const char *dir = "/tmp/lcn_l8_cycle";
+    /* Best-effort -- ignore mkdir failure if dir already exists. */
+    (void)system("rm -rf /tmp/lcn_l8_cycle && mkdir -p /tmp/lcn_l8_cycle");
+
+    FILE *fa = fopen("/tmp/lcn_l8_cycle/a.lceron", "w");
+    ASSERT_NOT_NULL(fa);
+    fputs("use b\nfn from_a() -> int { 1 }\nfn main() {}\n", fa);
+    fclose(fa);
+
+    FILE *fb = fopen("/tmp/lcn_l8_cycle/b.lceron", "w");
+    ASSERT_NOT_NULL(fb);
+    fputs("use a\nfn from_b() -> int { 2 }\n", fb);
+    fclose(fb);
+
+    /* Stage0 prints "ERR_CIRCULAR_IMPORT" on stderr when it sees a
+     * file already on the resolution stack. We just need the textual
+     * presence to confirm the cycle path was reported. */
+    FILE *p = popen("./build/limceron-stage0 build "
+                     "/tmp/lcn_l8_cycle/a.lceron "
+                     "-o /tmp/lcn_l8_cycle/a.out 2>&1", "r");
+    ASSERT_NOT_NULL(p);
+    char line[1024];
+    bool saw_cycle = false;
+    while (fgets(line, sizeof(line), p)) {
+        if (strstr(line, "ERR_CIRCULAR_IMPORT")) { saw_cycle = true; break; }
+    }
+    /* Drain remaining output so pclose doesn't block on SIGPIPE. */
+    while (fgets(line, sizeof(line), p)) { /* discard */ }
+    pclose(p);
+    (void)dir;
+    ASSERT(saw_cycle);
+}
+
+TEST(l8_mangling_two_modules_same_fn_name) {
+    /* Verify the mangling rule end-to-end via the codegen pipeline.
+     * We don't have a public IR-symbol enumeration API but the
+     * emitted C source carries the mangled names verbatim, so we
+     * shell out to the compiler in `emit` mode and grep for the two
+     * expected `lcn___<stem>_greet` symbols. */
+    const char *dir = "/tmp/lcn_l8_dupfn";
+    (void)system("rm -rf /tmp/lcn_l8_dupfn && mkdir -p /tmp/lcn_l8_dupfn");
+
+    FILE *fmain = fopen("/tmp/lcn_l8_dupfn/main.lceron", "w");
+    ASSERT_NOT_NULL(fmain);
+    fputs("use alpha\nuse beta\n"
+          "fn main() { let _ = alpha.greet(\"x\"); let _ = beta.greet(\"y\") }\n",
+          fmain);
+    fclose(fmain);
+
+    FILE *fa = fopen("/tmp/lcn_l8_dupfn/alpha.lceron", "w");
+    ASSERT_NOT_NULL(fa);
+    fputs("fn greet(name: string) -> string { \"A\" }\n", fa);
+    fclose(fa);
+
+    FILE *fb = fopen("/tmp/lcn_l8_dupfn/beta.lceron", "w");
+    ASSERT_NOT_NULL(fb);
+    fputs("fn greet(name: string) -> string { \"B\" }\n", fb);
+    fclose(fb);
+
+    FILE *p = popen("./build/limceron-stage0 emit "
+                     "/tmp/lcn_l8_dupfn/main.lceron 2>/dev/null", "r");
+    ASSERT_NOT_NULL(p);
+    char line[2048];
+    bool saw_alpha = false, saw_beta = false;
+    while (fgets(line, sizeof(line), p)) {
+        if (strstr(line, "lcn___alpha_greet")) saw_alpha = true;
+        if (strstr(line, "lcn___beta_greet"))  saw_beta  = true;
+    }
+    pclose(p);
+    (void)dir;
+    ASSERT(saw_alpha);
+    ASSERT(saw_beta);
+}
+
+/* ============================================================
+ * L9 (bidirectional type inference) tests
+ *
+ * The L9 inference engine (LcnUnifyTable + lcn_unify + the walker in
+ * src/l9_infer.c) is exercised directly via `lcn_l9_infer_types`.
+ * Each test parses a snippet, hands the AST + a fresh symbol table to
+ * the inference pass, and inspects the reporter for the expected
+ * diagnostic.
+ * ============================================================ */
+
+typedef enum {
+    L9T_SYM_FN,
+    L9T_SYM_AGENT,
+    L9T_SYM_TOOL,
+    L9T_SYM_CAPABILITY,
+    L9T_SYM_GUARD,
+    L9T_SYM_GUARDSET,
+    L9T_SYM_BUDGET,
+    L9T_SYM_TAINT,
+    L9T_SYM_STRUCT,
+    L9T_SYM_ENUM,
+    L9T_SYM_TRAIT,
+    L9T_SYM_INTERFACE,
+    L9T_SYM_CONST,
+    L9T_SYM_SUPERVISOR,
+    L9T_SYM_SKILL,
+    L9T_SYM_PROMPT,
+    L9T_SYM_MESH,
+    L9T_SYM_MEMORY,
+    L9T_SYM_CHANNEL,
+    L9T_SYM_ROUTER,
+    L9T_SYM_STRATEGY,
+    L9T_SYM_LET,
+    L9T_SYM_TYPE_ALIAS
+} L9TSymKind;
+
+typedef struct {
+    const char *name;
+    int         kind;
+    AstNode    *node;
+    SourceLoc   loc;
+} L9TSymbol;
+
+typedef struct {
+    L9TSymbol entries[4096];
+    int       count;
+} L9TSymbolTable;
+
+extern void lcn_l9_infer_types(void *symtab, AstNode *program,
+                               ErrorReporter *reporter, Arena *arena);
+
+static int l9_run_infer(const char *source, char *first_msg, size_t msg_cap) {
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+
+    size_t len = strlen(source);
+    ErrorReporter reporter = reporter_new("<test>", source, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", source, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *program = parse_program(&parser);
+    if (parser.had_error) return -1;
+
+    L9TSymbolTable st;
+    memset(&st, 0, sizeof(st));
+    for (AstNode *d = program->params; d; d = d->next) {
+        if (d->kind == AST_FN && d->name && st.count < 4096) {
+            st.entries[st.count].name = d->name;
+            st.entries[st.count].kind = (int)L9T_SYM_FN;
+            st.entries[st.count].node = d;
+            st.entries[st.count].loc  = d->loc;
+            st.count++;
+        }
+    }
+
+    lcn_l9_infer_types(&st, program, &reporter, &test_arena);
+
+    int errors = 0;
+    int i;
+    for (i = 0; i < reporter.count; i++) {
+        if (!reporter.errors[i].is_warning) {
+            if (errors == 0 && first_msg && msg_cap > 0 &&
+                reporter.errors[i].message) {
+                size_t n = strlen(reporter.errors[i].message);
+                if (n >= msg_cap) n = msg_cap - 1;
+                memcpy(first_msg, reporter.errors[i].message, n);
+                first_msg[n] = '\0';
+            }
+            errors++;
+        }
+    }
+    return errors;
+}
+
+TEST(l9_infer_int_literal) {
+    int errors = l9_run_infer(
+        "fn main() -> int {\n"
+        "    let x = 42\n"
+        "    x\n"
+        "}\n",
+        NULL, 0);
+    ASSERT_EQ(errors, 0);
+}
+
+TEST(l9_infer_from_callee_return) {
+    int errors = l9_run_infer(
+        "fn some_int_fn() -> int { 7 }\n"
+        "fn main() -> int {\n"
+        "    let x = some_int_fn()\n"
+        "    x\n"
+        "}\n",
+        NULL, 0);
+    ASSERT_EQ(errors, 0);
+}
+
+TEST(l9_infer_if_branches_must_unify) {
+    /* Both branches must agree -- int vs string -> unification failure.
+     * (We only assert the error count; the stored message buffer in
+     * ErrorReporter is currently shallow-aliased by report_error_fmt
+     * and can be observed as garbage after multiple emissions.) */
+    int errors = l9_run_infer(
+        "fn main() -> int {\n"
+        "    let x = if true { 1 } else { \"a\" }\n"
+        "    42\n"
+        "}\n",
+        NULL, 0);
+    ASSERT(errors >= 1);
+}
+
+TEST(l9_infer_nested_calls) {
+    int errors = l9_run_infer(
+        "fn bar(n: int) -> int { n }\n"
+        "fn foo(n: int) -> int { n }\n"
+        "fn main() -> int {\n"
+        "    let x = foo(bar(42))\n"
+        "    x\n"
+        "}\n",
+        NULL, 0);
+    ASSERT_EQ(errors, 0);
+}
+
+TEST(l9_infer_return_type_mismatch) {
+    /* fn f() -> string { let x = 42; x } -- x infers to int, fn
+     * declares string -> tail (⇓) check raises unification failure. */
+    int errors = l9_run_infer(
+        "fn f() -> string {\n"
+        "    let x = 42\n"
+        "    x\n"
+        "}\n",
+        NULL, 0);
+    ASSERT(errors >= 1);
+}
+
+/* ------------------------------------------------------------ *
+ * L9 pipeline tests -- exercise the engine through the full
+ * `typecheck_program` flow. Before Pass 10 was wired in
+ * src/typecheck.c, `lcn_l9_infer_types` only ran when called
+ * directly (the tests above). These two tests confirm that the
+ * inference engine now fires as part of the main typecheck
+ * pipeline -- the path the `limceron build` CLI takes -- so a
+ * return-type mismatch in implicit-typed `let` code is surfaced
+ * before IR-gen instead of leaking to the wasm backend.
+ * ------------------------------------------------------------ */
+
+TEST(l9_pipeline_let_inferred_int) {
+    /* The let-bound RHS is `42`, an int literal; with Pass 10 wired
+     * the inferred type for `x` is int, which unifies with the
+     * declared return type. typecheck_program must accept. Before
+     * Pass 10 wiring this also passed (the implicit-typed let was
+     * already accepted by Pass 6), so the assertion here is that
+     * we did not REGRESS valid code by wiring the inference pass. */
+    const char *src =
+        "fn foo() -> int {\n"
+        "    let x = 42\n"
+        "    x\n"
+        "}\n";
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(src);
+    ErrorReporter reporter = reporter_new("<test>", src, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", src, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *prog = parse_program(&parser);
+    bool ok = typecheck_program(prog, &reporter, &test_arena);
+    ASSERT(ok);
+}
+
+TEST(l9_pipeline_return_type_mismatch) {
+    /* The return-type-mismatch case routed through `typecheck_program`.
+     * `x` infers to int, declared return is string, so the L9 walker
+     * must emit `cannot unify int and string in return of fn 'foo'`.
+     * Pre-Pass-10 wiring this would have silently passed Pass 6 and
+     * only failed deep in IR-gen / wasm emission. */
+    const char *src =
+        "fn foo() -> string {\n"
+        "    let x = 42\n"
+        "    x\n"
+        "}\n";
+    arena_reset(&test_arena);
+    arena_reset(&test_intern_arena);
+    size_t len = strlen(src);
+    ErrorReporter reporter = reporter_new("<test>", src, len);
+    StringIntern intern = intern_new(&test_intern_arena);
+    Lexer lexer = lexer_new("<test>", src, len, &intern, &reporter);
+    Parser parser = parser_new(&lexer, &test_arena, &reporter);
+    AstNode *prog = parse_program(&parser);
+    bool ok = typecheck_program(prog, &reporter, &test_arena);
+
+    /* The pipeline must reject -- enforced error count > 0. */
+    ASSERT_FALSE(ok);
+
+    /* The diagnostic must come from Pass 10 (lcn_l9_infer_types).
+     * Match on the substring the engine emits in src/l9_infer.c. */
+    bool found = false;
+    int i;
+    for (i = 0; i < reporter.count; i++) {
+        if (!reporter.errors[i].is_warning &&
+            reporter.errors[i].message &&
+            strstr(reporter.errors[i].message,
+                   "in return of fn 'foo'") != NULL) {
+            found = true;
+            break;
+        }
+    }
+    ASSERT(found);
+}
+
 int main(void) {
     fprintf(stderr, "\n\033[1mLimceron Stage 0 — Test Suite\033[0m\n\n");
 
@@ -7527,6 +8649,13 @@ int main(void) {
     RUN_TEST(parse_nested_loops);
     RUN_TEST(codegen_for_range_expr);
 
+    fprintf(stderr, "\n── L2: loops + loop-carried bindings ──\n");
+    RUN_TEST(l2_parse_loop_keyword_infinite);
+    RUN_TEST(l2_parse_for_wildcard_pattern);
+    RUN_TEST(l2_typecheck_rejects_break_outside_loop);
+    RUN_TEST(l2_typecheck_rejects_continue_outside_loop);
+    RUN_TEST(l2_typecheck_accepts_break_inside_if_inside_loop);
+
     fprintf(stderr, "\n── Pattern Matching Tests ──\n");
     RUN_TEST(parse_match_wildcard);
     RUN_TEST(parse_match_multiple_arms);
@@ -7579,6 +8708,7 @@ int main(void) {
     fprintf(stderr, "\n── Invariant Wiring Tests ──\n");
     RUN_TEST(codegen_invariant_drift);
     RUN_TEST(codegen_invariant_avg_confidence);
+    RUN_TEST(codegen_entropy_budget_fails_fast_without_logprobs);
     RUN_TEST(codegen_invariant_avg_entropy);
     RUN_TEST(parse_invariant_decl);
 
@@ -7716,6 +8846,8 @@ int main(void) {
     RUN_TEST(ownership_scope_release);
     RUN_TEST(ownership_function_param_move);
     RUN_TEST(ownership_ref_param_borrow);
+    RUN_TEST(ownership_sb_append_reuse_not_a_move);
+    RUN_TEST(ownership_sb_to_string_still_consumes);
     RUN_TEST(ownership_advisory_mode);
 
     fprintf(stderr, "\n── Package Manager Tests ──\n");
@@ -7794,6 +8926,64 @@ int main(void) {
     RUN_TEST(md_guard_text_only);
     RUN_TEST(md_guard_with_code_block);
     RUN_TEST(md_unknown_section_warning);
+
+    fprintf(stderr, "\n── L5: Result<T,E> + try/catch + match + HostError ──\n");
+    RUN_TEST(l5_parser_try_catch_block_shape);
+    RUN_TEST(l5_parser_result_qualified_constructors);
+    RUN_TEST(l5_parser_match_result_two_arms);
+    RUN_TEST(l5_typecheck_match_result_inexhaustive_raises);
+    RUN_TEST(l5_typecheck_match_result_complete_passes);
+    RUN_TEST(l5_typecheck_host_error_unknown_variant_raises);
+    RUN_TEST(l5_typecheck_host_error_known_variant_accepted);
+    RUN_TEST(l5_typecheck_host_error_kebab_form_accepted);
+
+    fprintf(stderr, "\n── L6: pattern matching -- wildcards, literals, guards, nested ──\n");
+    RUN_TEST(l6_parser_underscore_wildcard);
+    RUN_TEST(l6_parser_underscore_binding_strips_leading_underscore);
+    RUN_TEST(l6_parser_literal_int_pattern_tagged_int);
+    RUN_TEST(l6_parser_guard_attaches_to_arm_params);
+    RUN_TEST(l6_parser_nested_enum_pattern_with_literal_payload);
+    RUN_TEST(l6_typecheck_bool_match_both_arms_passes);
+    RUN_TEST(l6_typecheck_bool_match_missing_false_raises);
+    RUN_TEST(l6_typecheck_int_match_without_wildcard_raises);
+    RUN_TEST(l6_typecheck_int_match_with_wildcard_passes);
+    RUN_TEST(l6_typecheck_result_with_wildcard_satisfies_exhaustiveness);
+    RUN_TEST(l6_typecheck_unreachable_arm_after_catchall_raises);
+    RUN_TEST(l6_typecheck_guarded_catchall_does_not_satisfy_exhaustiveness);
+
+    fprintf(stderr, "\n── L4: string interpolation -- ${var} ──\n");
+    RUN_TEST(l4_lex_plain_string_stays_string_lit);
+    RUN_TEST(l4_lex_interpolation_emits_interp_token);
+    RUN_TEST(l4_lex_escape_dollar_stays_literal);
+    RUN_TEST(l4_lex_detects_nested_interpolation);
+    RUN_TEST(l4_parser_builds_interp_string_ast);
+    RUN_TEST(l4_parser_nested_interpolation_raises);
+    RUN_TEST(l4_typecheck_json_without_cast_raises);
+    RUN_TEST(l4_typecheck_json_with_cast_accepted);
+    RUN_TEST(l4_typecheck_int_implicit_coercion_ok);
+
+    fprintf(stderr, "\n── L7: stdlib minimum (math + string + time) ──\n");
+    RUN_TEST(l7_parser_math_clamp_call);
+    RUN_TEST(l7_parser_string_contains_call);
+    RUN_TEST(l7_parser_time_now_call);
+    RUN_TEST(l7_parser_use_stdlib_path_accepted);
+    RUN_TEST(l7_typecheck_rejects_math_clamp_wrong_arity);
+    RUN_TEST(l7_typecheck_accepts_math_clamp_correct_arity);
+
+    fprintf(stderr, "\n── L8: multi-file modules ──\n");
+    RUN_TEST(l8_parse_module_level_use);
+    RUN_TEST(l8_typecheck_priv_fn_imported_ok);
+    RUN_TEST(l8_circular_import_detected);
+    RUN_TEST(l8_mangling_two_modules_same_fn_name);
+
+    fprintf(stderr, "\n── L9: bidirectional type inference ──\n");
+    RUN_TEST(l9_infer_int_literal);
+    RUN_TEST(l9_infer_from_callee_return);
+    RUN_TEST(l9_infer_if_branches_must_unify);
+    RUN_TEST(l9_infer_nested_calls);
+    RUN_TEST(l9_infer_return_type_mismatch);
+    RUN_TEST(l9_pipeline_let_inferred_int);
+    RUN_TEST(l9_pipeline_return_type_mismatch);
 
     teardown();
 

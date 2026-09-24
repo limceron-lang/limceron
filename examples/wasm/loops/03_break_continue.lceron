@@ -1,0 +1,46 @@
+// 03_break_continue.lceron — WASM PoC sample: for-in with break and continue.
+//
+// Walks i over 0..100 and accumulates a sum subject to two filters:
+//
+//   1. BREAK     — at the first multiple of 17 that is also >= 10.
+//                  17, 34, 51, 68, 85 are the multiples of 17 in this
+//                  range; the first one that satisfies i >= 10 is 17.
+//                  So we exit the loop the moment i hits 17.
+//
+//   2. CONTINUE  — odd i values are skipped (do not contribute to sum).
+//                  Note that the BREAK check is evaluated FIRST, so a
+//                  break-eligible i never reaches the continue gate.
+//                  (This matters for i = 17, which is both odd and the
+//                  trigger value.)
+//
+// So the loop body runs (and adds to sum) only for EVEN i in [0, 17):
+//
+//     0 + 2 + 4 + 6 + 8 + 10 + 12 + 14 + 16 = 72
+//
+// Expected: agent_main / main returns 72.
+//
+// Compile & run:
+//   ./build/limceron-stage0 build --target wasm32-wasi-preview2 \
+//       -o /tmp/loop_03.wasm examples/wasm/loops/03_break_continue.lceron
+//   wasmtime --invoke main /tmp/loop_03.wasm    # => 72
+
+agent LoopBreakContinue {
+    capabilities: []
+    budget: { max_tokens: 10, max_cost: 0.01 }
+
+    fn main() -> int {
+        let mut sum = 0
+        for i in 0..100 {
+            // Break test FIRST so it pre-empts the continue check.
+            if i >= 10 && (i % 17) == 0 {
+                break
+            }
+            // Skip odd values.
+            if (i % 2) == 1 {
+                continue
+            }
+            sum = sum + i
+        }
+        sum
+    }
+}

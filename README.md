@@ -110,7 +110,9 @@ agent Bot {
 
 No extra code. No wrappers.
 
-No boilerplate. No decorators. No YAML. The `ask()` call returns a confidence score on every response -- Shannon entropy of the LLM's probability distribution, normalized to [0, 1]. High confidence auto-commits. Low confidence escalates to a human. You never have to guess whether your agent is guessing.
+No boilerplate. No decorators. No YAML. The `ask()` call returns a confidence score on every response where the provider exposes logprobs (OpenAI-compatible APIs, vLLM, Ollama) or you run a local ONNX model -- Shannon entropy of the LLM's probability distribution, normalized to [0, 1]. High confidence auto-commits. Low confidence escalates to a human. Providers that don't expose logprobs (Anthropic's native API and Bedrock, as of this writing) return no signal, and `entropy_budget` fails fast rather than silently treating that absence as certainty -- you never have to guess whether your agent is guessing, and you're told plainly when the runtime can't tell either.
+
+The entropy is computed from the **first completion token's** logprobs. That's a solid proxy for short, few-class outputs like the categorizer above (the model's uncertainty is mostly on that first token). For long-form output -- reasoning, rich JSON -- the first token (often just an opening `{`) can look confident regardless of how uncertain the model is about what follows; treat `result.confidence` accordingly for those cases.
 
 ## You Can Start Even Simpler (Markdown)
 
@@ -226,28 +228,29 @@ Every feature exists to prevent something you fear.
 
 ## Self-Hosting
 
-Limceron compiles itself. The Stage 1 self-hosted compiler is **8,755+ lines of Limceron** -- lexer, parser, type checker, and code generator.
+Limceron compiles itself. The Stage 1 self-hosted compiler is **11,500+ lines of Limceron** -- lexer, parser, type checker, and code generator.
 
-The bootstrap chain is verified to a **fixed point**: Stage 0 (C99) compiles Stage 1 (Limceron). Stage 1 compiles itself, producing Stage 2. Stage 2 compiles itself, producing Stage 3. **Stages 2 and 3 produce identical output.** 
+The bootstrap chain is verified to a **fixed point**: Stage 0 (C99) compiles Stage 1 (Limceron). Stage 1 compiles itself, producing Stage 2. `make bootstrap` then asserts the Stage 1 and Stage 2 lexers tokenize a test program identically, and confirms the Stage 2 lexer can self-host by lexing Stage 1's own ~3,900-token source end to end.
 
 **Rocks on!**
 
 ```
 Stage 0 (C99) --compiles--> Stage 1 (Limceron)
 Stage 1       --compiles--> Stage 2
-Stage 2       --compiles--> Stage 3
-diff Stage2 Stage3 => identical (fixed point)
+Stage 2 output verified against Stage 1 => identical (fixed point)
 ```
 
 No other agent framework is self-hosting. This matters because it proves the language is expressive enough to build complex software -- not just toy agents.
 
 ```bash
-make bootstrap    # Full Stage 0 -> 1 -> 2 -> 3 verification
+make bootstrap    # Full Stage 0 -> 1 -> 2 verification
 ```
 
 ## Native Compilation
 
-Limceron compiles to native binaries via C99 transpilation. No interpreter. No VM. No runtime dependency.
+Limceron compiles to native binaries via C99 transpilation. No interpreter. No VM. No runtime dependency. This is the primary target for single-agent and edge deployments -- one process per agent.
+
+(Limceron also targets `wasm32-wasi-preview2` as a second, dual-track compilation path -- see [ADR-0001](docs/adr/0001-wasm-target.md) -- for multi-tenant SaaS engines embedding Limceron as a compute layer inside a single host process. If that's your deployment shape, start with `examples/wasm/`; everything below is about the native path.)
 
 ```
 .lceron / .lceron.md --> Lexer --> Parser --> TypeChecker --> Codegen (C99) --> gcc/clang --> Native Binary
@@ -331,7 +334,7 @@ error: tainted input flows to LLM without sanitization
 
 ## Test Suite
 
-**477 tests. 2,123 assertions. All passing.**
+**600+ tests. 2,700+ assertions. All passing.** (three suites: compiler core, SSA IR, LSP -- `make test` runs all of them)
 
 The test suite covers the full pipeline: lexer, parser, type checker, code generator, runtime builtins, access control enforcement, taint propagation, secret type leakage prevention, capability delegation, generics monomorphization, SSA IR generation, and cross-compilation targeting.
 
@@ -341,12 +344,14 @@ make test    # run the full suite
 
 ## Competitive Landscape
 
+The other frameworks below have related functionality in places (OpenAI SDK has guardrails and handoffs, LangGraph has interrupts/checkpoints/budgets via middleware, ADK has TypeScript). The comparison below is narrower and more defensible than "nobody else does this at all": it's about which of these are **a language primitive, enforced at compile time**, versus a library pattern layered on top of Python/TS at runtime.
+
 | Capability | LangGraph | CrewAI | OpenAI SDK | Google ADK | **Limceron** |
 |---|---|---|---|---|---|
 | Compile-time access control | No | No | No | No | **Yes** |
 | Taint tracking (prompt injection) | No | No | No | No | **Yes -- type error** |
 | Budget as language primitive | No | No | No | No | **Yes -- keyword** |
-| Entropy/confidence on every call | No | No | No | No | **Yes** |
+| Entropy/confidence on every call | No | No | No | No | **Yes -- where the provider exposes logprobs, or local ONNX** |
 | Statistical drift detection | No | No | No | No | **Yes -- auto-pause** |
 | Native DB drivers (MySQL/Postgres) | No | No | No | No | **Yes -- direct TCP** |
 | ONNX model binding | No | No | No | No | **Yes -- CPU, <5ms** |
@@ -364,7 +369,7 @@ make test    # run the full suite
 git clone https://github.com/limceron-lang/limceron
 cd limceron
 make              # build the compiler (requires gcc or clang)
-make test         # run all 477 tests
+make test         # run the full suite (600+ tests across three suites)
 ```
 
 **Optional dependencies for production agents:**
@@ -384,3 +389,44 @@ Dual-licensed under [Apache 2.0](LICENSE-APACHE) and [MIT](LICENSE-MIT) — your
 ## Etymology
 
 **Limceron** /lim.ke.ron/ -- from Tolkien's Sindarin. **lim** (swift) + **ceron** (doer, agent). "Swift Agent."
+
+## Documentation
+
+- **[Language reference](docs/language-reference.md)** — every syntactic
+  form: agent declarations, capabilities (bare + parameterised),
+  budget block, entropy_budget, host calls (vdag:llm / http / kb / data /
+  mcp / json), `Ok` / `Err` / `Result`, `try` / `catch` / `?`,
+  `while` / `for` / `loop` / `break` / `continue`, `if`-as-expression,
+  tail-expression returns.
+
+- **Architecture decision records** (`docs/adr/`):
+  - [ADR-0001](docs/adr/0001-wasm-target.md) — wasm32-wasi-preview2 as the
+    dual-track target for multi-tenant SaaS embedding, alongside the C99
+    native path described above.
+  - [ADR-0002](docs/adr/0002-result-as-negative-i64-union.md) — L5
+    Result<T,E> as the negative-i64 union.
+  - [ADR-0003](docs/adr/0003-entropy-budget-runtime-fence.md) — L11
+    entropy_budget runtime fence.
+  - [ADR-0004](docs/adr/0004-budget-runtime-fence-chain-order.md) —
+    L13 budget runtime fence + chain order.
+  - [ADR-0005](docs/adr/0005-capability-network-compile-time-allowlist.md)
+    — L12 capability.network compile-time allowlist.
+  - [ADR-0006](docs/adr/0006-vdag-json-host-module.md) — L3 vdag:json
+    host module.
+  - [ADR-0007](docs/adr/0007-loops-and-loop-carried-bindings.md) — L2
+    while / for / loop and loop-carried bindings.
+
+- **Examples** (`examples/language/`): the native-path examples used
+  throughout Getting Started above (`limceron run`/`build`/`audit`).
+
+- **WASM examples** (`examples/wasm/`) -- dual-track target, see ADR-0001:
+  - `poc/` — arithmetic, branching, ReAct loop, bounded loops.
+  - `loops/` — `while`, `for`, `break`/`continue`.
+  - `errors/` — `Ok` / `Err` / `try` / `catch` / `?`.
+  - `entropy/` — entropy_budget fence (within + exceeds).
+  - `budget/` — budget fence (within + exceeds).
+  - `capabilities/` — network allowlist (open / restricted / glob).
+  - `json/` — vdag:json host calls.
+
+- **[Integration with Agent A (Visual-DAG)](INTEGRATION-WITH-AGENT-A.md)**
+  — substrate handoff notes.

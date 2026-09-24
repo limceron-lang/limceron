@@ -1,0 +1,82 @@
+// 08_result_try_catch.lceron -- L5 sample: explicit Result<T,E> +
+// try/catch + match Result + canonical HostError sentinels.
+//
+// Scenario: an agent calls llm.classify; the expensive classifier
+// trips the host's `quota-exceeded` budget sentinel (-3). Instead
+// of trapping the whole module, the guest catches that error and
+// falls back to a cheaper classifier path that returns a best-
+// effort label length.
+//
+// What this sample exercises
+//
+//   1. `Result::Ok(v)` / `Result::Err(code)` constructors. The
+//      parser rewrites both to the existing AST_RESULT_OK /
+//      AST_RESULT_ERR kinds so the runtime repr stays a single i64.
+//   2. `host_error::quota_exceeded` resolves to -3 via the canonical
+//      include/vdag.errors.wit table. The compiler validates the
+//      variant name at the call site (an unknown name raises
+//      ERR_HOST_ERROR_UNKNOWN_VARIANT before codegen runs).
+//   3. `try { ... } catch (e: int) { ... }` recovers from any host
+//      error -- the `?` propagator inside the try body redirects to
+//      the catch handler instead of returning from the enclosing fn.
+//   4. `match` over a Result is exhaustive: both Ok(_) and Err(_)
+//      arms must be present (L5 ERR_MATCH_INEXHAUSTIVE).
+//
+// Expected behaviour: classify_with_fallback runs the expensive
+// classifier; on -3 the catch arm fires and the cheap classifier
+// produces the answer instead. With Visual-DAG's MockClient queued
+// to return BudgetExceeded (-3) for the expensive prompt, the catch
+// arm wins; the cheap classifier returns the byte count of its mock
+// answer and main yields that count.
+
+agent fallback_classifier {
+    capabilities: [llm.classify]
+    budget: { max_tokens: 256, max_cost: 0.05 }
+
+    // Cheap classifier is assumed to never trip quota. We still
+    // wrap the host call in `?` + Result::Ok so the chain composes
+    // with the expensive path -- both branches return the same
+    // Result-shaped int.
+    fn classify_cheap(text: string) -> int {
+        let len = llm.classify(text)?
+        Result::Ok(len)
+    }
+
+    // Expensive classifier; on budget breach the host returns
+    // host_error::quota_exceeded (-3) via the canonical
+    // include/vdag.errors.wit table.
+    fn classify_expensive(text: string) -> int {
+        let len = llm.classify(text)?
+        Result::Ok(len)
+    }
+
+    fn classify_with_fallback(prompt: string) -> int {
+        try {
+            classify_expensive(prompt)?
+        } catch (e: int) {
+            // The catch handler examines `e`. quota_exceeded falls
+            // back to the cheap path; every other sentinel re-raises
+            // as Err so the caller can decide. We use `match Result`
+            // to exercise the L5 exhaustiveness check -- both arms
+            // ARE required (single-arm match raises
+            // ERR_MATCH_INEXHAUSTIVE).
+            match Result::Ok(e) {
+                Result::Ok(code) ->
+                    if code == host_error::quota_exceeded {
+                        classify_cheap("fallback")
+                    } else {
+                        Result::Err(code)
+                    }
+                Result::Err(_) ->
+                    // Unreachable in this construction (we wrapped
+                    // Ok above); the arm exists only because L5
+                    // requires exhaustive Result matches.
+                    Result::Err(host_error::not_found)
+            }
+        }
+    }
+
+    fn main() -> int {
+        classify_with_fallback("classify-me-with-the-expensive-model")
+    }
+}
