@@ -235,3 +235,20 @@ fuente. No se tocó `src/main.c` (el `system()` de compile+link ya no necesitaba
 | 5 | C4, C6, C7, C8 | Higiene |
 
 **Verificación final:** `make test && make bootstrap` ambos en verde, README reproducible comando a comando.
+
+---
+
+## Estado final (2026-09-24)
+
+Los 8 ítems (C1-C8) fueron atacados en el orden sugerido arriba. `make test` (478+120+15 = 613 tests,
+2141+609+37 = 2787 assertions) y `make bootstrap` en verde. Pendiente real para quien retome esto:
+
+- **El hallazgo más grande de esta pasada** no estaba en la lista original: `own_check_call` en
+  `typecheck.c` trata cualquier identificador pasado por valor a cualquier función como "moved", sin
+  distinguir tipos Copy (int, bool) de recursos que de verdad hay que mover. Se arregló el caso puntual
+  de `sb_append` (C7), pero quedan ~100 warnings de ownership en `stage1/parser.lceron` solo, la mayoría
+  del mismo patrón (`cur = tok_next(toks, cur)`). Arreglarlo de raíz es un ítem propio, no cabe en
+  "higiene de warnings" — necesita que el checker sea consciente de tipos.
+- El resto de `ROADMAP.md` (LOC de Stage 0, conteos de tests viejos en varias tablas, % de fases) sigue
+  stale más allá de lo que tocó C3 — ver nota de cierre de C3.
+- `-Werror` en CI sigue sin recomendarse hasta que se resuelva el punto de arriba.
