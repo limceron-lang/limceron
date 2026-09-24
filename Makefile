@@ -266,10 +266,10 @@ dashboard: runtime
 
 stage1-build: stage0
 	@echo "=== Building Stage 1 components with Stage 0 ==="
-	@$(S0_BIN) build $(S1_DIR)/lexer.lceron -o $(BUILD_DIR)/stage1-lexer 2>&1 | tail -1
-	@$(S0_BIN) build $(S1_DIR)/parser.lceron -o $(BUILD_DIR)/stage1-parser 2>&1 | tail -1
-	@$(S0_BIN) build $(S1_DIR)/typecheck.lceron -o $(BUILD_DIR)/stage1-typecheck 2>&1 | tail -1
-	@$(S0_BIN) build $(S1_DIR)/codegen.lceron -o $(BUILD_DIR)/stage1-codegen 2>&1 | tail -1
+	@$(S0_BIN) build $(S1_DIR)/lexer.lceron -o $(BUILD_DIR)/stage1-lexer > /tmp/lcn_stage1lexer.log 2>&1 || { cat /tmp/lcn_stage1lexer.log; exit 1; }; tail -1 /tmp/lcn_stage1lexer.log
+	@$(S0_BIN) build $(S1_DIR)/parser.lceron -o $(BUILD_DIR)/stage1-parser > /tmp/lcn_stage1parser.log 2>&1 || { cat /tmp/lcn_stage1parser.log; exit 1; }; tail -1 /tmp/lcn_stage1parser.log
+	@$(S0_BIN) build $(S1_DIR)/typecheck.lceron -o $(BUILD_DIR)/stage1-typecheck > /tmp/lcn_stage1typecheck.log 2>&1 || { cat /tmp/lcn_stage1typecheck.log; exit 1; }; tail -1 /tmp/lcn_stage1typecheck.log
+	@$(S0_BIN) build $(S1_DIR)/codegen.lceron -o $(BUILD_DIR)/stage1-codegen > /tmp/lcn_stage1codegen.log 2>&1 || { cat /tmp/lcn_stage1codegen.log; exit 1; }; tail -1 /tmp/lcn_stage1codegen.log
 	@cp $(S1_DIR)/limceron-stage1.sh $(BUILD_DIR)/limceron-stage1.sh
 	@chmod +x $(BUILD_DIR)/limceron-stage1.sh
 	@echo "=== Stage 1 build complete ==="

@@ -192,10 +192,35 @@ runtime, que es más alcance del que este ítem pedía.
   100 warnings de ownership más los `-Wparentheses-equality` cosméticos del C generado, forzar
   `-Werror` hoy rompería el build sin arreglar nada real.
 
-## C8 — Exit codes y UX del compilador (menor)
+## C8 — Exit codes y UX del compilador (menor) — ✅ RESUELTO (2026-09-24, causa real era el Makefile)
 
 `limceron-stage0 build` con C inválido reporta `error: C compilation failed` y exit 1 ✓ (verificado) — pero el mensaje no muestra los errores del cc subyacente; hay que re-correr `emit` + `cc` a mano para verlos.
 **Fix:** capturar y mostrar stderr del compilador C (primeros N errores) en el mensaje de fallo. Acorta el loop de debugging de cualquier usuario — y del propio bootstrap.
+
+**Nota de cierre:** no reproducido en HEAD actual. El comando de compilación en `src/main.c` (compile+link
+y cada uno de los 24 `.o` de runtime) usa `system(cmd)` con `2>&1` — `system()` no captura stdout/stderr,
+los hereda del proceso padre, así que el error real de `cc`/`ld` YA se imprime en vivo, antes de nuestro
+`error: C compilation failed`. Repro con link roto:
+
+```
+$ limceron-stage0 build badlink.lceron -o out
+...
+ld: library 'ThisLibraryDoesNotExist12345' not found
+clang: error: linker command failed with exit code 1 (use -v to see invocation)
+error: C compilation failed
+  command: cc -std=c99 -O2 -Wall -I... ...
+```
+
+El error de `ld` aparece solo, sin re-correr nada a mano. Mismo comportamiento verificado durante C1 con
+errores reales de sintaxis C (el bug de paths con espacio de C1.d mostraba el `clang: error: no such
+file...` completo). Posible explicación: el auditor original testeó a través de `make bootstrap`, cuyo
+target `stage1-build` SÍ pipeaba por `| tail -1` — eso trunca cualquier error a la última línea, pero es
+el Makefile, no `limceron-stage0`. Se corrigió igual, ya que es la misma clase de problema aplicada al
+lugar donde de verdad ocurre: ahora cada paso de `stage1-build` corre a un log temporal y solo lo
+trunca a la última línea si salió bien — si falla, vuelca el log completo antes de propagar el error.
+Verificado con una falla real de parseo inyectada a propósito: antes de este cambio solo se veía
+`error: expected expression` (última línea); ahora se ven los 14 errores completos con snippets de
+fuente. No se tocó `src/main.c` (el `system()` de compile+link ya no necesitaba nada).
 
 ---
 
