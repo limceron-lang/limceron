@@ -2290,11 +2290,10 @@ TEST(codegen_json_array_get_builtin) {
  * LcnJsonValue* handle instead of coercing to string -- the only way to
  * read an object/array field (e.g. a JSON object's array-valued key) that
  * isn't a bare scalar. json_get can't do this: it always returns string.
- * Added for the pulso21-agentic ajustar_bbtt pilot -- see
- * limceron-pulso21-integration.md and
- * examples/language/json_get_value_smoke.lceron for the end-to-end proof. */
+ * See examples/language/json_get_value_smoke.lceron for an end-to-end
+ * proof (parse, read, conditional merge, stringify). */
 TEST(codegen_json_get_value_builtin) {
-    char *c = gen_c("fn main() -> Result {\n    let v = json_get_value(doc, \"cargos\")\n}");
+    char *c = gen_c("fn main() -> Result {\n    let v = json_get_value(doc, \"items\")\n}");
     ASSERT_NOT_NULL(c);
     ASSERT(strstr(c, "lcn_json_get(") != NULL);
     /* Must NOT lower to json_get's string coercion. */
@@ -2309,7 +2308,7 @@ TEST(codegen_json_get_value_returns_json_handle) {
     char *c = gen_c(
         "fn main() -> Result {\n"
         "    let doc = json_parse(\"{}\")\n"
-        "    let v = json_get_value(doc, \"cargos\")\n"
+        "    let v = json_get_value(doc, \"items\")\n"
         "    let n = json_array_len(v)\n"
         "}\n");
     ASSERT_NOT_NULL(c);
