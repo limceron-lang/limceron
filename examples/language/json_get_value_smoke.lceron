@@ -1,17 +1,12 @@
 // json_get_value_smoke.lceron — proof-of-concept for the json_get_value
-// builtin added to unblock the pulso21-agentic ajustar_bbtt pilot (see
-// limceron-pulso21-integration.md, "Encargo para el agente especializado
-// en Limceron"). Native target (Stage 0, no WASM). Synthetic fixture only
-// — no real client data, no network/LLM calls.
+// builtin. Native target (Stage 0, no WASM). Synthetic fixture only.
 //
-// Mirrors the shape of ajustar_bbtt's 4-line Python merge:
-//   ajustada = dict(base)
-//   for campo, valor in (datos or {}).items():
-//       if valor:
-//           ajustada[campo] = valor
-// i.e. per top-level field: if the incoming value is non-empty, it wins;
-// otherwise the base value is kept. Exercises the three field shapes that
-// matter for BaseAjustada: a plain string, a list[str], and a list[struct].
+// Demonstrates a common "merge an incoming JSON document over a base
+// document" pattern: per top-level field, if the incoming value is
+// non-empty, it wins; otherwise the base value is kept (the JSON
+// equivalent of `for k, v in incoming.items(): if v: base[k] = v`).
+// Exercises the three field shapes that matter for this: a plain
+// string, a list[str], and a list[struct].
 //
 // Written as independent if/else branches, each with its own println —
 // NOT `let x = if cond {a} else {b}` (block-bodied if-as-expression hits
@@ -22,36 +17,36 @@
 
 fn main() {
     let base = json_parse(
-        "{\"introduccion\":\"base intro\",\"epp\":[\"casco\",\"guantes\"],\"cargos\":[{\"rol\":\"supervisor\",\"dedicacion\":\"full\"}]}")
+        "{\"summary\":\"base summary\",\"tags\":[\"draft\",\"internal\"],\"members\":[{\"name\":\"alice\",\"role\":\"lead\"}]}")
     let incoming = json_parse(
-        "{\"introduccion\":\"intro ajustada por sourcing\",\"epp\":[],\"cargos\":[{\"rol\":\"jefe de obra\",\"dedicacion\":\"part\"},{\"rol\":\"supervisor\",\"dedicacion\":\"full\"}]}")
+        "{\"summary\":\"updated summary\",\"tags\":[],\"members\":[{\"name\":\"bob\",\"role\":\"reviewer\"},{\"name\":\"alice\",\"role\":\"lead\"}]}")
 
-    // Simple string field ("introduccion"): json_get already covers this
+    // Simple string field ("summary"): json_get already covers this
     // (returns string directly) — incoming has content, so it wins.
-    let incoming_intro = json_get(incoming, "introduccion")
-    if str_eq(incoming_intro, "") {
-        println("introduccion (expect: incoming, has content) -> " + json_get(base, "introduccion"))
+    let incoming_summary = json_get(incoming, "summary")
+    if str_eq(incoming_summary, "") {
+        println("summary (expect: incoming, has content) -> " + json_get(base, "summary"))
     } else {
-        println("introduccion (expect: incoming, has content) -> " + incoming_intro)
+        println("summary (expect: incoming, has content) -> " + incoming_summary)
     }
 
-    // list[str] field ("epp"): incoming is an EMPTY array -> keep base.
+    // list[str] field ("tags"): incoming is an EMPTY array -> keep base.
     // This is exactly the case json_get can't handle (it only returns
     // string) — needs json_get_value to get the array as a Json handle.
-    let incoming_epp = json_get_value(incoming, "epp")
-    if json_array_len(incoming_epp) == 0 {
-        println("epp (expect: base, incoming was empty) -> " + json_stringify(json_get_value(base, "epp")))
+    let incoming_tags = json_get_value(incoming, "tags")
+    if json_array_len(incoming_tags) == 0 {
+        println("tags (expect: base, incoming was empty) -> " + json_stringify(json_get_value(base, "tags")))
     } else {
-        println("epp (expect: base, incoming was empty) -> " + json_stringify(incoming_epp))
+        println("tags (expect: base, incoming was empty) -> " + json_stringify(incoming_tags))
     }
 
-    // list[struct] field ("cargos"): incoming has content -> incoming wins,
-    // whole sub-tree replaced wholesale (no per-element merge), same as
-    // the Python loop's "ajustada[campo] = valor" for a list field.
-    let incoming_cargos = json_get_value(incoming, "cargos")
-    if json_array_len(incoming_cargos) == 0 {
-        println("cargos (expect: incoming, has content) -> " + json_stringify(json_get_value(base, "cargos")))
+    // list[struct] field ("members"): incoming has content -> incoming
+    // wins, whole sub-tree replaced wholesale (no per-element merge),
+    // same as the "base[k] = v" case for a list field.
+    let incoming_members = json_get_value(incoming, "members")
+    if json_array_len(incoming_members) == 0 {
+        println("members (expect: incoming, has content) -> " + json_stringify(json_get_value(base, "members")))
     } else {
-        println("cargos (expect: incoming, has content) -> " + json_stringify(incoming_cargos))
+        println("members (expect: incoming, has content) -> " + json_stringify(incoming_members))
     }
 }
